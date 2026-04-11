@@ -526,12 +526,14 @@ impl LineWrapper {
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
         // is included so it stays attached to the preceding word when wrapping.
-        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
+        // `/` is included so URLs fill the line and break at the pixel boundary
+        // instead of at '/' boundaries (like Telegram does).
+        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';' | '/') ||
         // Closing punctuation never starts a line (UAX #14 LB13: no break
         // before `!`, `)`, `]`, `}`, closing quotes or an ellipsis) — `plz!`,
         // `see)`, `quoted”` wrap as one word instead of orphaning the mark on
-        // the next line. `/` and `?` stay break opportunities so long paths
-        // and URLs (`a/b`, `foo?b=2`) can wrap.
+        // the next line. `?` stays a break opportunity so query strings
+        // (`foo?b=2`) can wrap.
         matches!(c, '!' | ')' | ']' | '}' | '"' | '”' | '»' | '…') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
         matches!(c, '⋯') ||
@@ -1241,7 +1243,7 @@ mod tests {
 
         // URL case
         assert_word("github.com");
-        assert_not_word("zed-industries/zed");
+        assert_word("zed-industries/zed");
         assert_not_word("zed-industries\\zed");
         assert_not_word("a=1&b=2");
         assert_not_word("foo?b=2");
