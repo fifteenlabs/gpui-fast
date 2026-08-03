@@ -974,6 +974,7 @@ impl MacWindow {
             window_min_size,
             tabbing_identifier,
             use_display_p3,
+            shadow,
             ..
         }: WindowParams,
         cursor_visible: Arc<AtomicBool>,
@@ -1260,6 +1261,13 @@ impl MacWindow {
                 }
             }
 
+            if !shadow {
+                // AppKit shadows the window's frame, not what's drawn in it, so
+                // a transparent window laying out its own floating surfaces
+                // gets a shadow around the empty space between them too.
+                let _: () = msg_send![native_window, setHasShadow: NO];
+            }
+
             if allows_automatic_window_tabbing
                 && !main_window.is_null()
                 && main_window != native_window
@@ -1443,19 +1451,24 @@ impl PlatformWindow for MacWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let this = self.0.lock();
-        let window = this.native_window;
-        let closed = this.closed.clone();
-        this.foreground_executor
-            .spawn(async move {
-                if_window_not_closed(closed, || unsafe {
-                    window.setContentSize_(NSSize {
-                        width: size.width.as_f32() as f64,
-                        height: size.height.as_f32() as f64,
-                    });
-                })
-            })
-            .detach();
+        // Applied inline rather than queued onto the foreground executor: a
+        // resize that lands after the frame has been presented leaves the
+        // previous frame on screen, stretched into the new bounds, until the
+        // next one is drawn. `PlatformWindow` is main-thread only, so this
+        // runs where AppKit wants it.
+        //
+        // The lock is dropped first: `setContentSize:` calls straight back
+        // into `setFrameSize:`, which takes the same window-state lock.
+        let (window, closed) = {
+            let this = self.0.lock();
+            (this.native_window, this.closed.clone())
+        };
+        if_window_not_closed(closed, || unsafe {
+            window.setContentSize_(NSSize {
+                width: size.width.as_f32() as f64,
+                height: size.height.as_f32() as f64,
+            });
+        });
     }
 
     fn merge_all_windows(&self) {
