@@ -2908,8 +2908,19 @@ impl Window {
     }
 
     /// Set the content size of the window.
+    ///
+    /// The new size is adopted here rather than left to the platform's resize
+    /// callback: that callback reaches the window through `handle.update`, and
+    /// `&mut Window` only exists *inside* a window update, so the callback
+    /// can't re-enter and is dropped. Without this the platform window would
+    /// resize while layout carried on at the old size, clipping content.
+    ///
+    /// Bounds observers are not notified — they still fire for resizes that
+    /// originate on the platform side, such as a user dragging an edge.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
+        self.viewport_size = self.platform_window.content_size();
+        self.refresh();
     }
 
     /// Returns whether or not the window is currently fullscreen

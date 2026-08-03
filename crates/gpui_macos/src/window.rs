@@ -1009,6 +1009,12 @@ impl MacWindow {
                 if titlebar.appears_transparent {
                     style_mask |= NSWindowStyleMask::NSFullSizeContentViewWindowMask;
                 }
+            } else if kind == WindowKind::PopUp {
+                // A titled window is drawn with a hairline border and rounded
+                // corners. A popup drawing its own surfaces on a transparent
+                // background has no chrome to hide them behind, so the frame
+                // shows up as an outline around empty space.
+                style_mask = NSWindowStyleMask::NSBorderlessWindowMask;
             } else {
                 style_mask = NSWindowStyleMask::NSTitledWindowMask
                     | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
