@@ -1270,7 +1270,13 @@ pub struct Window {
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
+    /// The display's own scale factor, as the platform reports it. Read it
+    /// through [`Window::scale_factor`], which folds in [`Window::zoom`] —
+    /// this field alone is only half the story.
     scale_factor: f32,
+    /// UI magnification, on top of the display's scale factor. See
+    /// [`Window::set_zoom`].
+    zoom: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -2056,7 +2062,16 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        // The one place OS events enter, and so the one place
+                        // their screen units become layout units. Doing it in
+                        // `dispatch_event` instead would also catch the events
+                        // the window synthesizes for itself — an accessibility
+                        // click is built from bounds recorded during paint, and
+                        // is already in layout units.
+                        let event = window.event_in_layout_units(event);
+                        window.dispatch_event(event, cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -2177,6 +2192,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            zoom: 1.,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2804,7 +2820,7 @@ impl Window {
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
         self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.sync_viewport();
         self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
@@ -2917,9 +2933,12 @@ impl Window {
     ///
     /// Bounds observers are not notified — they still fire for resizes that
     /// originate on the platform side, such as a user dragging an edge.
-    pub fn resize(&mut self, size: Size<Pixels>) {
+    pub fn resize(&mut self, mut size: Size<Pixels>) {
+        // `size` is in the units the caller lays out in, which zoom has already
+        // magnified; the platform wants the window's own size back.
+        size *= self.zoom;
         self.platform_window.resize(size);
-        self.viewport_size = self.platform_window.content_size();
+        self.sync_viewport();
         self.refresh();
     }
 
@@ -3026,7 +3045,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        // Back out of the magnified layout space and into the window's own.
+        self.platform_window.show_window_menu(position * self.zoom)
     }
 
     /// Handle window movement for Linux and macOS.
@@ -3118,8 +3138,12 @@ impl Window {
     /// The scale factor of the display associated with the window. For example, it could
     /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
     /// be rendered as two pixels on screen.
+    ///
+    /// [`Window::zoom`] is folded in, so a 2x display at 150% zoom reports 3.0 and every
+    /// primitive is rasterized for it. Zoom is deliberately indistinguishable from a denser
+    /// display here: that is what makes it uniform.
     pub fn scale_factor(&self) -> f32 {
-        self.scale_factor
+        self.scale_factor * self.zoom
     }
 
     /// Overrides the display scale factor for tests.
@@ -3128,6 +3152,60 @@ impl Window {
         self.scale_factor = scale_factor;
         self.refresh();
     }
+
+    /// Convert an event's window-relative lengths from the units the platform
+    /// reports them in to the units this window lays out in.
+    ///
+    /// Only for events arriving from the OS. Anything the window synthesizes
+    /// for itself is built from laid-out geometry and is already in the right
+    /// units — converting it again would land it at 1/zoom of its target.
+    pub(crate) fn event_in_layout_units(&self, event: PlatformInput) -> PlatformInput {
+        if self.zoom == 1. {
+            return event;
+        }
+        event.scale_lengths(self.zoom)
+    }
+
+    /// UI magnification, on top of the display's own scale factor. 1.0 is unzoomed.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Magnify the window's UI by `zoom`, the way a browser zooms a page.
+    ///
+    /// This is not [`Window::set_rem_size`]: rem size only moves values that were authored
+    /// in rems, which leaves anything sized in pixels behind — text grows inside a row whose
+    /// height does not. Zoom instead multiplies the scale factor and shrinks the layout
+    /// viewport to match, so *every* length scales, including ones in third-party elements
+    /// this window never sees. Geometry is preserved exactly; only how much of it fits in
+    /// the window changes.
+    ///
+    /// Glyphs, quads and paths are rasterized at the combined factor rather than magnified
+    /// after the fact, so a zoomed window is as sharp as an unzoomed one.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        if zoom == self.zoom {
+            return;
+        }
+        self.zoom = zoom;
+        self.sync_viewport();
+        self.refresh();
+    }
+
+    /// Take the layout viewport from the window's actual size.
+    ///
+    /// The viewport is the content area measured in the units elements are
+    /// authored in, so it shrinks as zoom magnifies them. Anything that moves
+    /// either side of that — a resize, a display change, the zoom itself —
+    /// goes through here, so the relationship holds in one place.
+    fn sync_viewport(&mut self) {
+        self.viewport_size = self.platform_window.content_size() / self.zoom;
+    }
+
+    /// Below this the UI is smaller than the display can usefully draw.
+    pub const MIN_ZOOM: f32 = 0.5;
+    /// Above this a window holds too little to lay out at all.
+    pub const MAX_ZOOM: f32 = 3.0;
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
     /// UI to scale, just like zooming a web page.
@@ -7360,6 +7438,7 @@ impl Window {
             modifiers: self.modifiers,
             pressed_button: None,
         });
+        let event = self.event_in_layout_units(event);
         let _ = self.dispatch_event(event, cx);
     }
 
@@ -9931,5 +10010,83 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use crate::{
+        Context, InteractiveElement as _, IntoElement, Modifiers, ParentElement as _, Render,
+        StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div, point, px, size,
+    };
+
+    struct Target {
+        clicked: bool,
+    }
+
+    impl Render for Target {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            // A 100×100 box in the top-left corner, and nothing else.
+            div().size_full().child(
+                div()
+                    .id("target")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .on_click(cx.listener(|this, _, _, _| this.clicked = true)),
+            )
+        }
+    }
+
+    /// Zoom magnifies by shrinking the space the frame is laid out in, so a
+    /// window reports a smaller viewport while covering the same screen.
+    #[gpui::test]
+    fn viewport_shrinks_as_zoom_grows(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Target { clicked: false });
+
+        let unzoomed = cx.update(|window, _| window.viewport_size());
+        cx.update(|window, _| window.set_zoom(2.));
+        let zoomed = cx.update(|window, _| window.viewport_size());
+
+        assert_eq!(zoomed, size(unzoomed.width / 2., unzoomed.height / 2.));
+    }
+
+    /// The scale factor carries the zoom, so every primitive is rasterized for
+    /// it rather than magnified after the fact.
+    #[gpui::test]
+    fn scale_factor_carries_the_zoom(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Target { clicked: false });
+
+        let display = cx.update(|window, _| window.scale_factor());
+        cx.update(|window, _| window.set_zoom(1.5));
+
+        assert_eq!(cx.update(|window, _| window.scale_factor()), display * 1.5);
+    }
+
+    /// The regression this is really here for: a click arrives in the window's
+    /// own units and has to be divided by the zoom before it is hit-tested,
+    /// or every click lands at the wrong place — further off the further from
+    /// the top-left corner it is.
+    #[gpui::test]
+    fn clicks_land_where_the_pointer_is(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, _cx| Target { clicked: false });
+        cx.update(|window, _| window.set_zoom(2.));
+        cx.run_until_parked();
+
+        // Inside the 100×100 target once magnified (it covers 200×200 of the
+        // window), but outside it if the zoom were ignored.
+        cx.simulate_click(point(px(150.), px(150.)), Modifiers::none());
+        assert!(
+            view.read_with(cx, |view, _| view.clicked),
+            "a click inside the magnified target missed it"
+        );
+
+        view.update(cx, |view, _| view.clicked = false);
+        // Outside the target at this zoom, but inside the 100×100 bounds a
+        // caller that forgot to divide would be testing against.
+        cx.simulate_click(point(px(250.), px(250.)), Modifiers::none());
+        assert!(
+            !view.read_with(cx, |view, _| view.clicked),
+            "a click outside the magnified target hit it anyway"
+        );
     }
 }

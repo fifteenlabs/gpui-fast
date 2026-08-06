@@ -800,6 +800,56 @@ pub enum PlatformInput {
 }
 
 impl PlatformInput {
+    /// Rescale every window-relative length this event carries.
+    ///
+    /// The platform reports positions in the window's own units, but a zoomed window
+    /// lays out in magnified ones, so positions have to be divided by the zoom before
+    /// they can be hit-tested against elements. Pixel scroll deltas travel the same
+    /// way — the same flick of the wheel should cross the same amount of *content* at
+    /// any zoom, which is fewer layout units the more it is magnified. Line deltas are
+    /// already relative to the line height, and pressure and pinch deltas are not
+    /// lengths at all, so both are left alone.
+    pub(crate) fn scale_lengths(mut self, factor: f32) -> Self {
+        match &mut self {
+            PlatformInput::MouseDown(MouseDownEvent { position, .. })
+            | PlatformInput::MouseUp(MouseUpEvent { position, .. })
+            | PlatformInput::MouseMove(MouseMoveEvent { position, .. })
+            | PlatformInput::MousePressure(MousePressureEvent { position, .. })
+            | PlatformInput::MouseExited(MouseExitEvent { position, .. })
+            | PlatformInput::Pinch(PinchEvent { position, .. })
+            | PlatformInput::Touch(TouchEvent { position, .. })
+            | PlatformInput::FileDrop(
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position },
+            ) => *position = *position / factor,
+            PlatformInput::LongPress(LongPressEvent {
+                start_position,
+                position,
+                ..
+            })
+            | PlatformInput::TouchDrag(TouchDragEvent {
+                start_position,
+                position,
+                ..
+            }) => {
+                *start_position = *start_position / factor;
+                *position = *position / factor;
+            }
+            PlatformInput::ScrollWheel(event) => {
+                event.position = event.position / factor;
+                if let ScrollDelta::Pixels(delta) = event.delta {
+                    event.delta = ScrollDelta::Pixels(delta / factor);
+                }
+            }
+            PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_)
+            | PlatformInput::FileDrop(FileDropEvent::Exited | FileDropEvent::Ended) => {}
+        }
+        self
+    }
+
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
         match self {
             PlatformInput::KeyDown { .. } => None,
