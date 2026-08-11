@@ -219,6 +219,9 @@ impl<'a, T: 'static> Context<'a, T> {
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
     pub fn notify(&mut self) {
+        // Attributes the redraw request to the view that made it. A no-op
+        // without gpui's `notify-attribution` feature.
+        crate::profiler::record_notify(std::any::type_name::<T>());
         self.app.notify(self.entity_state.entity_id);
     }
 
