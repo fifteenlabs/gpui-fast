@@ -1157,6 +1157,17 @@ impl App {
         self.entities.leak_detector_snapshot()
     }
 
+    /// Live entities and handles per entity type, most handles first.
+    ///
+    /// The non-fatal counterpart to the assertions above, for an app that
+    /// caches entities deliberately and so can't assert anything at exit: a
+    /// type whose handle count climbs across a session is leaking, wherever it
+    /// turns out to be doing it.
+    #[cfg(any(test, gpui_leak_detection))]
+    pub fn entity_handle_counts(&self) -> Vec<TypeHandleCount> {
+        self.entities.handle_counts_by_type()
+    }
+
     /// Asserts that no entities created after `snapshot` still have alive handles.
     ///
     /// Entities that were already tracked at the time of the snapshot are ignored,

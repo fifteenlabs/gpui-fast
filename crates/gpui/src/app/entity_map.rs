@@ -103,6 +103,14 @@ impl EntityMap {
         self.ref_counts.read().leak_detector.snapshot()
     }
 
+    /// Live entities and handles per entity type, most handles first.
+    ///
+    /// See [`LeakDetector::handle_counts_by_type`].
+    #[cfg(any(test, gpui_leak_detection))]
+    pub fn handle_counts_by_type(&self) -> Vec<TypeHandleCount> {
+        self.ref_counts.read().leak_detector.handle_counts_by_type()
+    }
+
     /// Asserts that no entities created after `snapshot` still have alive handles.
     ///
     /// See [`LeakDetector::assert_no_new_leaks`] for details.
@@ -981,6 +989,17 @@ struct EntityLeakData {
     type_name: &'static str,
 }
 
+/// One entity type's live footprint, from [`LeakDetector::handle_counts_by_type`].
+#[cfg(any(test, gpui_leak_detection))]
+pub struct TypeHandleCount {
+    /// The entity type, as `std::any::type_name` spells it.
+    pub type_name: &'static str,
+    /// Entities of this type with at least one live handle.
+    pub entities: usize,
+    /// Live handles across those entities.
+    pub handles: usize,
+}
+
 #[cfg(any(test, gpui_leak_detection))]
 impl LeakDetector {
     /// Records that a new handle has been created for the given entity.
@@ -1052,6 +1071,34 @@ impl LeakDetector {
             }
             panic!("Handles for {} leaked:\n{out}", data.type_name);
         }
+    }
+
+    /// Live entities and handles per entity type, most handles first.
+    ///
+    /// The non-fatal read of the same data [`assert_released`](Self::assert_released)
+    /// panics over. An app that legitimately caches entities can't assert
+    /// anything at exit, but it can watch a type's handle count climb across a
+    /// session — which is the shape a leak has before anyone knows where it is.
+    pub fn handle_counts_by_type(&self) -> Vec<TypeHandleCount> {
+        let mut counts: HashMap<&'static str, TypeHandleCount> = HashMap::default();
+        for data in self.entity_handles.values() {
+            let count = counts
+                .entry(data.type_name)
+                .or_insert_with(|| TypeHandleCount {
+                    type_name: data.type_name,
+                    entities: 0,
+                    handles: 0,
+                });
+            count.entities += 1;
+            count.handles += data.handles.len();
+        }
+        let mut counts: Vec<_> = counts.into_values().collect();
+        counts.sort_unstable_by(|a, b| {
+            b.handles
+                .cmp(&a.handles)
+                .then_with(|| a.type_name.cmp(b.type_name))
+        });
+        counts
     }
 
     /// Captures a snapshot of all entity IDs that currently have alive handles.

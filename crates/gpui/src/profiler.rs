@@ -2265,9 +2265,8 @@ pub fn notify_counts() -> Vec<(&'static str, u64)> {
     #[cfg(feature = "notify-attribution")]
     {
         let mut counts = NOTIFY_COUNTS.lock().clone();
-        counts.sort_unstable_by(|(a_name, a), (b_name, b)| {
-            b.cmp(a).then_with(|| a_name.cmp(b_name))
-        });
+        counts
+            .sort_unstable_by(|(a_name, a), (b_name, b)| b.cmp(a).then_with(|| a_name.cmp(b_name)));
         counts
     }
     #[cfg(not(feature = "notify-attribution"))]
