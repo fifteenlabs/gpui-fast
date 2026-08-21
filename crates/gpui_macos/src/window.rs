@@ -2,7 +2,7 @@ use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    ns_string, ns_url_to_path, renderer,
 };
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
@@ -32,6 +32,7 @@ use gpui::{
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
+    PromisedFile, PromisedFiles,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -75,8 +76,8 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::{
-        Arc, Once, Weak,
-        atomic::{AtomicBool, Ordering},
+        Arc, Once, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -692,6 +693,10 @@ struct MacWindowState {
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
+    /// Files the drag being dropped promised rather than handed over
+    /// as paths, taken by whichever drop handler claims the drop (see
+    /// [`promised_files_from_event`]).
+    promised_files: Option<PromisedFiles>,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
     // When true, the whole content view is reported as app-owned titlebar content via
@@ -1143,6 +1148,7 @@ impl MacWindow {
                 keystroke_for_do_command: None,
                 do_command_handled: None,
                 external_files_dragged: false,
+                promised_files: None,
                 first_mouse: false,
                 app_owns_titlebar_drag,
                 fullscreen_restore_bounds: Bounds::default(),
@@ -1928,6 +1934,10 @@ impl PlatformWindow for MacWindow {
 
     fn is_subpixel_rendering_supported(&self) -> bool {
         false
+    }
+
+    fn take_promised_files(&self) -> Option<PromisedFiles> {
+        self.0.lock().promised_files.take()
     }
 
     fn set_edited(&mut self, edited: bool) {
@@ -3621,6 +3631,9 @@ fn is_drag_from_this_window(this: &Object, dragging_info: id) -> bool {
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     let is_source_window = is_drag_from_this_window(this, dragging_info);
     let window_state = unsafe { get_window_state(this) };
+    // Promises belong to one drop. If the last drop's went unclaimed,
+    // this drag must not inherit them.
+    window_state.lock().promised_files = None;
     let position = drag_event_position(&window_state, dragging_info);
     let paths = external_paths_from_event(dragging_info);
     if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
@@ -3657,6 +3670,10 @@ extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
 extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
+    // Accepting the drop is what lets the source app start writing the
+    // files it only promised, so ask before the handlers run — they
+    // take the promises out of the window state as they handle the drop.
+    window_state.lock().promised_files = promised_files_from_event(dragging_info);
     send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
 }
 
@@ -3675,6 +3692,273 @@ fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths
         paths.push(PathBuf::from(path))
     }
     Some(ExternalPaths(paths))
+}
+
+/// The pasteboard type under which a source app puts the name it
+/// suggests for a file it has promised.
+const PROMISED_FILE_NAME_TYPE: &str = "com.apple.pasteboard.promised-suggested-file-name";
+
+/// The queue the promised files are written on. One for the process:
+/// the writes are the source app's work, and a queue per drop would
+/// be an object per drop with nobody left to release it.
+fn promised_file_queue() -> id {
+    static QUEUE: OnceLock<usize> = OnceLock::new();
+    *QUEUE.get_or_init(|| unsafe {
+        let queue: id = msg_send![class!(NSOperationQueue), new];
+        queue as usize
+    }) as id
+}
+
+/// Describe the promises the drop being performed carries, and hand
+/// back a way to claim the ones the drop target wants.
+///
+/// A macOS drag can offer a file that does not exist yet: Photos.app
+/// drags every asset this way, putting a poster frame from its library
+/// on the pasteboard as the only real path — a JPEG, even when the
+/// asset is a video — and promising the asset itself. Nothing is
+/// written until a promise is claimed, and claiming one is not free:
+/// a source that staged its file in a temporary directory (the
+/// screenshot thumbnail does) finalizes and clears that staging when
+/// its promise is claimed. So this only reads what the promises say;
+/// [`PromisedFiles::receive`] is what asks for them.
+///
+/// One promise per dragged item, in item order, so a promise shares an
+/// index with the stand-in path [`external_paths_from_event`] read
+/// from the same pasteboard. A promise can cover more than one file;
+/// only the first of each is reported, which is all any of the
+/// Photos-style sources produce.
+fn promised_files_from_event(dragging_info: id) -> Option<PromisedFiles> {
+    let (files, receivers) = unsafe {
+        let pasteboard: id = msg_send![dragging_info, draggingPasteboard];
+        let class = class!(NSFilePromiseReceiver) as *const Class as id;
+        let classes = NSArray::arrayWithObject(nil, class);
+        let receivers: id = msg_send![pasteboard, readObjectsForClasses: classes options: nil];
+        if receivers == nil {
+            return None;
+        }
+        let count = NSArray::count(receivers);
+        if count == 0 {
+            return None;
+        }
+
+        // The suggested names live on the pasteboard items rather than
+        // on the receivers; both are in item order, so they pair up by
+        // index — and where they don't, the file arrives unnamed
+        // rather than misnamed.
+        let items: id = msg_send![pasteboard, pasteboardItems];
+        let named = items != nil && NSArray::count(items) == count;
+
+        let mut files = Vec::with_capacity(count as usize);
+        let mut retained = Vec::with_capacity(count as usize);
+        for ix in 0..count {
+            let receiver = NSArray::objectAtIndex(receivers, ix);
+            let types: id = msg_send![receiver, fileTypes];
+            let content_type = (types != nil && NSArray::count(types) > 0)
+                .then(|| NSArray::objectAtIndex(types, 0).to_str().to_string());
+            let suggested_name = named
+                .then(|| {
+                    let name: id = msg_send![
+                        NSArray::objectAtIndex(items, ix),
+                        stringForType: ns_string(PROMISED_FILE_NAME_TYPE)
+                    ];
+                    (name != nil).then(|| name.to_str().to_string())
+                })
+                .flatten()
+                .filter(|name| !name.is_empty());
+            files.push(PromisedFile {
+                suggested_name,
+                content_type,
+            });
+            // The pasteboard hands these out autoreleased, and the
+            // drop target claims them a few calls later; owning them
+            // until then keeps that from resting on the event turn's
+            // pool outliving the handler.
+            retained.push(Arc::new(RetainedPromiseReceiver::new(receiver)));
+        }
+        (files, retained)
+    };
+
+    Some(PromisedFiles::new(files, move |indices| {
+        receive_promised_files(receivers, indices)
+    }))
+}
+
+/// One of a drop's `NSFilePromiseReceiver`s, held for as long as
+/// anything still needs it: while the drop target might yet claim it,
+/// and — for the ones it does claim — until the write that claim
+/// started has reported back. The source app's write is asynchronous,
+/// so releasing on the way out of the call that started it would leave
+/// the reader block pointing at a dead object.
+struct RetainedPromiseReceiver(usize);
+
+impl RetainedPromiseReceiver {
+    /// Retains `receiver`, which the pasteboard handed out autoreleased.
+    fn new(receiver: id) -> Self {
+        unsafe {
+            let _: () = msg_send![receiver, retain];
+        }
+        Self(receiver as usize)
+    }
+
+    fn get(&self) -> id {
+        self.0 as id
+    }
+}
+
+impl Drop for RetainedPromiseReceiver {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.get(), release];
+        }
+    }
+}
+
+/// Ask the source app to write out the promises at `indices`, and
+/// report where it wrote them in that order. The receivers it doesn't
+/// ask for are let go of on the way out; the ones it does are held by
+/// the receipt until their writes report back.
+fn receive_promised_files(
+    receivers: Vec<Arc<RetainedPromiseReceiver>>,
+    indices: &[usize],
+) -> oneshot::Receiver<anyhow::Result<Vec<PathBuf>>> {
+    let (done_tx, done_rx) = oneshot::channel();
+    let claimed: Vec<Arc<RetainedPromiseReceiver>> = indices
+        .iter()
+        .filter_map(|ix| receivers.get(*ix).cloned())
+        .collect();
+    if claimed.len() != indices.len() {
+        done_tx
+            .send(Err(anyhow::anyhow!(
+                "the drop asked for a file it was not promised"
+            )))
+            .ok();
+        return done_rx;
+    }
+
+    // A directory of our own per claim, so two drops of the same asset
+    // don't have the second overwrite a file the first is still
+    // sending, and so the names the source app chooses can be kept.
+    static CLAIM: AtomicUsize = AtomicUsize::new(0);
+    let destination = std::env::temp_dir().join(format!(
+        "gpui-dropped-files-{}-{}",
+        std::process::id(),
+        CLAIM.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(error) = std::fs::create_dir_all(&destination) {
+        done_tx
+            .send(Err(anyhow::anyhow!(
+                "could not make a directory for the dropped files: {error}"
+            )))
+            .ok();
+        return done_rx;
+    }
+
+    let receipt = Arc::new(Mutex::new(PromisedFileReceipt {
+        slots: claimed.iter().map(|_| PromisedFileSlot::Waiting).collect(),
+        done_tx: Some(done_tx),
+        destination: destination.clone(),
+        receivers: claimed.clone(),
+    }));
+
+    unsafe {
+        let destination: id = msg_send![
+            class!(NSURL),
+            fileURLWithPath: ns_string(&destination.to_string_lossy())
+            isDirectory: true.to_objc()
+        ];
+        let options = NSDictionary::dictionary(nil);
+        let queue = promised_file_queue();
+        for (slot, receiver) in claimed.into_iter().enumerate() {
+            let receipt = receipt.clone();
+            let reader =
+                RcBlock::new(move |file_url: *mut Objc2Object, error: *mut Objc2Object| {
+                    let file_url = file_url as id;
+                    let error = error as id;
+                    let written = if file_url == nil {
+                        let message: id = msg_send![error, localizedDescription];
+                        Err(if message == nil {
+                            "the source app did not write the file it promised".to_string()
+                        } else {
+                            message.to_str().to_string()
+                        })
+                    } else {
+                        ns_url_to_path(file_url).map_err(|error| error.to_string())
+                    };
+                    receipt.lock().receive(slot, written);
+                });
+            let _: () = msg_send![
+                receiver.get(),
+                receivePromisedFilesAtDestination: destination
+                options: options
+                operationQueue: queue
+                reader: &*reader as *const _
+            ];
+        }
+    }
+
+    done_rx
+}
+
+/// One claim's promised files as they are written, which happens on
+/// the writing queue — one callback per file, in whatever order the
+/// source app gets to them.
+struct PromisedFileReceipt {
+    /// One slot per claimed promise, in the order they were asked for.
+    slots: Vec<PromisedFileSlot>,
+    done_tx: Option<oneshot::Sender<anyhow::Result<Vec<PathBuf>>>>,
+    /// Where the source app is writing them, to remove again if it
+    /// turns out nobody is still waiting for them.
+    destination: PathBuf,
+    /// The receivers doing the writing, held — never read — until
+    /// every slot has reported and this receipt goes with the last
+    /// reader block that referenced it.
+    #[allow(dead_code)]
+    receivers: Vec<Arc<RetainedPromiseReceiver>>,
+}
+
+enum PromisedFileSlot {
+    Waiting,
+    Done(std::result::Result<PathBuf, String>),
+}
+
+impl PromisedFileReceipt {
+    fn receive(&mut self, ix: usize, written: std::result::Result<PathBuf, String>) {
+        let Some(slot @ PromisedFileSlot::Waiting) = self.slots.get_mut(ix) else {
+            // A promise of more than one file, reporting its second;
+            // the first is the one being waited on.
+            return;
+        };
+        *slot = PromisedFileSlot::Done(written);
+
+        let mut paths = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            match slot {
+                PromisedFileSlot::Waiting => return,
+                // One failure fails the claim: the paths are handed
+                // over as a set the drop handler pairs with what it
+                // asked for by index, and a set with a hole in it
+                // would pair everything after the hole wrongly.
+                PromisedFileSlot::Done(Err(error)) => {
+                    let error = format!("could not receive the promised files: {error}");
+                    self.report(Err(anyhow::anyhow!(error)));
+                    return;
+                }
+                PromisedFileSlot::Done(Ok(path)) => paths.push(path.clone()),
+            }
+        }
+        self.report(Ok(paths));
+    }
+
+    fn report(&mut self, written: anyhow::Result<Vec<PathBuf>>) {
+        let Some(done_tx) = self.done_tx.take() else {
+            return;
+        };
+        // Nothing is waiting on them any more — whatever the source
+        // app wrote is then ours to take back off the disk.
+        if done_tx.send(written).is_err() {
+            std::fs::remove_dir_all(&self.destination).ok();
+        }
+    }
 }
 
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {

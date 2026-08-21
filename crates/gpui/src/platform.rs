@@ -40,9 +40,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
-    hash, point, px, size,
+    PromisedFiles, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
+    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window,
+    WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -1291,6 +1291,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn tab_bar_visible(&self) -> bool {
         false
+    }
+    /// The files promised by the drag that just landed, if the drop
+    /// carried any (macOS file promises). Only meaningful while a
+    /// [`FileDropEvent::Submit`] is being dispatched, and taking them
+    /// leaves none behind for a second caller.
+    fn take_promised_files(&self) -> Option<PromisedFiles> {
+        None
     }
     fn set_edited(&mut self, _edited: bool) {}
     fn set_document_path(&self, _path: Option<&std::path::Path>) {}

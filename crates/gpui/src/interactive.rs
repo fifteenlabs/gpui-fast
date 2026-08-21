@@ -2,6 +2,8 @@ use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, LongPressEvent, Modifiers, Pixels,
     Point, Render, TouchDragEvent, Window, point, seal::Sealed,
 };
+use anyhow::{Context as _, Result};
+use futures::channel::oneshot;
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
 
@@ -729,6 +731,91 @@ impl Render for ExternalPaths {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // the platform will render icons for the dragged files
         Empty
+    }
+}
+
+/// A file a drag offered without handing over a path — a macOS file
+/// promise, which the source app writes out only once the drop is
+/// accepted. Photos.app drags every asset this way: the only real path
+/// on the pasteboard is a poster frame from its library (a JPEG, even
+/// for a video), and the asset itself is promised.
+#[derive(Debug, Clone)]
+pub struct PromisedFile {
+    /// The name the source app suggests for the file, e.g.
+    /// `Screen Recording.mov`. Absent if it offered none.
+    pub suggested_name: Option<String>,
+    /// The platform's identifier for the promised content — a uniform
+    /// type identifier on macOS, e.g. `com.apple.quicktime-movie`.
+    /// Known before the file exists, so a drop target can tell what is
+    /// coming while it waits.
+    pub content_type: Option<String>,
+}
+
+/// The files promised by the drag that just landed, in the same order
+/// as [`ExternalPaths`] — one promise per dragged item, so an item's
+/// stand-in path and its promise share an index.
+///
+/// Taken from the window while a [`FileDropEvent::Submit`] is being
+/// dispatched (see `Window::take_promised_files`), and asked for what
+/// the drop target wants with [`Self::receive`].
+pub struct PromisedFiles {
+    files: Vec<PromisedFile>,
+    #[allow(clippy::type_complexity)]
+    receive: Box<dyn FnOnce(&[usize]) -> oneshot::Receiver<Result<Vec<PathBuf>>>>,
+}
+
+impl PromisedFiles {
+    /// Wraps what the platform knows about a drop's promises: the
+    /// per-file descriptions, and how to ask for a subset of them.
+    pub fn new(
+        files: Vec<PromisedFile>,
+        receive: impl FnOnce(&[usize]) -> oneshot::Receiver<Result<Vec<PathBuf>>> + 'static,
+    ) -> Self {
+        Self {
+            files,
+            receive: Box::new(receive),
+        }
+    }
+
+    /// What each promised file will be, known before it exists.
+    pub fn files(&self) -> &[PromisedFile] {
+        &self.files
+    }
+
+    /// Ask the source app to write out the promises at `indices` into
+    /// [`Self::files`] — and only those. Fulfilling a promise is not
+    /// free of consequence for the drag it came from: a source that
+    /// staged the file in a temporary directory (macOS screenshot
+    /// thumbnails do) finalizes and clears that staging once its
+    /// promise is claimed, which would pull the ground out from under
+    /// a path the same drag handed over. So a drop target asks for
+    /// what it will use and leaves the rest alone.
+    ///
+    /// Call this while the drop is being dispatched — a promise is
+    /// only good for the drag it belongs to.
+    pub fn receive(self, indices: &[usize]) -> PromisedPaths {
+        PromisedPaths((self.receive)(indices))
+    }
+}
+
+impl Debug for PromisedFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromisedFiles")
+            .field("files", &self.files)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The paths of the promised files a drop target asked for, on their
+/// way (see [`PromisedFiles::receive`]).
+pub struct PromisedPaths(oneshot::Receiver<Result<Vec<PathBuf>>>);
+
+impl PromisedPaths {
+    /// Where the source app wrote them, in the order they were asked
+    /// for. Writing them takes as long as the source needs to export
+    /// the asset, so await this off the drop handler.
+    pub async fn paths(self) -> Result<Vec<PathBuf>> {
+        self.0.await.context("promised files were never written")?
     }
 }
 

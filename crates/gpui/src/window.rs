@@ -15,6 +15,7 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    PromisedFiles,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
@@ -3109,6 +3110,20 @@ impl Window {
     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.platform_window
             .set_background_appearance(background_appearance);
+    }
+
+    /// The files the drag that just landed promised rather than handed
+    /// over as paths — macOS file promises, which the source app
+    /// writes out once the drop is accepted. Photos.app drags every
+    /// asset this way: the pasteboard's only real path is a poster
+    /// frame from its library (a JPEG even for a video), and the asset
+    /// itself arrives through the promise.
+    ///
+    /// Call from a drop handler; the promises belong to the drop being
+    /// dispatched, and taking them leaves none for a second handler,
+    /// so the target that claims the drop claims them with it.
+    pub fn take_promised_files(&self) -> Option<PromisedFiles> {
+        self.platform_window.take_promised_files()
     }
 
     /// Mark the window as dirty at the platform level.
