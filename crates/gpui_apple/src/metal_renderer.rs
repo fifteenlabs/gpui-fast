@@ -5,9 +5,9 @@ use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, BrushExtend,
     CLIP_TEXTURE_QUANTUM, ClipCover, ClipId, ClipPlan, ClipTextureBudget, ComposeMode, ContentMask,
-    DevicePixels, DeviceRect, Extent, FillRule, GroupSpec, Hsla, MixMode, PaintSurface, Path,
-    PathBrush, Point, PrimitiveBatch, ScaledPixels, Scene, SceneFilter, SceneStep, Size,
-    TextureBudget, TileId, TransformationMatrix, point, size,
+    DevicePixels, DeviceRect, Extent, FillRule, FilterOp, GroupFilter, GroupSpec, Hsla, MixMode,
+    PaintSurface, Path, PathBrush, Point, PrimitiveBatch, ScaledPixels, Scene, SceneFilter,
+    SceneStep, Size, TextureBudget, TileId, TransformationMatrix, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -74,9 +74,6 @@ const GROUP_TEXTURE_SHRINK_FRAMES: u32 = 240;
 /// group is painted without isolation and says so, which is a wrong picture,
 /// but a loud one and a bounded amount of memory.
 const GROUP_TARGET_BUDGET_BYTES: usize = 128 * 1024 * 1024;
-/// How long a chain of colour matrices one group may carry. CSS `filter` lists
-/// are short, and the whole chain travels to the GPU as one small constant.
-const MAX_GROUP_COLOR_MATRICES: usize = 8;
 /// The most texels one blur pass reads on each side of the texel it writes.
 ///
 /// [`SceneFilter::Blur`] carries a standard deviation and the tail worth
@@ -3392,44 +3389,6 @@ pub struct GroupComposite {
     pub backdrop_size: Size<DevicePixels>,
 }
 
-/// A chain of colour matrices applied to a group's result before it is
-/// composited.
-///
-/// Every CSS colour filter - `hue-rotate`, `saturate`, `sepia`, `grayscale`,
-/// `opacity`, `invert`, `brightness`, `contrast` - is affine per channel, so a
-/// chain of them is this and costs the composite draw nothing but arithmetic:
-/// no extra pass, no extra target.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct GroupFilter {
-    /// How many of `matrices` are in use.
-    pub matrix_count: u32,
-    pub pad: [u32; 3],
-    /// [`MAX_GROUP_COLOR_MATRICES`] row-major 4x5 matrices, flattened.
-    pub matrices: [f32; 160],
-}
-
-impl GroupFilter {
-    /// No filter at all: the group's result is composited as it came out.
-    const NONE: Self = GroupFilter {
-        matrix_count: 0,
-        pad: [0; 3],
-        matrices: [0.; 160],
-    };
-
-    /// Adds one matrix, or fails when the chain is already
-    /// [`MAX_GROUP_COLOR_MATRICES`] long.
-    fn push(&mut self, matrix: &[f32; 20]) -> bool {
-        let index = self.matrix_count as usize;
-        if index >= MAX_GROUP_COLOR_MATRICES {
-            return false;
-        }
-        self.matrices[index * 20..(index + 1) * 20].copy_from_slice(matrix);
-        self.matrix_count += 1;
-        true
-    }
-}
-
 /// What outside the source a filter pass reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -3498,78 +3457,6 @@ impl FilterPass {
             stride: 1,
             edge: edge as u32,
         }
-    }
-}
-
-/// One step of a [`SceneFilter`], flattened out of the tree it arrives as and
-/// with each run of adjacent colour matrices collapsed into a single step.
-///
-/// Collapsing the matrices is not the same as multiplying them together: the
-/// shader still applies them one at a time with a clamp between, because CSS
-/// clamps between filter primitives. It is only that a run of them costs one
-/// pass rather than one pass each.
-#[derive(Clone, Debug)]
-enum FilterOp {
-    Matrices(GroupFilter),
-    Blur {
-        sigma_x: f32,
-        sigma_y: f32,
-    },
-    DropShadow {
-        offset: PointF,
-        sigma: f32,
-        color: Hsla,
-    },
-}
-
-impl FilterOp {
-    /// The steps a filter compiles to, in order.
-    ///
-    /// A run of colour matrices longer than [`MAX_GROUP_COLOR_MATRICES`] is not
-    /// a filter this cannot express: it is two steps rather than one, and the
-    /// second reads what the first wrote. Nothing here can fail, which is why
-    /// there is no longer a "this filter is not implemented" line to log.
-    fn flatten(filter: &SceneFilter) -> Vec<FilterOp> {
-        fn walk(filter: &SceneFilter, ops: &mut Vec<FilterOp>) {
-            match filter {
-                SceneFilter::ColorMatrix(matrix) => {
-                    if let Some(FilterOp::Matrices(matrices)) = ops.last_mut()
-                        && matrices.push(matrix)
-                    {
-                        return;
-                    }
-                    let mut matrices = GroupFilter::NONE;
-                    matrices.push(matrix);
-                    ops.push(FilterOp::Matrices(matrices));
-                }
-                SceneFilter::Blur { radius_x, radius_y } => ops.push(FilterOp::Blur {
-                    sigma_x: radius_x.max(0.),
-                    sigma_y: radius_y.max(0.),
-                }),
-                SceneFilter::DropShadow {
-                    offset_x,
-                    offset_y,
-                    radius,
-                    color,
-                } => ops.push(FilterOp::DropShadow {
-                    offset: point(*offset_x, *offset_y),
-                    sigma: radius.max(0.),
-                    color: *color,
-                }),
-                SceneFilter::Chain(filters) => {
-                    for filter in filters {
-                        walk(filter, ops);
-                    }
-                }
-            }
-        }
-
-        let mut ops = Vec::new();
-        walk(filter, &mut ops);
-        // A blur of zero moves nothing, and a chain can carry one: `blur(0)` is
-        // legal CSS and a transition through it passes over it every time.
-        ops.retain(|op| !matches!(op, FilterOp::Blur { sigma_x, sigma_y } if *sigma_x <= 0. && *sigma_y <= 0.));
-        ops
     }
 }
 
