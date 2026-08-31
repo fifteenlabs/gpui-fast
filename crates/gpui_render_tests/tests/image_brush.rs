@@ -21,9 +21,12 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     Bounds, BrushExtend, ContentMask, Corners, MAX_BRUSH_IMAGE_SIZE, Path, Pixels, RenderImage,
-    ScaledPixels, TransformationMatrix, point, px, size,
+    ScaledPixels, TransformationMatrix, Window, point, px, size,
 };
-use harness::{at, rect, render_frame, render_frame_on_transparent, render_two_frames};
+use harness::{
+    RenderedFrame, at, rect, rect_path, render_frame, render_frame_on_transparent,
+    render_two_frames,
+};
 use image::{Frame, Rgba, RgbaImage};
 
 /// The four colours of the test image, in the RGBA the harness reads back.
@@ -102,12 +105,37 @@ fn brush_over(bounds: Bounds<Pixels>, image_size: u32) -> TransformationMatrix {
         ))
 }
 
-fn rect_path(bounds: Bounds<Pixels>) -> Path<Pixels> {
-    let mut path = Path::new(bounds.origin);
-    path.line_to(bounds.top_right());
-    path.line_to(bounds.bottom_right());
-    path.line_to(bounds.bottom_left());
-    path
+/// Fills `path` with `image` mapped by `transform`, at full alpha and padded
+/// outside the image: what all but the tiling tests below ask for.
+fn brush(
+    window: &mut Window,
+    path: Path<Pixels>,
+    image: &Arc<RenderImage>,
+    transform: TransformationMatrix,
+) {
+    tiled_brush(window, path, image, transform, BrushExtend::Pad);
+}
+
+/// The same, with `extend` deciding what happens past the image along x. Along
+/// y it still pads, so a horizontal tiling can be read one row at a time.
+fn tiled_brush(
+    window: &mut Window,
+    path: Path<Pixels>,
+    image: &Arc<RenderImage>,
+    transform: TransformationMatrix,
+    extend: BrushExtend,
+) {
+    window
+        .paint_path_with_image(
+            path,
+            image.clone(),
+            0,
+            transform,
+            extend,
+            BrushExtend::Pad,
+            1.,
+        )
+        .expect("the brush image fits in the atlas");
 }
 
 fn window() -> gpui::Size<Pixels> {
@@ -125,6 +153,23 @@ fn quadrant_centres() -> [gpui::Point<Pixels>; 4] {
     [at(60., 50.), at(140., 50.), at(60., 110.), at(140., 110.)]
 }
 
+/// The colours [`quadrant_image`] puts in its four quadrants, in the order
+/// [`quadrant_centres`] samples them.
+const QUADRANTS: [([u8; 4], &str); 4] = [
+    (RED, "top-left"),
+    (GREEN, "top-right"),
+    (BLUE, "bottom-left"),
+    (YELLOW, "bottom-right"),
+];
+
+/// Asserts each of [`quadrant_centres`] came back its own quadrant's colour.
+#[track_caller]
+fn assert_quadrants(frame: &RenderedFrame, what: &str) {
+    for (centre, (expected, quadrant)) in quadrant_centres().into_iter().zip(QUADRANTS) {
+        frame.assert_painted(centre, expected, &format!("{what}, {quadrant}"));
+    }
+}
+
 #[test]
 fn an_image_brush_fills_a_triangle_and_only_the_triangle() {
     // The shape half: a brush is a fill, not a rectangle blit, so the coverage
@@ -135,17 +180,7 @@ fn an_image_brush_fills_a_triangle_and_only_the_triangle() {
         let mut path = Path::new(at(20., 20.));
         path.line_to(at(180., 20.));
         path.line_to(at(100., 140.));
-        window
-            .paint_path_with_image(
-                path,
-                image.clone(),
-                0,
-                brush_over(shape(), IMAGE_SIZE),
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        brush(window, path, &image, brush_over(shape(), IMAGE_SIZE));
     });
 
     // Inside the triangle, and inside the image's top-left quadrant. A renderer
@@ -165,24 +200,15 @@ fn the_image_maps_across_the_shape() {
     // rather than four.
     let image = quadrant_image(IMAGE_SIZE);
     let frame = render_frame(window(), move |_, window, _| {
-        window
-            .paint_path_with_image(
-                rect_path(shape()),
-                image.clone(),
-                0,
-                brush_over(shape(), IMAGE_SIZE),
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        brush(
+            window,
+            rect_path(shape()),
+            &image,
+            brush_over(shape(), IMAGE_SIZE),
+        );
     });
 
-    let [top_left, top_right, bottom_left, bottom_right] = quadrant_centres();
-    frame.assert_painted(top_left, RED, "the image's top-left quadrant");
-    frame.assert_painted(top_right, GREEN, "the image's top-right quadrant");
-    frame.assert_painted(bottom_left, BLUE, "the image's bottom-left quadrant");
-    frame.assert_painted(bottom_right, YELLOW, "the image's bottom-right quadrant");
+    assert_quadrants(&frame, "the image's quadrants");
 
     let colours = quadrant_centres().map(|point| frame.color_at(point));
     for (index, colour) in colours.iter().enumerate() {
@@ -211,25 +237,11 @@ fn the_brush_transform_is_honoured() {
         } else {
             TransformationMatrix::unit()
         };
-        window
-            .paint_path_with_image(
-                rect_path(shape()),
-                image.clone(),
-                0,
-                transform,
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        brush(window, rect_path(shape()), &image, transform);
     });
     let [transformed, untransformed] = frames;
 
-    let [top_left, top_right, bottom_left, bottom_right] = quadrant_centres();
-    transformed.assert_painted(top_left, RED, "the transformed brush, top-left");
-    transformed.assert_painted(top_right, GREEN, "the transformed brush, top-right");
-    transformed.assert_painted(bottom_left, BLUE, "the transformed brush, bottom-left");
-    transformed.assert_painted(bottom_right, YELLOW, "the transformed brush, bottom-right");
+    assert_quadrants(&transformed, "the transformed brush");
 
     for point in quadrant_centres() {
         untransformed.assert_painted(
@@ -278,17 +290,13 @@ fn pad_and_repeat_disagree_outside_the_image() {
         } else {
             BrushExtend::Repeat
         };
-        window
-            .paint_path_with_image(
-                rect_path(shape),
-                image.clone(),
-                0,
-                brush_over(one_tile(), IMAGE_SIZE),
-                extend,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        tiled_brush(
+            window,
+            rect_path(shape),
+            &image,
+            brush_over(one_tile(), IMAGE_SIZE),
+            extend,
+        );
     });
     let [padded, repeated] = frames;
 
@@ -326,17 +334,13 @@ fn repeat_recurs_at_the_period_of_the_image() {
     let image = quadrant_image(IMAGE_SIZE);
     let shape = rect(20., 20., 300., 120.);
     let frame = render_frame(size(px(340.), px(160.)), move |_, window, _| {
-        window
-            .paint_path_with_image(
-                rect_path(shape),
-                image.clone(),
-                0,
-                brush_over(one_tile(), IMAGE_SIZE),
-                BrushExtend::Repeat,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        tiled_brush(
+            window,
+            rect_path(shape),
+            &image,
+            brush_over(one_tile(), IMAGE_SIZE),
+            BrushExtend::Repeat,
+        );
     });
 
     // A quarter of the way into the first, second and third copies.
@@ -465,17 +469,12 @@ fn a_rounded_content_mask_clips_a_brushed_path() {
     };
     let frame = render_frame(window(), move |_, window, _| {
         window.with_content_mask(Some(mask), |window| {
-            window
-                .paint_path_with_image(
-                    rect_path(shape()),
-                    image.clone(),
-                    0,
-                    brush_over(shape(), IMAGE_SIZE),
-                    BrushExtend::Pad,
-                    BrushExtend::Pad,
-                    1.,
-                )
-                .expect("the brush image fits in the atlas");
+            brush(
+                window,
+                rect_path(shape()),
+                &image,
+                brush_over(shape(), IMAGE_SIZE),
+            );
         });
     });
 
@@ -509,28 +508,14 @@ fn two_brushes_on_different_atlas_textures_each_show_their_own_image() {
     let left = rect(20., 20., 60., 120.);
     let right = rect(120., 20., 60., 120.);
     let frame = render_frame(window(), move |_, window, _| {
-        window
-            .paint_path_with_image(
-                rect_path(left),
-                filler.clone(),
-                0,
-                brush_over(left, 1024),
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("a 1024-square image is the largest brush the atlas takes");
-        window
-            .paint_path_with_image(
-                rect_path(right),
-                second.clone(),
-                0,
-                brush_over(right, IMAGE_SIZE),
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the second brush image fits in the atlas");
+        // A 1024-square image is the largest brush the atlas takes.
+        brush(window, rect_path(left), &filler, brush_over(left, 1024));
+        brush(
+            window,
+            rect_path(right),
+            &second,
+            brush_over(right, IMAGE_SIZE),
+        );
     });
 
     frame.assert_painted(
@@ -598,29 +583,19 @@ fn element_opacity_dims_a_brushed_path() {
     let right = rect(120., 20., 60., 120.);
     let frame = render_frame(window(), move |_, window, _| {
         window.with_element_opacity(Some(0.5), |window| {
-            window
-                .paint_path_with_image(
-                    rect_path(left),
-                    image.clone(),
-                    0,
-                    brush_over(left, IMAGE_SIZE),
-                    BrushExtend::Pad,
-                    BrushExtend::Pad,
-                    1.,
-                )
-                .expect("the brush image fits in the atlas");
+            brush(
+                window,
+                rect_path(left),
+                &image,
+                brush_over(left, IMAGE_SIZE),
+            );
         });
-        window
-            .paint_path_with_image(
-                rect_path(right),
-                image.clone(),
-                0,
-                brush_over(right, IMAGE_SIZE),
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        brush(
+            window,
+            rect_path(right),
+            &image,
+            brush_over(right, IMAGE_SIZE),
+        );
     });
 
     frame.assert_painted(
@@ -709,35 +684,17 @@ fn the_image_lands_where_the_transform_puts_it_to_within_a_pixel() {
     // that reads the wrong quadrant.
     let image = quadrant_image(160);
     let frame = render_frame(window(), move |_, window, _| {
-        window
-            .paint_path_with_image(
-                rect_path(shape()),
-                image.clone(),
-                0,
-                brush_over(shape(), 160),
-                BrushExtend::Pad,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        brush(window, rect_path(shape()), &image, brush_over(shape(), 160));
     });
 
-    frame.assert_painted(at(98., 78.), RED, "two pixels inside the top-left quadrant");
-    frame.assert_painted(
-        at(102., 78.),
-        GREEN,
-        "two pixels inside the top-right quadrant",
-    );
-    frame.assert_painted(
-        at(98., 82.),
-        BLUE,
-        "two pixels inside the bottom-left quadrant",
-    );
-    frame.assert_painted(
-        at(102., 82.),
-        YELLOW,
-        "two pixels inside the bottom-right quadrant",
-    );
+    let two_pixels_in = [at(98., 78.), at(102., 78.), at(98., 82.), at(102., 82.)];
+    for (point, (expected, quadrant)) in two_pixels_in.into_iter().zip(QUADRANTS) {
+        frame.assert_painted(
+            point,
+            expected,
+            &format!("two pixels inside the {quadrant} quadrant"),
+        );
+    }
 }
 
 #[test]
@@ -755,17 +712,13 @@ fn reflect_mirrors_every_other_copy_and_repeat_does_not() {
         } else {
             BrushExtend::Reflect
         };
-        window
-            .paint_path_with_image(
-                rect_path(shape),
-                image.clone(),
-                0,
-                brush_over(one_tile(), IMAGE_SIZE),
-                extend,
-                BrushExtend::Pad,
-                1.,
-            )
-            .expect("the brush image fits in the atlas");
+        tiled_brush(
+            window,
+            rect_path(shape),
+            &image,
+            brush_over(one_tile(), IMAGE_SIZE),
+            extend,
+        );
     });
     let [repeated, reflected] = frames;
 
@@ -818,17 +771,12 @@ fn a_brush_carries_the_alpha_of_the_image_it_samples() {
     let right = rect(120., 20., 60., 120.);
     let frame = render_frame_on_transparent(window(), move |_, window, _| {
         for (shape, image) in [(left, &translucent), (right, &opaque)] {
-            window
-                .paint_path_with_image(
-                    rect_path(shape),
-                    image.clone(),
-                    0,
-                    brush_over(shape, IMAGE_SIZE),
-                    BrushExtend::Pad,
-                    BrushExtend::Pad,
-                    1.,
-                )
-                .expect("the brush image fits in the atlas");
+            brush(
+                window,
+                rect_path(shape),
+                image,
+                brush_over(shape, IMAGE_SIZE),
+            );
         }
     });
 
@@ -865,17 +813,12 @@ fn a_group_at_half_opacity_fades_the_image_a_path_is_brushed_with() {
     let frame = render_frame(window(), move |bounds, window, _| {
         window.paint_quad(gpui::fill(bounds, gpui::blue()));
         window.with_group_opacity(shape, 0.5, |window| {
-            window
-                .paint_path_with_image(
-                    rect_path(shape),
-                    image.clone(),
-                    0,
-                    brush_over(shape, IMAGE_SIZE),
-                    BrushExtend::Pad,
-                    BrushExtend::Pad,
-                    1.,
-                )
-                .expect("the brush image fits in the atlas");
+            brush(
+                window,
+                rect_path(shape),
+                &image,
+                brush_over(shape, IMAGE_SIZE),
+            );
         });
         let mut recorded = recorded.lock().expect("the paint callback runs alone");
         recorded.clear();

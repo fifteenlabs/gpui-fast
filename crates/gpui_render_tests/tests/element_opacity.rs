@@ -5,7 +5,7 @@
 mod harness;
 
 use gpui::{px, size, white};
-use harness::{HALF_WHITE, WHITE, at, rect, render_frame};
+use harness::{HALF_WHITE, WHITE, at, rect, rect_path, render_frame};
 
 fn window() -> gpui::Size<gpui::Pixels> {
     size(px(200.), px(100.))
@@ -35,12 +35,7 @@ fn element_opacity_halves_the_intensity_of_what_is_painted_inside_it() {
 fn element_opacity_halves_a_path_too() {
     let frame = render_frame(window(), |_, window, _| {
         window.with_element_opacity(Some(0.5), |window| {
-            let bounds = rect(10., 10., 180., 80.);
-            let mut path = gpui::Path::new(bounds.origin);
-            path.line_to(bounds.top_right());
-            path.line_to(bounds.bottom_right());
-            path.line_to(bounds.bottom_left());
-            window.paint_path(path, white());
+            window.paint_path(rect_path(rect(10., 10., 180., 80.)), white());
         });
     });
 

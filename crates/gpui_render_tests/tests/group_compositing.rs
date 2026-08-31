@@ -13,16 +13,15 @@ mod harness;
 
 use std::sync::{Arc, Mutex};
 
-use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
-use core_video::pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA};
 use gpui::{
     App, BlendMode, Bounds, BoxShadow, ClipPath, ComposeMode, Corners, GroupOptions, MixMode, Path,
     Pixels, RenderImage, SceneFilter, Size, TextAlign, TextRun, UnderlineStyle, Window, font,
     point, px, red, size, white,
 };
 use harness::{
-    HALF_WHITE_ON_NOTHING, RenderedFrame, THREE_QUARTER_WHITE_ON_NOTHING, TRANSPARENT, WHITE, at,
-    rect, render_frame, render_frame_on_transparent,
+    GRAY_RED, GRAYSCALE, HALF_WHITE_ON_NOTHING, RenderedFrame, THREE_QUARTER_WHITE_ON_NOTHING,
+    TRANSPARENT, WHITE, at, lines_since, rect, render_frame, render_frame_on_transparent,
+    white_surface,
 };
 use image::{Frame, RgbaImage};
 
@@ -289,18 +288,6 @@ fn dest_in_leaves_what_is_outside_its_clip_alone() {
 
 // ----------------------------------------------------------------- filters --
 
-/// `grayscale(1)` as CSS defines it: a row-major 4x5 matrix taking the
-/// luminance of every channel and leaving alpha alone.
-const GRAYSCALE: [f32; 20] = [
-    0.2126, 0.7152, 0.0722, 0., 0., //
-    0.2126, 0.7152, 0.0722, 0., 0., //
-    0.2126, 0.7152, 0.0722, 0., 0., //
-    0., 0., 0., 1., 0.,
-];
-
-/// The luminance of pure red, as a byte: what `grayscale(1)` turns it into.
-const GRAY_RED: [u8; 4] = [54, 54, 54, 255];
-
 fn red_square_in_a_group(filter: Option<SceneFilter>) -> RenderedFrame {
     render_frame(window(), move |_, window, _| {
         window.with_isolated_group(
@@ -446,40 +433,6 @@ fn tall_window() -> Size<Pixels> {
 /// radii, gaussians and brush matrices against.
 fn offset_group() -> Bounds<Pixels> {
     rect(30., 20., 150., 120.)
-}
-
-/// An opaque white BGRA pixel buffer, backed by an IOSurface so the Metal
-/// texture cache will accept it.
-///
-/// A surface is the one primitive that is drawn one instance at a time, out of
-/// a record the renderer builds by hand rather than out of the instance buffer
-/// every other kind rides in, so it is also the one whose target it is easiest
-/// to get wrong.
-fn white_surface(side: usize) -> CVPixelBuffer {
-    let io_surface_properties = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
-    let attributes = CFDictionary::from_CFType_pairs(&[(
-        CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
-        io_surface_properties.as_CFType(),
-    )]);
-    let buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, side, side, Some(&attributes))
-        .expect("failed to create a pixel buffer for the surface");
-    assert_eq!(buffer.lock_base_address(0), 0, "failed to lock the buffer");
-    // SAFETY: the buffer is locked, so its base address is valid for
-    // `bytes_per_row * height` bytes, and each row's first `side * 4` bytes are
-    // the pixels.
-    unsafe {
-        let base = buffer.get_base_address() as *mut u8;
-        let stride = buffer.get_bytes_per_row();
-        for row in 0..side {
-            std::ptr::write_bytes(base.add(row * stride), 0xff, side * 4);
-        }
-    }
-    assert_eq!(
-        buffer.unlock_base_address(0),
-        0,
-        "failed to unlock the buffer"
-    );
-    buffer
 }
 
 /// A sixteen-texel red image, in the straight BGRA the sprite atlas holds.
@@ -753,37 +706,6 @@ fn a_group_whose_opacity_is_not_a_number_is_composited_at_full_strength() {
 
 // ----------------------------------------------------------- what is dropped --
 
-/// A logger that keeps what it is told, so a test can hold the renderer to the
-/// promise that it says something out loud rather than quietly painting a
-/// different picture.
-struct CapturedLog(Mutex<Vec<String>>);
-
-impl log::Log for CapturedLog {
-    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        self.0
-            .lock()
-            .expect("the capturing logger is never poisoned")
-            .push(record.args().to_string());
-    }
-
-    fn flush(&self) {}
-}
-
-/// The process's one logger, installed the first time a test asks for it.
-fn captured_log() -> &'static CapturedLog {
-    static LOG: std::sync::OnceLock<&'static CapturedLog> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| {
-        let logger: &'static CapturedLog = Box::leak(Box::new(CapturedLog(Mutex::new(Vec::new()))));
-        log::set_logger(logger).expect("nothing else in this binary installs a logger");
-        log::set_max_level(log::LevelFilter::Trace);
-        logger
-    })
-}
-
 #[test]
 fn a_backdrop_filter_is_applied_rather_than_dropped_with_a_line_in_the_log() {
     // `GroupOptions::backdrop_filter` used to be recorded by the scene and
@@ -792,29 +714,20 @@ fn a_backdrop_filter_is_applied_rather_than_dropped_with_a_line_in_the_log() {
     // is the opposite one: the filter reaches the pixels *and* nothing is
     // logged, because a line in the log now would mean something else had gone
     // wrong.
-    let log = captured_log();
-    log.0
-        .lock()
-        .expect("the capturing logger is never poisoned")
-        .clear();
-
-    let frame = render_frame(window(), |_, window, _| {
-        window.paint_quad(gpui::fill(rect(0., 0., 200., 100.), red()));
-        window.with_isolated_group(
-            GroupOptions {
-                bounds: rect(20., 20., 160., 60.),
-                backdrop_filter: Some(SceneFilter::ColorMatrix(GRAYSCALE)),
-                ..Default::default()
-            },
-            |_| {},
-        );
+    let (frame, lines) = lines_since(|| {
+        render_frame(window(), |_, window, _| {
+            window.paint_quad(gpui::fill(rect(0., 0., 200., 100.), red()));
+            window.with_isolated_group(
+                GroupOptions {
+                    bounds: rect(20., 20., 160., 60.),
+                    backdrop_filter: Some(SceneFilter::ColorMatrix(GRAYSCALE)),
+                    ..Default::default()
+                },
+                |_| {},
+            );
+        })
     });
 
-    let lines = log
-        .0
-        .lock()
-        .expect("the capturing logger is never poisoned")
-        .clone();
     assert!(
         !lines.iter().any(|line| line.contains("backdrop")),
         "the renderer said something about the backdrop filter it was supposed \

@@ -15,14 +15,13 @@ use std::sync::Arc;
 
 use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
 use core_video::pixel_buffer::{
-    CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA,
-    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
 };
 use gpui::{
-    App, BorderStyle, Bounds, BoxShadow, ClipPath, Corners, Path, Pixels, Point, RenderImage, Size,
+    App, BorderStyle, Bounds, BoxShadow, ClipPath, Corners, Pixels, Point, RenderImage, Size,
     TextAlign, TextRun, UnderlineStyle, Window, font, px, quad, size, white,
 };
-use harness::{WHITE, at, rect, render_frame};
+use harness::{WHITE, at, rect, rect_path, render_frame, white_surface};
 use image::{Frame, RgbaImage};
 
 /// The window every test in this file renders, in logical pixels.
@@ -197,11 +196,7 @@ fn a_path_is_clipped_by_a_clip_path() {
     // so its clip has to be applied during the rasterization - the copy applies
     // neither the clip nor the content mask.
     assert_clipped("a path", &KEPT, &CUT, |bounds, window, _| {
-        let mut path = Path::new(bounds.origin);
-        path.line_to(bounds.top_right());
-        path.line_to(bounds.bottom_right());
-        path.line_to(bounds.bottom_left());
-        window.paint_path(path, white());
+        window.paint_path(rect_path(bounds), white());
     });
 }
 
@@ -265,35 +260,6 @@ fn glyphs_are_clipped_by_a_clip_path() {
     });
     clipped.assert_region_painted(above, "the glyphs a clip path keeps above its hypotenuse");
     clipped.assert_region_clipped_away(below, "the glyphs a clip path cuts below its hypotenuse");
-}
-
-/// An opaque white BGRA pixel buffer, backed by an IOSurface so the Metal
-/// texture cache will accept it.
-fn white_surface(side: usize) -> CVPixelBuffer {
-    let io_surface_properties = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
-    let attributes = CFDictionary::from_CFType_pairs(&[(
-        CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
-        io_surface_properties.as_CFType(),
-    )]);
-    let buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, side, side, Some(&attributes))
-        .expect("failed to create a pixel buffer for the surface");
-    assert_eq!(buffer.lock_base_address(0), 0, "failed to lock the buffer");
-    // SAFETY: the buffer is locked, so its base address is valid for
-    // `bytes_per_row * height` bytes, and each row's first `side * 4` bytes are
-    // the pixels.
-    unsafe {
-        let base = buffer.get_base_address() as *mut u8;
-        let stride = buffer.get_bytes_per_row();
-        for row in 0..side {
-            std::ptr::write_bytes(base.add(row * stride), 0xff, side * 4);
-        }
-    }
-    assert_eq!(
-        buffer.unlock_base_address(0),
-        0,
-        "failed to unlock the buffer"
-    );
-    buffer
 }
 
 #[test]

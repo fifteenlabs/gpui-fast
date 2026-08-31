@@ -18,11 +18,16 @@
 
 #![allow(dead_code, reason = "each test binary uses a different part of this")]
 
-use std::{rc::Rc, sync::Arc};
+use std::{
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
+use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
+use core_video::pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA};
 use gpui::{
-    App, AppContext as _, Bounds, Context, HeadlessAppContext, IntoElement, Pixels, Point, Render,
-    Size, Styled, Window, canvas, point, px, size,
+    App, AppContext as _, Bounds, Context, HeadlessAppContext, IntoElement, Path, Pixels, Point,
+    Render, Size, Styled, Window, canvas, point, px, size,
 };
 use image::RgbaImage;
 
@@ -61,6 +66,22 @@ pub const HALF_WHITE_ON_NOTHING: [u8; 4] = [128, 128, 128, 128];
 /// Two coats of [`HALF_WHITE_ON_NOTHING`] composited source-over: alpha
 /// `0.5 + 0.5 * 0.5 = 0.75`, and the premultiplied colour alongside it.
 pub const THREE_QUARTER_WHITE_ON_NOTHING: [u8; 4] = [191, 191, 191, 191];
+
+/// `grayscale(1)` as CSS defines it: a row-major 4x5 matrix taking the
+/// luminance of every channel and leaving alpha alone.
+pub const GRAYSCALE: [f32; 20] = [
+    0.2126, 0.7152, 0.0722, 0., 0., //
+    0.2126, 0.7152, 0.0722, 0., 0., //
+    0.2126, 0.7152, 0.0722, 0., 0., //
+    0., 0., 0., 1., 0.,
+];
+
+/// The luminance of pure red, as a byte: what [`GRAYSCALE`] turns it into.
+///
+/// Written out rather than worked out from the matrix above. A test that
+/// computed its expectation from the same numbers it handed the shader would
+/// pass whatever the shader did with them.
+pub const GRAY_RED: [u8; 4] = [54, 54, 54, 255];
 
 /// Paints `paint` into an invisible window of `window_size` logical pixels and
 /// returns what the GPU actually produced.
@@ -250,12 +271,6 @@ impl RenderedFrame {
         }
     }
 
-    /// The colour this frame was cleared to, and so what "nothing was painted
-    /// here" looks like in it.
-    pub fn background(&self) -> [u8; 4] {
-        self.background
-    }
-
     /// Whether the given logical point still shows the window background
     /// exactly: the one definition of "nothing was painted here" the whole
     /// harness uses.
@@ -410,4 +425,100 @@ pub fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
         origin: at(x, y),
         size: size(px(width), px(height)),
     }
+}
+
+/// A rectangle as a closed [`Path`], for the tests whose subject rides the path
+/// pipeline - a brush, a gradient, a clip - rather than the quad one.
+pub fn rect_path(bounds: Bounds<Pixels>) -> Path<Pixels> {
+    let mut path = Path::new(bounds.origin);
+    path.line_to(bounds.top_right());
+    path.line_to(bounds.bottom_right());
+    path.line_to(bounds.bottom_left());
+    path
+}
+
+/// An opaque white BGRA pixel buffer, backed by an IOSurface so the Metal
+/// texture cache will accept it.
+///
+/// A surface is the one primitive that is drawn one instance at a time, out of
+/// a record the renderer builds by hand rather than out of the instance buffer
+/// every other kind rides in, so it is also the one whose target and whose clip
+/// id it is easiest to get wrong.
+pub fn white_surface(side: usize) -> CVPixelBuffer {
+    let io_surface_properties = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
+    let attributes = CFDictionary::from_CFType_pairs(&[(
+        CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
+        io_surface_properties.as_CFType(),
+    )]);
+    let buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, side, side, Some(&attributes))
+        .expect("failed to create a pixel buffer for the surface");
+    assert_eq!(buffer.lock_base_address(0), 0, "failed to lock the buffer");
+    // SAFETY: the buffer is locked, so its base address is valid for
+    // `bytes_per_row * height` bytes, and each row's first `side * 4` bytes are
+    // the pixels.
+    unsafe {
+        let base = buffer.get_base_address() as *mut u8;
+        let stride = buffer.get_bytes_per_row();
+        for row in 0..side {
+            std::ptr::write_bytes(base.add(row * stride), 0xff, side * 4);
+        }
+    }
+    assert_eq!(
+        buffer.unlock_base_address(0),
+        0,
+        "failed to unlock the buffer"
+    );
+    buffer
+}
+
+/// A logger that keeps what it is told, so a test can hold the renderer to the
+/// promise that it says something out loud rather than quietly painting a
+/// different picture - or to the promise that it says nothing.
+struct CapturedLog(Mutex<Vec<String>>);
+
+impl log::Log for CapturedLog {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        self.0
+            .lock()
+            .expect("the capturing logger is never poisoned")
+            .push(record.args().to_string());
+    }
+
+    fn flush(&self) {}
+}
+
+/// The binary's one logger, installed the first time a test asks for it.
+///
+/// `log::set_logger` may be called once per process, and every file under
+/// `tests/` is a process of its own, so the static below is per binary and the
+/// install can never race another one.
+fn captured_log() -> &'static CapturedLog {
+    static LOG: std::sync::OnceLock<&'static CapturedLog> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let logger: &'static CapturedLog = Box::leak(Box::new(CapturedLog(Mutex::new(Vec::new()))));
+        log::set_logger(logger).expect("nothing else in this binary installs a logger");
+        log::set_max_level(log::LevelFilter::Trace);
+        logger
+    })
+}
+
+/// Runs `paint` with the capturing logger emptied first, and hands back what it
+/// returned alongside every line logged while it ran.
+pub fn lines_since<T>(paint: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let log = captured_log();
+    log.0
+        .lock()
+        .expect("the capturing logger is never poisoned")
+        .clear();
+    let painted = paint();
+    let lines = log
+        .0
+        .lock()
+        .expect("the capturing logger is never poisoned")
+        .clone();
+    (painted, lines)
 }

@@ -9,8 +9,8 @@
 
 mod harness;
 
-use gpui::{ContentMask, Corners, Path, px, size, white};
-use harness::{WHITE, at, rect, render_frame, render_inside_content_mask};
+use gpui::{ContentMask, Corners, px, size, white};
+use harness::{WHITE, at, rect, rect_path, render_frame, render_inside_content_mask};
 
 /// The window every test in this file renders, in logical pixels.
 const WINDOW: f32 = 200.;
@@ -64,11 +64,7 @@ fn paint_full_window_quad(bounds: gpui::Bounds<gpui::Pixels>, window: &mut gpui:
 }
 
 fn paint_full_window_path(bounds: gpui::Bounds<gpui::Pixels>, window: &mut gpui::Window) {
-    let mut path = Path::new(bounds.origin);
-    path.line_to(bounds.top_right());
-    path.line_to(bounds.bottom_right());
-    path.line_to(bounds.bottom_left());
-    window.paint_path(path, white());
+    window.paint_path(rect_path(bounds), white());
 }
 
 #[test]

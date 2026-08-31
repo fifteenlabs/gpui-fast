@@ -16,15 +16,13 @@
 
 mod harness;
 
-use std::sync::Mutex;
-
 use gpui::{
-    Bounds, BoxShadow, Corners, GroupOptions, Pixels, SceneFilter, Size, point, px, red, size,
-    white,
+    Bounds, BoxShadow, Corners, GroupOptions, Hsla, Pixels, SceneFilter, Size, Window, point, px,
+    red, size, white,
 };
 use harness::{
-    BACKGROUND, RenderedFrame, TRANSPARENT, WHITE, at, rect, render_frame,
-    render_frame_on_transparent,
+    BACKGROUND, GRAY_RED, GRAYSCALE, RenderedFrame, TRANSPARENT, WHITE, at, lines_since, rect,
+    render_frame, render_frame_on_transparent,
 };
 
 /// A window with room for a square and three standard deviations of tail on
@@ -64,11 +62,13 @@ const WEIGHT_TOLERANCE: u8 = 13;
 
 // ------------------------------------------------------------------- blur --
 
-fn blurred_square(sigma_x: f32, sigma_y: f32) -> RenderedFrame {
+/// A `colour` quad filling `bounds`, alone in a group blurred by `sigma_x`
+/// along x and `sigma_y` along y, over nothing at all.
+fn blurred(bounds: Bounds<Pixels>, colour: Hsla, sigma_x: f32, sigma_y: f32) -> RenderedFrame {
     render_frame_on_transparent(window(), move |_, window, _| {
         window.with_isolated_group(
             GroupOptions {
-                bounds: square(),
+                bounds,
                 filter: Some(SceneFilter::Blur {
                     radius_x: sigma_x,
                     radius_y: sigma_y,
@@ -76,10 +76,15 @@ fn blurred_square(sigma_x: f32, sigma_y: f32) -> RenderedFrame {
                 ..Default::default()
             },
             |window| {
-                window.paint_quad(gpui::fill(square(), white()));
+                window.paint_quad(gpui::fill(bounds, colour));
             },
         );
     })
+}
+
+/// [`square`], white, blurred: what most of the tests below ask for.
+fn blurred_square(sigma_x: f32, sigma_y: f32) -> RenderedFrame {
+    blurred(square(), white(), sigma_x, sigma_y)
 }
 
 /// The same square's alpha, blurred by gpui's own drop shadow shader at the
@@ -209,21 +214,7 @@ fn a_blur_runs_on_premultiplied_colour() {
     // the red channel tracks the alpha. Straight, the red would be averaged
     // with the canvas's black first and the pixel would read (64, 0, 0, 128) -
     // the halo every renderer that gets this wrong draws round its edges.
-    let frame = render_frame_on_transparent(window(), |_, window, _| {
-        window.with_isolated_group(
-            GroupOptions {
-                bounds: square(),
-                filter: Some(SceneFilter::Blur {
-                    radius_x: SIGMA,
-                    radius_y: SIGMA,
-                }),
-                ..Default::default()
-            },
-            |window| {
-                window.paint_quad(gpui::fill(square(), red()));
-            },
-        );
-    });
+    let frame = blurred(square(), red(), SIGMA, SIGMA);
 
     let edge = frame.color_at(at(160., 60.));
     assert!(
@@ -251,21 +242,7 @@ fn a_blur_of_partial_alpha_keeps_the_alpha_it_started_from() {
     // the interior of a region far larger than the kernel has to come back
     // exactly as it went in: a normalized gaussian over a constant field is
     // that constant.
-    let frame = render_frame_on_transparent(window(), |_, window, _| {
-        window.with_isolated_group(
-            GroupOptions {
-                bounds: square(),
-                filter: Some(SceneFilter::Blur {
-                    radius_x: SIGMA,
-                    radius_y: SIGMA,
-                }),
-                ..Default::default()
-            },
-            |window| {
-                window.paint_quad(gpui::fill(square(), red().opacity(0.5)));
-            },
-        );
-    });
+    let frame = blurred(square(), red().opacity(0.5), SIGMA, SIGMA);
 
     frame.assert_painted(
         at(120., 60.),
@@ -332,22 +309,7 @@ fn a_blur_that_runs_out_of_target_fades_rather_than_smearing() {
     // outside that rendering. Finding a copy of the last column instead would
     // drag the square's ink along the whole margin rather than fading it, which
     // is the difference between a blur and a smear.
-    let bounds = rect(0., 30., 80., 60.);
-    let frame = render_frame_on_transparent(window(), move |_, window, _| {
-        window.with_isolated_group(
-            GroupOptions {
-                bounds,
-                filter: Some(SceneFilter::Blur {
-                    radius_x: SIGMA,
-                    radius_y: SIGMA,
-                }),
-                ..Default::default()
-            },
-            |window| {
-                window.paint_quad(gpui::fill(bounds, white()));
-            },
-        );
-    });
+    let frame = blurred(rect(0., 30., 80., 60.), white(), SIGMA, SIGMA);
 
     // Half a device pixel inside the window's left edge, where the kernel finds
     // ink on one side of itself and nothing at all on the other.
@@ -441,17 +403,6 @@ fn a_chain_applies_a_blur_and_a_colour_matrix_in_order() {
     );
 }
 
-/// `grayscale(1)` as CSS defines it.
-const GRAYSCALE: [f32; 20] = [
-    0.2126, 0.7152, 0.0722, 0., 0., //
-    0.2126, 0.7152, 0.0722, 0., 0., //
-    0.2126, 0.7152, 0.0722, 0., 0., //
-    0., 0., 0., 1., 0.,
-];
-
-/// The luminance of pure red, as a byte.
-const GRAY_RED: [u8; 4] = [54, 54, 54, 255];
-
 // ------------------------------------------------------------ drop shadow --
 
 /// The drop shadow's own standard deviation and offset, both large enough that
@@ -460,8 +411,9 @@ const GRAY_RED: [u8; 4] = [54, 54, 54, 255];
 const SHADOW_SIGMA: f32 = 6.;
 const SHADOW_OFFSET: f32 = 30.;
 
-/// A white square with a red shadow under it, `SHADOW_OFFSET` down and right.
-fn drop_shadowed_square() -> RenderedFrame {
+/// A white square with a red shadow under it, `SHADOW_OFFSET` down and right,
+/// blurred at `radius`.
+fn drop_shadowed_square(radius: f32) -> RenderedFrame {
     let bounds = rect(80., 25., 80., 50.);
     render_frame_on_transparent(window(), move |_, window, _| {
         window.with_isolated_group(
@@ -470,7 +422,7 @@ fn drop_shadowed_square() -> RenderedFrame {
                 filter: Some(SceneFilter::DropShadow {
                     offset_x: SHADOW_OFFSET,
                     offset_y: SHADOW_OFFSET,
-                    radius: SHADOW_SIGMA,
+                    radius,
                     color: red(),
                 }),
                 ..Default::default()
@@ -484,7 +436,7 @@ fn drop_shadowed_square() -> RenderedFrame {
 
 #[test]
 fn a_drop_shadow_lands_where_its_offset_puts_it() {
-    let frame = drop_shadowed_square();
+    let frame = drop_shadowed_square(SHADOW_SIGMA);
 
     // The shadow's own rectangle is the square moved thirty logical pixels down
     // and right: 110..190 x 55..105. Well inside it, and outside the square.
@@ -506,7 +458,7 @@ fn a_drop_shadow_lands_where_its_offset_puts_it() {
 
 #[test]
 fn a_drop_shadow_is_drawn_behind_its_source_in_its_own_colour() {
-    let frame = drop_shadowed_square();
+    let frame = drop_shadowed_square(SHADOW_SIGMA);
 
     // The square itself is untouched: the shadow goes underneath it, and an
     // opaque source hides it completely.
@@ -524,7 +476,7 @@ fn a_drop_shadow_is_drawn_behind_its_source_in_its_own_colour() {
 
 #[test]
 fn a_drop_shadow_blurs_its_source_alpha_at_the_standard_deviation_it_was_given() {
-    let frame = drop_shadowed_square();
+    let frame = drop_shadowed_square(SHADOW_SIGMA);
 
     // Across the shadow rectangle's own right edge at x = 190, far from its
     // top and bottom. The same falloff the group blur has, because it is the
@@ -559,24 +511,7 @@ fn a_drop_shadow_blurs_its_source_alpha_at_the_standard_deviation_it_was_given()
 fn a_drop_shadow_of_no_radius_is_the_silhouette_itself() {
     // The degenerate case the blur passes are skipped for. It still has to be
     // the source's alpha, offset and tinted, rather than nothing.
-    let bounds = rect(80., 25., 80., 50.);
-    let frame = render_frame_on_transparent(window(), move |_, window, _| {
-        window.with_isolated_group(
-            GroupOptions {
-                bounds,
-                filter: Some(SceneFilter::DropShadow {
-                    offset_x: SHADOW_OFFSET,
-                    offset_y: SHADOW_OFFSET,
-                    radius: 0.,
-                    color: red(),
-                }),
-                ..Default::default()
-            },
-            |window| {
-                window.paint_quad(gpui::fill(bounds, white()));
-            },
-        );
-    });
+    let frame = drop_shadowed_square(0.);
 
     frame.assert_painted(
         at(170., 85.),
@@ -593,17 +528,27 @@ fn a_drop_shadow_of_no_radius_is_the_silhouette_itself() {
 
 // --------------------------------------------------------- backdrop filter --
 
+/// A group over `bounds` that paints nothing of its own, so the only thing it
+/// can do to the picture is filter what is already behind it.
+fn backdrop_group(window: &mut Window, bounds: Bounds<Pixels>, filter: SceneFilter) {
+    window.with_isolated_group(
+        GroupOptions {
+            bounds,
+            backdrop_filter: Some(filter),
+            ..Default::default()
+        },
+        |_| {},
+    );
+}
+
 #[test]
 fn a_backdrop_filter_filters_what_is_behind_the_group_and_nothing_else() {
     let frame = render_frame(window(), |_, window, _| {
         window.paint_quad(gpui::fill(rect(0., 0., 240., 120.), red()));
-        window.with_isolated_group(
-            GroupOptions {
-                bounds: rect(80., 30., 80., 60.),
-                backdrop_filter: Some(SceneFilter::ColorMatrix(GRAYSCALE)),
-                ..Default::default()
-            },
-            |_| {},
+        backdrop_group(
+            window,
+            rect(80., 30., 80., 60.),
+            SceneFilter::ColorMatrix(GRAYSCALE),
         );
     });
 
@@ -659,16 +604,13 @@ fn a_backdrop_blur_softens_what_is_behind_the_group_and_not_beside_it() {
     // where nothing had.
     let frame = render_frame(window(), |_, window, _| {
         window.paint_quad(gpui::fill(rect(0., 0., 120., 120.), white()));
-        window.with_isolated_group(
-            GroupOptions {
-                bounds: rect(40., 10., 160., 40.),
-                backdrop_filter: Some(SceneFilter::Blur {
-                    radius_x: SIGMA,
-                    radius_y: 0.,
-                }),
-                ..Default::default()
+        backdrop_group(
+            window,
+            rect(40., 10., 160., 40.),
+            SceneFilter::Blur {
+                radius_x: SIGMA,
+                radius_y: 0.,
             },
-            |_| {},
         );
     });
 
@@ -710,16 +652,13 @@ fn a_backdrop_blur_copies_more_of_the_backdrop_than_the_group_covers() {
     // and would leave the column black.
     let frame = render_frame(window(), |_, window, _| {
         window.paint_quad(gpui::fill(rect(0., 0., 120., 120.), white()));
-        window.with_isolated_group(
-            GroupOptions {
-                bounds: rect(120., 30., 80., 60.),
-                backdrop_filter: Some(SceneFilter::Blur {
-                    radius_x: SIGMA,
-                    radius_y: 0.,
-                }),
-                ..Default::default()
+        backdrop_group(
+            window,
+            rect(120., 30., 80., 60.),
+            SceneFilter::Blur {
+                radius_x: SIGMA,
+                radius_y: 0.,
             },
-            |_| {},
         );
     });
 
@@ -758,19 +697,15 @@ fn a_backdrop_blur_duplicates_the_edge_where_the_copy_runs_out() {
     //
     // This is the opposite rule from the one a group's own filter follows, and
     // the reason they differ is that a group's rendering really does stop.
-    let bounds = rect(0., 30., 80., 60.);
     let frame = render_frame(window(), move |_, window, _| {
         window.paint_quad(gpui::fill(rect(0., 0., 240., 120.), white()));
-        window.with_isolated_group(
-            GroupOptions {
-                bounds,
-                backdrop_filter: Some(SceneFilter::Blur {
-                    radius_x: SIGMA,
-                    radius_y: SIGMA,
-                }),
-                ..Default::default()
+        backdrop_group(
+            window,
+            rect(0., 30., 80., 60.),
+            SceneFilter::Blur {
+                radius_x: SIGMA,
+                radius_y: SIGMA,
             },
-            |_| {},
         );
     });
 
@@ -785,47 +720,6 @@ fn a_backdrop_blur_duplicates_the_edge_where_the_copy_runs_out() {
 
 // ------------------------------------------------------------ the counters --
 
-/// The process's one logger, so a test can read what the renderer said.
-struct CapturedLog(Mutex<Vec<String>>);
-
-impl log::Log for CapturedLog {
-    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        self.0
-            .lock()
-            .expect("the capturing logger is never poisoned")
-            .push(record.args().to_string());
-    }
-
-    fn flush(&self) {}
-}
-
-fn captured_log() -> &'static CapturedLog {
-    static LOG: std::sync::OnceLock<&'static CapturedLog> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| {
-        let logger: &'static CapturedLog = Box::leak(Box::new(CapturedLog(Mutex::new(Vec::new()))));
-        log::set_logger(logger).expect("nothing else in this binary installs a logger");
-        log::set_max_level(log::LevelFilter::Trace);
-        logger
-    })
-}
-
-fn lines_since(clear: impl FnOnce()) -> Vec<String> {
-    let log = captured_log();
-    log.0
-        .lock()
-        .expect("the capturing logger is never poisoned")
-        .clear();
-    clear();
-    log.0
-        .lock()
-        .expect("the capturing logger is never poisoned")
-        .clone()
-}
-
 #[test]
 fn a_blur_wider_than_one_pass_can_read_says_that_it_was_approximated() {
     // A standard deviation of forty logical pixels is eighty device pixels, and
@@ -834,9 +728,7 @@ fn a_blur_wider_than_one_pass_can_read_says_that_it_was_approximated() {
     // same integral rather than a shorter one, and it is still an
     // approximation. The rule this file is written to is that an approximation
     // is counted out loud.
-    let lines = lines_since(|| {
-        blurred_square(40., 40.);
-    });
+    let (_, lines) = lines_since(|| blurred_square(40., 40.));
     assert!(
         lines.iter().any(|line| line.contains("integrated every")),
         "a blur too wide to read every texel of said nothing about it: {lines:?}"
@@ -844,9 +736,7 @@ fn a_blur_wider_than_one_pass_can_read_says_that_it_was_approximated() {
 
     // And a blur that fits says nothing, so the line above is about the width
     // rather than about blurring at all.
-    let lines = lines_since(|| {
-        blurred_square(SIGMA, SIGMA);
-    });
+    let (_, lines) = lines_since(|| blurred_square(SIGMA, SIGMA));
     assert!(
         !lines.iter().any(|line| line.contains("integrated every")),
         "a blur narrow enough to read every texel reported an approximation it \

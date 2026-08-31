@@ -25,11 +25,12 @@ mod harness;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    BrushExtend, ColorSpace, Gradient, LinearColorStop, Path, Pixels, Radians, linear_color_stop,
-    point, px, rgb, rgba, size,
+    BrushExtend, ColorSpace, Gradient, LinearColorStop, Path, Pixels, Radians, Window,
+    linear_color_stop, point, px, rgb, rgba, size,
 };
 use harness::{
-    at, rect, render_frame, render_frame_on_transparent, render_frames, render_two_frames,
+    at, rect, rect_path, render_frame, render_frame_on_transparent, render_frames,
+    render_two_frames,
 };
 
 const RED: [u8; 4] = [255, 0, 0, 255];
@@ -51,12 +52,12 @@ fn shape() -> gpui::Bounds<Pixels> {
     rect(20., 20., 160., 120.)
 }
 
-fn rect_path(bounds: gpui::Bounds<Pixels>) -> Path<Pixels> {
-    let mut path = Path::new(bounds.origin);
-    path.line_to(bounds.top_right());
-    path.line_to(bounds.bottom_right());
-    path.line_to(bounds.bottom_left());
-    path
+/// Fills `shape` with `gradient` at full alpha: what all but one of the tests
+/// below ask for.
+fn paint_gradient(window: &mut Window, shape: gpui::Bounds<Pixels>, gradient: &Gradient) {
+    window
+        .paint_path_with_gradient(rect_path(shape), gradient, 1.)
+        .expect("the baked gradient fits in the atlas");
 }
 
 /// Red, green, blue at 0, a half and 1: the stop list whose middle a two-stop
@@ -96,13 +97,11 @@ fn a_three_stop_linear_gradient_shows_its_middle_stop_in_the_middle() {
     // three-quarter points, which differ from each other and from the middle.
     let (start, end) = across_the_shape();
     let frame = render_frame(window(), move |_, window, _| {
-        window
-            .paint_path_with_gradient(
-                rect_path(shape()),
-                &Gradient::linear(start, end, three_stops()),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(
+            window,
+            shape(),
+            &Gradient::linear(start, end, three_stops()),
+        );
     });
 
     frame.assert_painted(along(0.5), GREEN, "the middle stop, in the middle");
@@ -144,9 +143,7 @@ fn a_stop_sits_where_its_position_puts_it() {
             linear_color_stop(rgb(0x00ff00), middle),
             linear_color_stop(rgb(0x0000ff), 1.),
         ];
-        window
-            .paint_path_with_gradient(rect_path(shape()), &Gradient::linear(start, end, stops), 1.)
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(window, shape(), &Gradient::linear(start, end, stops));
     });
     let [quarter, half] = frames;
 
@@ -199,13 +196,11 @@ fn a_repeating_gradient_recurs_and_a_padded_one_does_not() {
             linear_color_stop(rgb(0xff0000), 0.),
             linear_color_stop(rgb(0x0000ff), 1.),
         ];
-        window
-            .paint_path_with_gradient(
-                rect_path(shape()),
-                &Gradient::linear(start, end, stops).extend(extend),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(
+            window,
+            shape(),
+            &Gradient::linear(start, end, stops).extend(extend),
+        );
     });
     let [repeated, padded] = frames;
 
@@ -241,13 +236,11 @@ fn a_radial_gradient_is_radially_symmetric() {
     // a flat fill fails the second.
     let centre = at(100., 80.);
     let frame = render_frame(window(), move |_, window, _| {
-        window
-            .paint_path_with_gradient(
-                rect_path(shape()),
-                &Gradient::radial(centre, size(px(60.), px(60.)), three_stops()),
-                1.,
-            )
-            .expect("the baked field fits in the atlas");
+        paint_gradient(
+            window,
+            shape(),
+            &Gradient::radial(centre, size(px(60.), px(60.)), three_stops()),
+        );
     });
 
     let around = |radius: f32| {
@@ -310,13 +303,11 @@ fn a_sweep_gradient_turns_with_the_angle_and_not_with_the_radius() {
             linear_color_stop(rgb(0x000000), 0.),
             linear_color_stop(rgb(0xffffff), 1.),
         ];
-        window
-            .paint_path_with_gradient(
-                rect_path(shape()),
-                &Gradient::sweep(centre, Radians(-std::f32::consts::FRAC_PI_2), stops),
-                1.,
-            )
-            .expect("the baked field fits in the atlas");
+        paint_gradient(
+            window,
+            shape(),
+            &Gradient::sweep(centre, Radians(-std::f32::consts::FRAC_PI_2), stops),
+        );
     });
 
     // Due east is a quarter turn clockwise from due north, where the ramp
@@ -408,17 +399,15 @@ fn a_gradient_composites_over_what_is_under_it() {
             linear_color_stop(rgb(0xff0000), 0.7),
             linear_color_stop(rgb(0xff0000), 1.),
         ];
-        window
-            .paint_path_with_gradient(
-                rect_path(left),
-                &Gradient::linear(
-                    point(left.left(), px(0.)),
-                    point(left.right(), px(0.)),
-                    fading,
-                ),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(
+            window,
+            left,
+            &Gradient::linear(
+                point(left.left(), px(0.)),
+                point(left.right(), px(0.)),
+                fading,
+            ),
+        );
 
         let opaque = vec![
             linear_color_stop(rgb(0xff0000), 0.),
@@ -487,13 +476,7 @@ fn a_two_stop_background_still_renders_itself_and_bakes_nothing() {
         );
         recorded.push(window.baked_gradient_count());
 
-        window
-            .paint_path_with_gradient(
-                rect_path(right),
-                &Gradient::linear(start, end, three_stops()),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(window, right, &Gradient::linear(start, end, three_stops()));
         recorded.push(window.baked_gradient_count());
 
         window.paint_path(
@@ -571,23 +554,15 @@ fn the_same_gradient_painted_twice_bakes_once() {
         recorded.clear();
 
         for shape in [rect(20., 20., 160., 50.), rect(20., 90., 160., 50.)] {
-            window
-                .paint_path_with_gradient(
-                    rect_path(shape),
-                    &Gradient::linear(start, end, three_stops()),
-                    1.,
-                )
-                .expect("the baked ramp fits in the atlas");
+            paint_gradient(window, shape, &Gradient::linear(start, end, three_stops()));
         }
         recorded.push(window.baked_gradient_count());
 
-        window
-            .paint_path_with_gradient(
-                rect_path(rect(120., 20., 60., 120.)),
-                &Gradient::linear(start, end, three_stops()).color_space(ColorSpace::Oklab),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(
+            window,
+            rect(120., 20., 60., 120.),
+            &Gradient::linear(start, end, three_stops()).color_space(ColorSpace::Oklab),
+        );
         recorded.push(window.baked_gradient_count());
     });
 
@@ -624,13 +599,7 @@ fn a_stop_at_transparent_does_not_fade_through_black() {
             linear_color_stop(rgb(0xff0000), 0.),
             linear_color_stop(rgba(0x00000000), 1.),
         ];
-        window
-            .paint_path_with_gradient(
-                rect_path(shape()),
-                &Gradient::linear(start, end, fading),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(window, shape(), &Gradient::linear(start, end, fading));
     });
 
     frame.assert_painted(
@@ -683,24 +652,20 @@ fn a_full_gradient_cache_evicts_rather_than_giving_up_on_gradients() {
                         linear_color_stop(rgb(0x00ff00), 0.5),
                         linear_color_stop(rgb(0x0000ff), 1.),
                     ];
-                    window
-                        .paint_path_with_gradient(
-                            rect_path(shape()),
-                            &Gradient::radial(centre, size(px(60.), px(60.)), stops),
-                            1.,
-                        )
-                        .expect("the baked field fits in the atlas");
+                    paint_gradient(
+                        window,
+                        shape(),
+                        &Gradient::radial(centre, size(px(60.), px(60.)), stops),
+                    );
                 }
             }
             1 => window.paint_quad(gpui::fill(shape(), gpui::blue())),
             _ => {
-                window
-                    .paint_path_with_gradient(
-                        rect_path(shape()),
-                        &Gradient::radial(centre, size(px(60.), px(60.)), three_stops()),
-                        1.,
-                    )
-                    .expect("the baked field fits in the atlas");
+                paint_gradient(
+                    window,
+                    shape(),
+                    &Gradient::radial(centre, size(px(60.), px(60.)), three_stops()),
+                );
             }
         }
         recorded
@@ -750,13 +715,7 @@ fn a_gradient_carries_the_alpha_of_its_stops() {
             linear_color_stop(rgba(0xff000080), 0.5),
             linear_color_stop(rgb(0xff0000), 1.),
         ];
-        window
-            .paint_path_with_gradient(
-                rect_path(shape()),
-                &Gradient::linear(start, end, fading),
-                1.,
-            )
-            .expect("the baked ramp fits in the atlas");
+        paint_gradient(window, shape(), &Gradient::linear(start, end, fading));
     });
 
     frame.assert_painted(
