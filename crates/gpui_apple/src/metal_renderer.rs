@@ -205,15 +205,12 @@ pub struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
-    paths_rasterization_pipeline_state: metal::RenderPipelineState,
+    primitive_pipelines: [metal::RenderPipelineState; PRIMITIVE_PIPELINES.len()],
+    /// Composites the rasterized path intermediate, and has no clipped twin on
+    /// purpose: the clip is applied while the path is rasterized, by
+    /// [`PrimitivePipeline::PathsRasterization`], so by the time the sprite is
+    /// composited the coverage already carries it.
     path_sprites_pipeline_state: metal::RenderPipelineState,
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
-    surfaces_pipeline_state: metal::RenderPipelineState,
-    bgra_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     /// Bound wherever a path rasterization pass has no image brush to sample: a
     /// fragment shader that declares a `texture2d` argument needs something
@@ -499,90 +496,13 @@ impl MetalRenderer {
             },
         );
 
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &device,
-            &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-            false,
-        );
+        let primitive_pipelines = build_primitive_pipelines(&device, &library, false);
         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
             &device,
             &library,
             "path_sprites",
             "path_sprite_vertex",
             "path_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        let surfaces_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "surfaces",
-            "surface_vertex",
-            "surface_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            false,
-        );
-        // BGRA surfaces carry premultiplied alpha (they come from GPU
-        // renderers like vello, and CoreGraphics can only produce
-        // premultiplied BGRA), so blend with source factor One — the
-        // path-sprite builder's blend config — rather than gpui's usual
-        // straight-alpha SourceAlpha factor.
-        let bgra_surfaces_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &library,
-            "bgra_surfaces",
-            "surface_vertex",
-            "surface_bgra_fragment",
             MTLPixelFormat::BGRA8Unorm,
             false,
         );
@@ -634,15 +554,8 @@ impl MetalRenderer {
             is_unified_memory,
             opaque,
             command_queue,
-            paths_rasterization_pipeline_state,
+            primitive_pipelines,
             path_sprites_pipeline_state,
-            shadows_pipeline_state,
-            quads_pipeline_state,
-            underlines_pipeline_state,
-            monochrome_sprites_pipeline_state,
-            polychrome_sprites_pipeline_state,
-            surfaces_pipeline_state,
-            bgra_surfaces_pipeline_state,
             unit_vertices,
             default_brush_texture,
             instance_buffer_pool,
@@ -1599,17 +1512,21 @@ impl MetalRenderer {
             mem::size_of::<FilterPass>() as u64,
             pass as *const FilterPass as *const _,
         );
-        let matrices = matrices.copied().unwrap_or(GroupFilter::NONE);
-        encoder.set_fragment_bytes(
-            FilterInputIndex::Filter as u64,
-            mem::size_of::<GroupFilter>() as u64,
-            &matrices as *const GroupFilter as *const _,
-        );
+        // Bound only where the pipeline declares them. A `GroupFilter` is 656
+        // bytes, and a separable gaussian is two passes, so filling the slot
+        // unconditionally uploaded 1312 bytes of zeroes per blurred group per
+        // frame into a buffer the blur fragment shader does not name.
+        if let Some(matrices) = matrices {
+            encoder.set_fragment_bytes(
+                FilterInputIndex::Filter as u64,
+                mem::size_of::<GroupFilter>() as u64,
+                matrices as *const GroupFilter as *const _,
+            );
+        }
         encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(source));
-        encoder.set_fragment_texture(
-            FilterInputIndex::Blurred as u64,
-            Some(blurred.unwrap_or(source)),
-        );
+        if let Some(blurred) = blurred {
+            encoder.set_fragment_texture(FilterInputIndex::Blurred as u64, Some(blurred));
+        }
         encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
         encoder.end_encoding();
     }
@@ -1870,9 +1787,7 @@ impl MetalRenderer {
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         let clip = self.clip_variant(clipped);
         command_encoder.set_render_pipeline_state(
-            clip.map_or(&self.paths_rasterization_pipeline_state, |clip| {
-                &clip.paths_rasterization_pipeline_state
-            }),
+            self.pipeline_for(PrimitivePipeline::PathsRasterization, clip),
         );
         if let (Some(clip), Some(clip_id_bindings)) = (clip, clip_id_bindings.as_ref()) {
             command_encoder.set_fragment_buffer(
@@ -1963,11 +1878,8 @@ impl MetalRenderer {
         }
 
         let clip = self.clip_variant(clipped);
-        command_encoder.set_render_pipeline_state(
-            clip.map_or(&self.shadows_pipeline_state, |clip| {
-                &clip.shadows_pipeline_state
-            }),
-        );
+        command_encoder
+            .set_render_pipeline_state(self.pipeline_for(PrimitivePipeline::Shadows, clip));
         self.bind_clip_mask(
             clip,
             command_encoder,
@@ -2018,11 +1930,8 @@ impl MetalRenderer {
         }
 
         let clip = self.clip_variant(clipped);
-        command_encoder.set_render_pipeline_state(
-            clip.map_or(&self.quads_pipeline_state, |clip| {
-                &clip.quads_pipeline_state
-            }),
-        );
+        command_encoder
+            .set_render_pipeline_state(self.pipeline_for(PrimitivePipeline::Quads, clip));
         self.bind_clip_mask(
             clip,
             command_encoder,
@@ -2150,11 +2059,8 @@ impl MetalRenderer {
         }
 
         let clip = self.clip_variant(clipped);
-        command_encoder.set_render_pipeline_state(
-            clip.map_or(&self.underlines_pipeline_state, |clip| {
-                &clip.underlines_pipeline_state
-            }),
-        );
+        command_encoder
+            .set_render_pipeline_state(self.pipeline_for(PrimitivePipeline::Underlines, clip));
         self.bind_clip_mask(
             clip,
             command_encoder,
@@ -2214,9 +2120,7 @@ impl MetalRenderer {
         );
         let clip = self.clip_variant(clipped);
         command_encoder.set_render_pipeline_state(
-            clip.map_or(&self.monochrome_sprites_pipeline_state, |clip| {
-                &clip.monochrome_sprites_pipeline_state
-            }),
+            self.pipeline_for(PrimitivePipeline::MonochromeSprites, clip),
         );
         self.bind_clip_mask(
             clip,
@@ -2282,9 +2186,7 @@ impl MetalRenderer {
         );
         let clip = self.clip_variant(clipped);
         command_encoder.set_render_pipeline_state(
-            clip.map_or(&self.polychrome_sprites_pipeline_state, |clip| {
-                &clip.polychrome_sprites_pipeline_state
-            }),
+            self.pipeline_for(PrimitivePipeline::PolychromeSprites, clip),
         );
         self.bind_clip_mask(
             clip,
@@ -2411,9 +2313,7 @@ impl MetalRenderer {
             match CVPixelBufferGetPixelFormatType(image_buffer) {
                 format if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
                     command_encoder.set_render_pipeline_state(
-                        clip.map_or(&self.surfaces_pipeline_state, |clip| {
-                            &clip.surfaces_pipeline_state
-                        }),
+                        self.pipeline_for(PrimitivePipeline::Surfaces, clip),
                     );
                     let plane = |plane, format| {
                         texture(
@@ -2432,9 +2332,7 @@ impl MetalRenderer {
                 }
                 format if format == kCVPixelFormatType_32BGRA => {
                     command_encoder.set_render_pipeline_state(
-                        clip.map_or(&self.bgra_surfaces_pipeline_state, |clip| {
-                            &clip.bgra_surfaces_pipeline_state
-                        }),
+                        self.pipeline_for(PrimitivePipeline::BgraSurfaces, clip),
                     );
                     // Unlike the video path above (whose AVFoundation buffers
                     // are always cache-compatible), BGRA buffers come from
@@ -2483,6 +2381,23 @@ impl MetalRenderer {
     /// is one that needs them.
     fn clip_variant(&self, clipped: bool) -> Option<&ClipResources> {
         if clipped { self.clip.as_ref() } else { None }
+    }
+
+    /// The pipeline that draws `pipeline`, in the specialization this batch
+    /// needs.
+    ///
+    /// Indexing an array rather than reaching for a named field per kind is
+    /// what makes a missing clipped pipeline a compile error: reading one out
+    /// of `Option<&ClipResources>` by field name would fall back to the
+    /// unclipped pipeline, which draws the batch with its clip path silently
+    /// ignored.
+    fn pipeline_for<'a>(
+        &'a self,
+        pipeline: PrimitivePipeline,
+        clip: Option<&'a ClipResources>,
+    ) -> &'a metal::RenderPipelineState {
+        let pipelines = clip.map_or(&self.primitive_pipelines, |clip| &clip.primitive_pipelines);
+        &pipelines[pipeline as usize]
     }
 
     /// Binds the coverage atlas and the per-clip records the clipped variant of
@@ -2781,6 +2696,141 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     }
 
     RgbaImage::from_raw(width, height, pixels).context("failed to create RgbaImage from pixel data")
+}
+
+/// A drawing pipeline that exists in both an unclipped and a clip-path
+/// specialization, and how it is built.
+///
+/// The variant is its own index into [`MetalRenderer::primitive_pipelines`] and
+/// [`ClipResources::primitive_pipelines`], which is what makes
+/// [`MetalRenderer::pipeline_for`] total: a clipped batch cannot fall back to
+/// the unclipped pipeline because its clipped twin was never built, which is a
+/// picture with the clip path silently missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimitivePipeline {
+    PathsRasterization = 0,
+    Shadows,
+    Quads,
+    Underlines,
+    MonochromeSprites,
+    PolychromeSprites,
+    Surfaces,
+    BgraSurfaces,
+}
+
+/// Which blend and attachment shape a pipeline is built with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipelineShape {
+    /// gpui's usual straight-alpha source-over.
+    StraightAlpha,
+    /// Source factor `One`, for a fragment that is already premultiplied.
+    Premultiplied,
+    /// Multisampled, drawn into the path intermediate.
+    Multisampled,
+}
+
+/// Every [`PrimitivePipeline`], in the order the enum indexes them: the label
+/// Metal's debugger shows, the vertex function, the fragment function, and how
+/// it blends. A clipped pipeline is the same three names with `_clipped`
+/// appended to the label and the `CLIPPED` function constant set.
+const PRIMITIVE_PIPELINES: [(&str, &str, &str, PipelineShape); 8] = [
+    (
+        "paths_rasterization",
+        "path_rasterization_vertex",
+        "path_rasterization_fragment",
+        PipelineShape::Multisampled,
+    ),
+    (
+        "shadows",
+        "shadow_vertex",
+        "shadow_fragment",
+        PipelineShape::StraightAlpha,
+    ),
+    (
+        "quads",
+        "quad_vertex",
+        "quad_fragment",
+        PipelineShape::StraightAlpha,
+    ),
+    (
+        "underlines",
+        "underline_vertex",
+        "underline_fragment",
+        PipelineShape::StraightAlpha,
+    ),
+    (
+        "monochrome_sprites",
+        "monochrome_sprite_vertex",
+        "monochrome_sprite_fragment",
+        PipelineShape::StraightAlpha,
+    ),
+    (
+        "polychrome_sprites",
+        "polychrome_sprite_vertex",
+        "polychrome_sprite_fragment",
+        PipelineShape::StraightAlpha,
+    ),
+    (
+        "surfaces",
+        "surface_vertex",
+        "surface_fragment",
+        PipelineShape::StraightAlpha,
+    ),
+    // BGRA surfaces carry premultiplied alpha (they come from GPU renderers
+    // like vello, and CoreGraphics can only produce premultiplied BGRA), so
+    // they blend with source factor One rather than gpui's usual straight-alpha
+    // SourceAlpha factor.
+    (
+        "bgra_surfaces",
+        "surface_vertex",
+        "surface_bgra_fragment",
+        PipelineShape::Premultiplied,
+    ),
+];
+
+/// Builds every [`PrimitivePipeline`], either unclipped or clipped.
+fn build_primitive_pipelines(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    clipped: bool,
+) -> [metal::RenderPipelineState; PRIMITIVE_PIPELINES.len()] {
+    PRIMITIVE_PIPELINES.map(|(label, vertex_fn, fragment_fn, shape)| {
+        let label = if clipped {
+            format!("{label}_clipped")
+        } else {
+            label.to_string()
+        };
+        match shape {
+            PipelineShape::Multisampled => build_path_rasterization_pipeline_state(
+                device,
+                library,
+                &label,
+                vertex_fn,
+                fragment_fn,
+                MTLPixelFormat::BGRA8Unorm,
+                PATH_SAMPLE_COUNT,
+                clipped,
+            ),
+            PipelineShape::Premultiplied => build_path_sprite_pipeline_state(
+                device,
+                library,
+                &label,
+                vertex_fn,
+                fragment_fn,
+                MTLPixelFormat::BGRA8Unorm,
+                clipped,
+            ),
+            PipelineShape::StraightAlpha => build_pipeline_state(
+                device,
+                library,
+                &label,
+                vertex_fn,
+                fragment_fn,
+                MTLPixelFormat::BGRA8Unorm,
+                clipped,
+            ),
+        }
+    })
 }
 
 fn build_pipeline_state(
@@ -3253,11 +3303,11 @@ enum GroupCompositeInputIndex {
 enum FilterInputIndex {
     Vertices = 0,
     Pass = 1,
+    /// The colour matrices, declared by `filter_matrix_fragment` alone.
     Filter = 2,
     Source = 3,
-    /// The blurred alpha a drop shadow draws behind its source. Every pass
-    /// declares it so that one pipeline layout serves all three; the two that
-    /// do not read it are bound their own source.
+    /// The blurred alpha a drop shadow draws behind its source, declared by
+    /// `filter_drop_shadow_fragment` alone.
     Blurred = 4,
 }
 
@@ -3890,14 +3940,7 @@ struct ClipResources {
     even_odd_stencil_state: metal::DepthStencilState,
     nonzero_cover_state: metal::DepthStencilState,
     even_odd_cover_state: metal::DepthStencilState,
-    paths_rasterization_pipeline_state: metal::RenderPipelineState,
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
-    surfaces_pipeline_state: metal::RenderPipelineState,
-    bgra_surfaces_pipeline_state: metal::RenderPipelineState,
+    primitive_pipelines: [metal::RenderPipelineState; PRIMITIVE_PIPELINES.len()],
     /// The coverage the clipped fragment shaders sample, one tile per clip.
     /// Never cleared: a tile is either written whole by this frame or never
     /// read, because a clip that has no tile says so in its `ClipMask`.
@@ -3943,79 +3986,7 @@ impl ClipResources {
             even_odd_stencil_state: build_stencil_state(device, FillRule::EvenOdd),
             nonzero_cover_state: build_cover_state(device, FillRule::NonZero),
             even_odd_cover_state: build_cover_state(device, FillRule::EvenOdd),
-            paths_rasterization_pipeline_state: build_path_rasterization_pipeline_state(
-                device,
-                library,
-                "paths_rasterization_clipped",
-                "path_rasterization_vertex",
-                "path_rasterization_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                PATH_SAMPLE_COUNT,
-                true,
-            ),
-            shadows_pipeline_state: build_pipeline_state(
-                device,
-                library,
-                "shadows_clipped",
-                "shadow_vertex",
-                "shadow_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
-            quads_pipeline_state: build_pipeline_state(
-                device,
-                library,
-                "quads_clipped",
-                "quad_vertex",
-                "quad_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
-            underlines_pipeline_state: build_pipeline_state(
-                device,
-                library,
-                "underlines_clipped",
-                "underline_vertex",
-                "underline_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
-            monochrome_sprites_pipeline_state: build_pipeline_state(
-                device,
-                library,
-                "monochrome_sprites_clipped",
-                "monochrome_sprite_vertex",
-                "monochrome_sprite_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
-            polychrome_sprites_pipeline_state: build_pipeline_state(
-                device,
-                library,
-                "polychrome_sprites_clipped",
-                "polychrome_sprite_vertex",
-                "polychrome_sprite_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
-            surfaces_pipeline_state: build_pipeline_state(
-                device,
-                library,
-                "surfaces_clipped",
-                "surface_vertex",
-                "surface_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
-            bgra_surfaces_pipeline_state: build_path_sprite_pipeline_state(
-                device,
-                library,
-                "bgra_surfaces_clipped",
-                "surface_vertex",
-                "surface_bgra_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-                true,
-            ),
+            primitive_pipelines: build_primitive_pipelines(device, library, true),
             atlas,
             scratch,
             multisample,
