@@ -115,54 +115,80 @@ pub struct GroupId(pub u32);
 #[repr(transparent)]
 pub struct SegmentId(pub u32);
 
-/// The primitives painted between two group boundaries: one contiguous range
-/// of each per-kind array.
+/// The eight per-kind arrays a [`Scene`] appends primitives to, in the one
+/// order the whole file spells them.
 ///
-/// Eight ranges are enough to name a subtree because
-/// [`Scene::insert_primitive`] appends to those arrays and nothing else does,
-/// so primitives land in paint order, and a group is closure-scoped.
-/// Everything painted between a [`Scene::push_group`] and its matching
-/// [`Scene::pop_group`] therefore occupies a contiguous range of every array,
-/// before any sorting - which is why isolating a subtree needs no second
-/// scene, no re-batching, and no change to [`Scene::insert_primitive`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[expect(missing_docs)]
-pub struct Segment {
-    pub shadows: Range<usize>,
-    pub quads: Range<usize>,
-    pub paths: Range<usize>,
-    pub underlines: Range<usize>,
-    pub monochrome_sprites: Range<usize>,
-    pub subpixel_sprites: Range<usize>,
-    pub polychrome_sprites: Range<usize>,
-    pub surfaces: Range<usize>,
+/// The list was written out ten times before this: [`Segment`]'s fields, its
+/// `is_empty` and `len`, three ways of building one, the boxes a run covers,
+/// and [`BatchIterator`]'s cursors and its eight arms. Adding a ninth kind of
+/// primitive meant finding all ten and getting all ten right.
+macro_rules! with_primitive_kinds {
+    ($callback:ident) => {
+        $callback! {
+            shadows,
+            quads,
+            paths,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            surfaces
+        }
+    };
 }
 
-impl Segment {
-    /// Whether this run holds no primitives at all.
-    pub fn is_empty(&self) -> bool {
-        self.shadows.is_empty()
-            && self.quads.is_empty()
-            && self.paths.is_empty()
-            && self.underlines.is_empty()
-            && self.monochrome_sprites.is_empty()
-            && self.subpixel_sprites.is_empty()
-            && self.polychrome_sprites.is_empty()
-            && self.surfaces.is_empty()
-    }
+macro_rules! define_segment {
+    ($($kind:ident),+ $(,)?) => {
+        /// The primitives painted between two group boundaries: one contiguous
+        /// range of each per-kind array.
+        ///
+        /// Eight ranges are enough to name a subtree because
+        /// [`Scene::insert_primitive`] appends to those arrays and nothing else
+        /// does, so primitives land in paint order, and a group is
+        /// closure-scoped. Everything painted between a [`Scene::push_group`]
+        /// and its matching [`Scene::pop_group`] therefore occupies a
+        /// contiguous range of every array, before any sorting - which is why
+        /// isolating a subtree needs no second scene, no re-batching, and no
+        /// change to [`Scene::insert_primitive`].
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        #[expect(missing_docs)]
+        pub struct Segment {
+            $(pub $kind: Range<usize>,)+
+        }
 
-    /// How many primitives this run holds, across every kind.
-    pub fn len(&self) -> usize {
-        self.shadows.len()
-            + self.quads.len()
-            + self.paths.len()
-            + self.underlines.len()
-            + self.monochrome_sprites.len()
-            + self.subpixel_sprites.len()
-            + self.polychrome_sprites.len()
-            + self.surfaces.len()
-    }
+        impl Segment {
+            /// Whether this run holds no primitives at all.
+            pub fn is_empty(&self) -> bool {
+                true $(&& self.$kind.is_empty())+
+            }
+
+            /// How many primitives this run holds, across every kind.
+            pub fn len(&self) -> usize {
+                0 $(+ self.$kind.len())+
+            }
+        }
+
+        impl Scene {
+            /// Every per-kind array from where `start` opened it to where it
+            /// ends now: the run painted since `start` was taken.
+            fn since(&self, start: &Segment) -> Segment {
+                Segment {
+                    $($kind: start.$kind.start..self.$kind.len(),)+
+                }
+            }
+
+            /// Where every per-kind array currently ends, as an empty run
+            /// starting there.
+            fn end_indices(&self) -> Segment {
+                Segment {
+                    $($kind: self.$kind.len()..self.$kind.len(),)+
+                }
+            }
+        }
+    };
 }
+
+with_primitive_kinds!(define_segment);
 
 /// The blend function a group is composited with, mirroring `peniko::Mix`
 /// value for value so a painter that speaks peniko converts with a plain
@@ -666,11 +692,9 @@ struct OpenGroup {
     /// How deep the layer stack was at the push. A group may sit inside a
     /// layer, but it may not straddle one: see [`Scene::push_group`].
     layer_depth: usize,
-    /// Whether a group pushed inside this one survived its pop. One that
-    /// folded away left nothing behind and does not count.
-    has_surviving_child: bool,
     /// The union of the final bounds of the groups inside this one that
-    /// survived.
+    /// survived, and so also whether any of them did: one that folded away
+    /// left nothing behind and never reaches here.
     ///
     /// A surviving child is composited onto this group's target as one quad
     /// over its own bounds, and a blur has already grown those past everything
@@ -809,7 +833,6 @@ impl Scene {
             reopen,
             content: self.open_run.clone(),
             layer_depth: self.layer_stack.len(),
-            has_surviving_child: false,
             child_bounds: None,
         });
         self.paint_operations.push(PaintOperation::StartGroup(spec));
@@ -840,13 +863,19 @@ impl Scene {
             self.layer_stack.len(),
         );
 
-        if !self.fold_group_if_unobservable(&group) {
-            self.grow_group_to_its_content(&group);
+        // Measured once. Both of the next two want the group's own run and the
+        // boxes its primitives paint into, and exactly one of them runs: a
+        // group that folds away needed the boxes to prove its contents do not
+        // overlap, and one that survives needs them to size its target.
+        let content = self.group_content(&group);
+        let mut boxes = self.content_boxes(&content);
+
+        if !self.fold_group_if_unobservable(&group, &content, &mut boxes) {
+            self.grow_group_to_its_content(&group, &boxes);
             self.close_run();
             self.steps.push(SceneStepRecord::PopGroup);
             let bounds = self.groups[group.id.0 as usize].bounds;
             if let Some(parent) = self.group_stack.last_mut() {
-                parent.has_surviving_child = true;
                 parent.child_bounds = Some(match parent.child_bounds {
                     Some(existing) => existing.union(&bounds),
                     None => bounds,
@@ -880,18 +909,7 @@ impl Scene {
     /// nothing is drawn for an empty run, and a group that opens with nothing
     /// painted before it should not cost a step saying so.
     fn close_run(&mut self) {
-        let run = Segment {
-            shadows: self.open_run.shadows.start..self.shadows.len(),
-            quads: self.open_run.quads.start..self.quads.len(),
-            paths: self.open_run.paths.start..self.paths.len(),
-            underlines: self.open_run.underlines.start..self.underlines.len(),
-            monochrome_sprites: self.open_run.monochrome_sprites.start
-                ..self.monochrome_sprites.len(),
-            subpixel_sprites: self.open_run.subpixel_sprites.start..self.subpixel_sprites.len(),
-            polychrome_sprites: self.open_run.polychrome_sprites.start
-                ..self.polychrome_sprites.len(),
-            surfaces: self.open_run.surfaces.start..self.surfaces.len(),
-        };
+        let run = self.since(&self.open_run);
         self.open_run = self.end_indices();
         if run.is_empty() {
             return;
@@ -901,35 +919,9 @@ impl Scene {
         self.steps.push(SceneStepRecord::Run(id));
     }
 
-    /// Where every per-kind array currently ends, as an empty run starting
-    /// there.
-    fn end_indices(&self) -> Segment {
-        Segment {
-            shadows: self.shadows.len()..self.shadows.len(),
-            quads: self.quads.len()..self.quads.len(),
-            paths: self.paths.len()..self.paths.len(),
-            underlines: self.underlines.len()..self.underlines.len(),
-            monochrome_sprites: self.monochrome_sprites.len()..self.monochrome_sprites.len(),
-            subpixel_sprites: self.subpixel_sprites.len()..self.subpixel_sprites.len(),
-            polychrome_sprites: self.polychrome_sprites.len()..self.polychrome_sprites.len(),
-            surfaces: self.surfaces.len()..self.surfaces.len(),
-        }
-    }
-
     /// The run a group's own primitives occupy, at the moment it is popped.
     fn group_content(&self, group: &OpenGroup) -> Segment {
-        Segment {
-            shadows: group.content.shadows.start..self.shadows.len(),
-            quads: group.content.quads.start..self.quads.len(),
-            paths: group.content.paths.start..self.paths.len(),
-            underlines: group.content.underlines.start..self.underlines.len(),
-            monochrome_sprites: group.content.monochrome_sprites.start
-                ..self.monochrome_sprites.len(),
-            subpixel_sprites: group.content.subpixel_sprites.start..self.subpixel_sprites.len(),
-            polychrome_sprites: group.content.polychrome_sprites.start
-                ..self.polychrome_sprites.len(),
-            surfaces: group.content.surfaces.start..self.surfaces.len(),
-        }
+        self.since(&group.content)
     }
 
     /// Take a group back out of the scene when compositing it separately could
@@ -961,17 +953,21 @@ impl Scene {
     /// as the rectangle its gaussian tail actually reaches rather than the one
     /// its falloff is measured from: two shadows whose spread boxes are clear
     /// of one another can still overlap where it matters.
-    fn fold_group_if_unobservable(&mut self, group: &OpenGroup) -> bool {
+    fn fold_group_if_unobservable(
+        &mut self,
+        group: &OpenGroup,
+        content: &Segment,
+        boxes: &mut [Bounds<ScaledPixels>],
+    ) -> bool {
         let spec = &self.groups[group.id.0 as usize];
-        if group.has_surviving_child || !spec.is_foldable() {
+        if group.child_bounds.is_some() || !spec.is_foldable() {
             return false;
         }
         let opacity = spec.opacity;
-        let content = self.group_content(group);
         if !content.subpixel_sprites.is_empty() || !content.surfaces.is_empty() {
             return false;
         }
-        if !self.content_is_overlap_free(&content) {
+        if !Self::is_overlap_free(boxes) {
             return false;
         }
 
@@ -985,7 +981,7 @@ impl Scene {
         self.segments.truncate(group.segments_len);
         self.open_run = group.reopen.clone();
         if opacity < 1.0 {
-            self.fold_opacity(&content, opacity);
+            self.fold_opacity(content, opacity);
         }
         true
     }
@@ -1000,10 +996,8 @@ impl Scene {
     /// set never shrinks; rather than let that cost grow quadratically inside
     /// a frame, the scan gives up after a fixed number of comparisons and the
     /// group is isolated. Isolating a group is never wrong, only slower.
-    fn content_is_overlap_free(&self, content: &Segment) -> bool {
+    fn is_overlap_free(boxes: &mut [Bounds<ScaledPixels>]) -> bool {
         const SCAN_BUDGET: usize = 4096;
-
-        let mut boxes = self.content_boxes(content);
 
         boxes.sort_by(|a, b| {
             a.origin
@@ -1035,6 +1029,8 @@ impl Scene {
     /// what it covers, narrowed by its own content mask.
     fn content_boxes(&self, content: &Segment) -> Vec<Bounds<ScaledPixels>> {
         let mut boxes = Vec::with_capacity(content.len());
+        // A shadow is the one kind whose box is not its `bounds`: the gaussian
+        // reaches past the rectangle its falloff was measured from.
         for shadow in &self.shadows[content.shadows.clone()] {
             boxes.push(
                 shadow
@@ -1042,27 +1038,22 @@ impl Scene {
                     .intersect(&shadow.content_mask.bounds),
             );
         }
-        for quad in &self.quads[content.quads.clone()] {
-            boxes.push(quad.bounds.intersect(&quad.content_mask.bounds));
+        macro_rules! push_bounds {
+            ($($kind:ident),+ $(,)?) => {$(
+                for primitive in &self.$kind[content.$kind.clone()] {
+                    boxes.push(primitive.bounds.intersect(&primitive.content_mask.bounds));
+                }
+            )+};
         }
-        for path in &self.paths[content.paths.clone()] {
-            boxes.push(path.bounds.intersect(&path.content_mask.bounds));
-        }
-        for underline in &self.underlines[content.underlines.clone()] {
-            boxes.push(underline.bounds.intersect(&underline.content_mask.bounds));
-        }
-        for sprite in &self.monochrome_sprites[content.monochrome_sprites.clone()] {
-            boxes.push(sprite.bounds.intersect(&sprite.content_mask.bounds));
-        }
-        for sprite in &self.subpixel_sprites[content.subpixel_sprites.clone()] {
-            boxes.push(sprite.bounds.intersect(&sprite.content_mask.bounds));
-        }
-        for sprite in &self.polychrome_sprites[content.polychrome_sprites.clone()] {
-            boxes.push(sprite.bounds.intersect(&sprite.content_mask.bounds));
-        }
-        for surface in &self.surfaces[content.surfaces.clone()] {
-            boxes.push(surface.bounds.intersect(&surface.content_mask.bounds));
-        }
+        push_bounds!(
+            quads,
+            paths,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            surfaces,
+        );
         boxes
     }
 
@@ -1094,17 +1085,16 @@ impl Scene {
     /// [`GroupSpec::mask`]: everything inside the group was clipped to it when
     /// it was painted, and a blur is not licence to paint outside an ancestor's
     /// `overflow: hidden`.
-    fn grow_group_to_its_content(&mut self, group: &OpenGroup) {
-        let content = self.group_content(group);
+    fn grow_group_to_its_content(&mut self, group: &OpenGroup, boxes: &[Bounds<ScaledPixels>]) {
         let mut painted: Option<Bounds<ScaledPixels>> =
             group.child_bounds.filter(|bounds| !bounds.is_empty());
-        for bounds in self.content_boxes(&content) {
+        for bounds in boxes {
             if bounds.is_empty() {
                 continue;
             }
             painted = Some(match painted {
-                Some(painted) => painted.union(&bounds),
-                None => bounds,
+                Some(painted) => painted.union(bounds),
+                None => *bounds,
             });
         }
         let Some(painted) = painted else {
@@ -1346,32 +1336,6 @@ impl Scene {
             self.polychrome_sprites[run.polychrome_sprites]
                 .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
             self.surfaces[run.surfaces].sort_by_key(|surface| surface.order);
-        }
-        self.debug_assert_path_ids_are_a_permutation();
-    }
-
-    /// [`Scene::insert_primitive`] hands each path the index it was pushed at,
-    /// so within one frame the ids are exactly `0..paths.len()`, each used
-    /// once. Sorting reorders them - `order` is not monotone in paint order, so
-    /// the ids are not sorted afterwards either - but it cannot duplicate one
-    /// or push one out of range, and that is what a renderer keying a per-path
-    /// side buffer or atlas entry by id depends on. Anything that starts
-    /// splitting, merging or re-emitting paths has to keep this true.
-    #[inline]
-    fn debug_assert_path_ids_are_a_permutation(&self) {
-        #[cfg(debug_assertions)]
-        {
-            let mut seen = vec![false; self.paths.len()];
-            for path in &self.paths {
-                let index = path.id.0;
-                assert!(
-                    index < seen.len(),
-                    "path id {index} is out of range for a scene of {} paths",
-                    seen.len()
-                );
-                assert!(!seen[index], "two paths in one scene share the id {index}");
-                seen[index] = true;
-            }
         }
     }
 
@@ -1617,176 +1581,80 @@ impl<'a> Iterator for BatchIterator<'a> {
             return None;
         };
 
+        // The eight arms differ in the array they walk, in whether a batch also
+        // has to be homogeneous in its atlas texture, and in which
+        // `PrimitiveBatch` comes out. The scan itself - take the first, take
+        // every following primitive that is still under the order bound and
+        // still on the same side of the clip split, advance the cursor - is one
+        // piece of code.
+        macro_rules! batch {
+            ($iter:ident, $cursor:ident, $variant:ident) => {{
+                let clipped = self.$iter.peek().unwrap().clip.is_clipped();
+                let start = self.$cursor;
+                let mut end = start + 1;
+                self.$iter.next();
+                while self
+                    .$iter
+                    .next_if(|primitive| {
+                        (primitive.order, batch_kind) < max_order_and_kind
+                            && primitive.clip.is_clipped() == clipped
+                    })
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.$cursor = end;
+                Some(PrimitiveBatch::$variant(start..end))
+            }};
+        }
+
+        macro_rules! sprite_batch {
+            ($iter:ident, $cursor:ident, $variant:ident) => {{
+                let texture_id = self.$iter.peek().unwrap().tile.texture_id;
+                let clipped = self.$iter.peek().unwrap().clip.is_clipped();
+                let start = self.$cursor;
+                let mut end = start + 1;
+                self.$iter.next();
+                while self
+                    .$iter
+                    .next_if(|sprite| {
+                        (sprite.order, batch_kind) < max_order_and_kind
+                            && sprite.tile.texture_id == texture_id
+                            && sprite.clip.is_clipped() == clipped
+                    })
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.$cursor = end;
+                Some(PrimitiveBatch::$variant {
+                    texture_id,
+                    range: start..end,
+                })
+            }};
+        }
+
         match batch_kind {
-            PrimitiveKind::Shadow => {
-                let clipped = self.shadows_iter.peek().unwrap().clip.is_clipped();
-                let shadows_start = self.shadows_start;
-                let mut shadows_end = shadows_start + 1;
-                self.shadows_iter.next();
-                while self
-                    .shadows_iter
-                    .next_if(|shadow| {
-                        (shadow.order, batch_kind) < max_order_and_kind
-                            && shadow.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    shadows_end += 1;
-                }
-                self.shadows_start = shadows_end;
-                Some(PrimitiveBatch::Shadows(shadows_start..shadows_end))
-            }
-            PrimitiveKind::Quad => {
-                let clipped = self.quads_iter.peek().unwrap().clip.is_clipped();
-                let quads_start = self.quads_start;
-                let mut quads_end = quads_start + 1;
-                self.quads_iter.next();
-                while self
-                    .quads_iter
-                    .next_if(|quad| {
-                        (quad.order, batch_kind) < max_order_and_kind
-                            && quad.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    quads_end += 1;
-                }
-                self.quads_start = quads_end;
-                Some(PrimitiveBatch::Quads(quads_start..quads_end))
-            }
-            PrimitiveKind::Path => {
-                let clipped = self.paths_iter.peek().unwrap().clip.is_clipped();
-                let paths_start = self.paths_start;
-                let mut paths_end = paths_start + 1;
-                self.paths_iter.next();
-                while self
-                    .paths_iter
-                    .next_if(|path| {
-                        (path.order, batch_kind) < max_order_and_kind
-                            && path.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    paths_end += 1;
-                }
-                self.paths_start = paths_end;
-                Some(PrimitiveBatch::Paths(paths_start..paths_end))
-            }
-            PrimitiveKind::Underline => {
-                let clipped = self.underlines_iter.peek().unwrap().clip.is_clipped();
-                let underlines_start = self.underlines_start;
-                let mut underlines_end = underlines_start + 1;
-                self.underlines_iter.next();
-                while self
-                    .underlines_iter
-                    .next_if(|underline| {
-                        (underline.order, batch_kind) < max_order_and_kind
-                            && underline.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    underlines_end += 1;
-                }
-                self.underlines_start = underlines_end;
-                Some(PrimitiveBatch::Underlines(underlines_start..underlines_end))
-            }
-            PrimitiveKind::MonochromeSprite => {
-                let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
-                let clipped = self
-                    .monochrome_sprites_iter
-                    .peek()
-                    .unwrap()
-                    .clip
-                    .is_clipped();
-                let sprites_start = self.monochrome_sprites_start;
-                let mut sprites_end = sprites_start + 1;
-                self.monochrome_sprites_iter.next();
-                while self
-                    .monochrome_sprites_iter
-                    .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
-                            && sprite.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    sprites_end += 1;
-                }
-                self.monochrome_sprites_start = sprites_end;
-                Some(PrimitiveBatch::MonochromeSprites {
-                    texture_id,
-                    range: sprites_start..sprites_end,
-                })
-            }
-            PrimitiveKind::SubpixelSprite => {
-                let texture_id = self.subpixel_sprites_iter.peek().unwrap().tile.texture_id;
-                let clipped = self.subpixel_sprites_iter.peek().unwrap().clip.is_clipped();
-                let sprites_start = self.subpixel_sprites_start;
-                let mut sprites_end = sprites_start + 1;
-                self.subpixel_sprites_iter.next();
-                while self
-                    .subpixel_sprites_iter
-                    .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
-                            && sprite.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    sprites_end += 1;
-                }
-                self.subpixel_sprites_start = sprites_end;
-                Some(PrimitiveBatch::SubpixelSprites {
-                    texture_id,
-                    range: sprites_start..sprites_end,
-                })
-            }
-            PrimitiveKind::PolychromeSprite => {
-                let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
-                let clipped = self
-                    .polychrome_sprites_iter
-                    .peek()
-                    .unwrap()
-                    .clip
-                    .is_clipped();
-                let sprites_start = self.polychrome_sprites_start;
-                let mut sprites_end = sprites_start + 1;
-                self.polychrome_sprites_iter.next();
-                while self
-                    .polychrome_sprites_iter
-                    .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
-                            && sprite.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    sprites_end += 1;
-                }
-                self.polychrome_sprites_start = sprites_end;
-                Some(PrimitiveBatch::PolychromeSprites {
-                    texture_id,
-                    range: sprites_start..sprites_end,
-                })
-            }
-            PrimitiveKind::Surface => {
-                let clipped = self.surfaces_iter.peek().unwrap().clip.is_clipped();
-                let surfaces_start = self.surfaces_start;
-                let mut surfaces_end = surfaces_start + 1;
-                self.surfaces_iter.next();
-                while self
-                    .surfaces_iter
-                    .next_if(|surface| {
-                        (surface.order, batch_kind) < max_order_and_kind
-                            && surface.clip.is_clipped() == clipped
-                    })
-                    .is_some()
-                {
-                    surfaces_end += 1;
-                }
-                self.surfaces_start = surfaces_end;
-                Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
-            }
+            PrimitiveKind::Shadow => batch!(shadows_iter, shadows_start, Shadows),
+            PrimitiveKind::Quad => batch!(quads_iter, quads_start, Quads),
+            PrimitiveKind::Path => batch!(paths_iter, paths_start, Paths),
+            PrimitiveKind::Underline => batch!(underlines_iter, underlines_start, Underlines),
+            PrimitiveKind::MonochromeSprite => sprite_batch!(
+                monochrome_sprites_iter,
+                monochrome_sprites_start,
+                MonochromeSprites
+            ),
+            PrimitiveKind::SubpixelSprite => sprite_batch!(
+                subpixel_sprites_iter,
+                subpixel_sprites_start,
+                SubpixelSprites
+            ),
+            PrimitiveKind::PolychromeSprite => sprite_batch!(
+                polychrome_sprites_iter,
+                polychrome_sprites_start,
+                PolychromeSprites
+            ),
+            PrimitiveKind::Surface => batch!(surfaces_iter, surfaces_start, Surfaces),
         }
     }
 }
@@ -2778,29 +2646,6 @@ mod tests {
         scene.finish();
 
         assert_eq!(scene.shadows.len(), 1);
-    }
-
-    /// What a renderer keying anything by [`PathId`] relies on: within one
-    /// frame the ids are `0..paths.len()`, each used once. They are *not*
-    /// sorted after `finish` - `order` is not monotone in paint order, so a
-    /// path painted later can sort earlier and carry a lower id with it.
-    #[test]
-    fn path_ids_are_a_permutation_after_finish_even_where_they_are_not_sorted() {
-        let mut scene = Scene::default();
-        // Two overlapping paths, so the second takes an order above the first,
-        // then one clear of both, which takes the lower order and sorts ahead
-        // of it carrying the id 2.
-        scene.insert_primitive(path_at(0.));
-        scene.insert_primitive(path_at(5.));
-        scene.insert_primitive(path_at(100.));
-        scene.finish();
-
-        let ids: Vec<_> = scene.paths.iter().map(|path| path.id.0).collect();
-        assert_eq!(ids, vec![0, 2, 1], "id 2 sorted ahead of id 1");
-
-        let mut sorted = ids;
-        sorted.sort();
-        assert_eq!(sorted, vec![0, 1, 2], "the ids are a permutation of 0..3");
     }
 
     fn quad_batches(scene: &Scene) -> Vec<Range<usize>> {
