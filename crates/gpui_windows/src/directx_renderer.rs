@@ -54,6 +54,9 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// Whether this renderer has already said that it cannot isolate a group.
+    reported_groups: bool,
 }
 
 /// Direct3D objects
@@ -194,6 +197,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            reported_groups: false,
         })
     }
 
@@ -337,6 +341,7 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        report_groups_painted_without_isolation(scene, &mut self.reported_groups);
         self.render(scene, background_appearance)?;
         self.present()
     }

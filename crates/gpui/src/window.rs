@@ -4901,10 +4901,11 @@ impl Window {
     ///
     /// The Metal renderer draws a group to a target of its own and composites
     /// it; the wgpu and DirectX renderers do not yet, and paint the subtree
-    /// un-isolated. A group whose contents do not overlap needs no target on
-    /// any backend and its opacity is folded into its primitives, which is
-    /// what gpui has always done and stays exactly right - see
-    /// [`Scene::push_group`].
+    /// un-isolated, saying so once through
+    /// [`report_groups_painted_without_isolation`]. A group whose contents do
+    /// not overlap needs no target on any backend and its opacity is folded
+    /// into its primitives, which is what gpui has always done and stays
+    /// exactly right - see [`Scene::push_group`].
     ///
     /// The Metal renderer applies every [`SceneFilter`] - colour matrices, a
     /// separable gaussian blur, a drop shadow - and applies

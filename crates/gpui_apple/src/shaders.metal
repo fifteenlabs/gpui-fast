@@ -28,6 +28,10 @@ float2 to_scene_position_transformed(float2 unit_vertex,
 float4 to_target_position(float2 scene_position,
                           constant RenderTarget *render_target);
 float4 apply_color_matrices(float4 premultiplied, constant GroupFilter *filter);
+float4 filter_read(texture2d<float> source, int2 texel,
+                   constant FilterPass *pass);
+float filter_sample_alpha(texture2d<float> source, float2 at,
+                          constant FilterPass *pass);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
@@ -1180,6 +1184,17 @@ fragment float clip_cover_fragment(
 // agree. See `GroupComposeMode`.
 constant uint COMPOSE_MODE [[function_constant(1)]];
 
+// Whether this composite was handed a copy of what is underneath the group and
+// has to filter it: CSS `backdrop-filter`.
+//
+// The variant that was cannot use a blend state at all. It is given the
+// destination as two textures - as it stood, and with the filter applied - and
+// emits the finished pixel, which the pipeline writes with One/Zero. That is
+// what lets the group's coverage fade the filter in as well as the group,
+// something no blend factor could express: a blend factor sees one source and
+// one destination, and this needs two of the latter.
+constant bool HAS_BACKDROP [[function_constant(2)]];
+
 struct GroupCompositeVertexOutput {
   float4 position [[position]];
   float2 scene_position;
@@ -1228,7 +1243,13 @@ fragment float4 group_composite_fragment(
       function_constant(CLIPPED)]],
     texture2d<float> clip_atlas
     [[texture(GroupCompositeInputIndex_ClipAtlas),
-      function_constant(CLIPPED)]]) {
+      function_constant(CLIPPED)]],
+    texture2d<float> backdrop
+    [[texture(GroupCompositeInputIndex_BackdropTexture),
+      function_constant(HAS_BACKDROP)]],
+    texture2d<float> filtered_backdrop
+    [[texture(GroupCompositeInputIndex_FilteredBackdropTexture),
+      function_constant(HAS_BACKDROP)]]) {
   // Nearest: the composite quad is pixel-aligned with the target it was drawn
   // into, so every sample is a texel centre and filtering would only blur it.
   constexpr sampler group_sampler(mag_filter::nearest, min_filter::nearest);
@@ -1239,6 +1260,27 @@ fragment float4 group_composite_fragment(
   if (CLIPPED) {
     coverage *= clip_mask_alpha(input.scene_position, composite->clip,
                                 clip_masks, clip_atlas);
+  }
+
+  if (HAS_BACKDROP) {
+    // The copy covers at least the group's quad, and both textures are
+    // texel-aligned with the window, so the texel under this fragment is the
+    // fragment's own scene position less where the copy starts.
+    int2 texel = int2(input.scene_position -
+                      float2(composite->backdrop_origin.x,
+                             composite->backdrop_origin.y));
+    texel = clamp(texel, int2(0, 0),
+                  int2(composite->backdrop_size.width - 1,
+                       composite->backdrop_size.height - 1));
+    float4 below = backdrop.read(uint2(texel));
+    float4 above = filtered_backdrop.read(uint2(texel));
+    // Both halves are premultiplied, so mixing them is linear and the result is
+    // premultiplied too. At `coverage == 0` this is the destination exactly as
+    // it stood, which is what "the group did not reach here" has to mean even
+    // though the pipeline overwrites every fragment it touches.
+    float4 destination = mix(below, above, coverage);
+    float4 over = source * coverage;
+    return over + destination * (1. - over.a);
   }
 
   switch (COMPOSE_MODE) {
@@ -1257,6 +1299,126 @@ fragment float4 group_composite_fragment(
     // and differ only in the pipeline's blend factors.
     return source * coverage;
   }
+}
+
+// ------------------------------------------------------------- filter passes
+
+// One texel of a filter pass's source, and what is outside the source.
+//
+// A group's own image sits on a transparent canvas, so reading past its edge
+// has to give transparent black or the blur would smear the outermost row of
+// ink outwards forever instead of fading. A backdrop is a rectangle cut out of
+// something larger, so reading past *its* edge has to give the nearest texel
+// inside: the pixels beyond it are not empty, they are merely not in the copy,
+// and fading to transparent there would ring the filtered region with a halo
+// that is in nothing behind it.
+float4 filter_read(texture2d<float> source, int2 texel,
+                   constant FilterPass *pass) {
+  int2 last = int2(pass->source_size.width - 1, pass->source_size.height - 1);
+  if (pass->edge == FilterEdge_Clamp) {
+    return source.read(uint2(clamp(texel, int2(0, 0), last)));
+  }
+  if (texel.x < 0 || texel.y < 0 || texel.x > last.x || texel.y > last.y) {
+    return float4(0., 0., 0., 0.);
+  }
+  return source.read(uint2(texel));
+}
+
+// The alpha at a point between texels, bilinearly. A drop shadow's offset is a
+// CSS length times the scale factor and lands wherever it lands.
+float filter_sample_alpha(texture2d<float> source, float2 at,
+                          constant FilterPass *pass) {
+  float2 corner = at - 0.5;
+  int2 texel = int2(floor(corner));
+  float2 t = corner - float2(texel);
+  float top = mix(filter_read(source, texel, pass).a,
+                  filter_read(source, texel + int2(1, 0), pass).a, t.x);
+  float bottom = mix(filter_read(source, texel + int2(0, 1), pass).a,
+                     filter_read(source, texel + int2(1, 1), pass).a, t.x);
+  return mix(top, bottom, t.y);
+}
+
+struct FilterVertexOutput {
+  float4 position [[position]];
+};
+
+// A quad over the whole of the pass's destination.
+//
+// The viewport is already the image's own rectangle in the top-left corner of a
+// pooled texture, so covering it is covering clip space, and `position.xy` in
+// the fragment stage is then the texel being written - which is also the texel
+// being read, because every pass in a chain writes the rectangle it read.
+vertex FilterVertexOutput filter_pass_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(FilterInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  return FilterVertexOutput{
+      float4(unit_vertex.x * 2. - 1., 1. - unit_vertex.y * 2., 0., 1.)};
+}
+
+// One axis of a separable gaussian.
+//
+// The weights are not normalized in advance and the sum divides them at the
+// end, which is what makes the truncated kernel behave. Every tap counts
+// towards the divisor, including the ones that fall outside the image and
+// contribute nothing, so the interior keeps its brightness exactly while an
+// edge fades in proportion to how much of the kernel found anything - which is
+// the definition of blurring an image that stops.
+//
+// The blur runs on premultiplied colour, as `feGaussianBlur` is defined to.
+// Blurring straight colour and the alpha separately would drag the colour of an
+// invisible texel into a visible one and halo every edge.
+fragment float4 filter_blur_fragment(
+    FilterVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]],
+    constant FilterPass *pass [[buffer(FilterInputIndex_Pass)]]) {
+  int2 texel = int2(input.position.xy);
+  int2 step = int2(int(pass->direction.x), int(pass->direction.y)) * pass->stride;
+  float4 total = float4(0., 0., 0., 0.);
+  float weight_total = 0.;
+  for (int index = -pass->taps; index <= pass->taps; index++) {
+    float distance = (float)(index * pass->stride);
+    float weight = exp(-(distance * distance) / (2. * pass->sigma * pass->sigma));
+    weight_total += weight;
+    total += weight * filter_read(source, texel + step * index, pass);
+  }
+  return total / weight_total;
+}
+
+// A run of CSS colour filters, as a pass of its own.
+//
+// The composite applies the trailing run itself, so this is only reached by a
+// run with something after it - a matrix before a blur, which has to happen
+// before the blur and not after.
+fragment float4 filter_matrix_fragment(
+    FilterVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]],
+    constant FilterPass *pass [[buffer(FilterInputIndex_Pass)]],
+    constant GroupFilter *filter [[buffer(FilterInputIndex_Filter)]]) {
+  return apply_color_matrices(
+      filter_read(source, int2(input.position.xy), pass), filter);
+}
+
+// The source over its own blurred alpha, offset and tinted: CSS
+// `drop-shadow()`.
+//
+// Only the alpha of the blurred image is used. The shadow takes the colour it
+// was given, whatever the group underneath it was coloured, which is what makes
+// a drop shadow a silhouette rather than a smear.
+fragment float4 filter_drop_shadow_fragment(
+    FilterVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]],
+    texture2d<float> blurred [[texture(FilterInputIndex_Blurred)]],
+    constant FilterPass *pass [[buffer(FilterInputIndex_Pass)]]) {
+  int2 texel = int2(input.position.xy);
+  float4 above = filter_read(source, texel, pass);
+  float2 at = float2(texel) + 0.5 -
+              float2(pass->offset.x, pass->offset.y);
+  float alpha = filter_sample_alpha(blurred, at, pass);
+  float4 color = hsla_to_rgba(pass->color);
+  float shadow_alpha = color.a * alpha;
+  float4 shadow = float4(color.rgb * shadow_alpha, shadow_alpha);
+  return above + shadow * (1. - above.a);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

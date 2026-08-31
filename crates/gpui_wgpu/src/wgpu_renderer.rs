@@ -288,6 +288,9 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// Whether this renderer has already said that it composites no isolated
+    /// groups. See [`gpui::report_groups_painted_without_isolation`].
+    reported_groups: bool,
 }
 
 impl WgpuRenderer {
@@ -511,6 +514,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            reported_groups: false,
         })
     }
 }
@@ -1159,6 +1163,8 @@ impl WgpuRenderer {
         let RendererState::Ready { surface, core } = &mut self.state else {
             return false;
         };
+
+        gpui::report_groups_painted_without_isolation(scene, &mut self.reported_groups);
 
         if let Some(error) = self.last_surface_error.take().or_else(|| {
             self.device_errors

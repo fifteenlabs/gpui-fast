@@ -358,14 +358,23 @@ impl SceneFilter {
                 ..
             } => {
                 // The shadow is drawn behind the input, which is still painted
-                // where it always was, so the result covers both.
+                // where it always was, so the result covers the input and the
+                // offset, blurred silhouette both.
+                //
+                // The tail is added to *both*, not only to the offset copy, and
+                // the reason is the intermediate rather than the result. A
+                // renderer blurs the input in place and then reads that blurred
+                // image back at `p - offset`, which for a `p` near the near
+                // corner of the rectangle lands `offset` outside it. What is
+                // there is the input's own blur tail, so the tail has to be
+                // inside the rectangle: without it the shadow is cut off in a
+                // straight line, exactly where its falloff should have been.
                 let offset = point(ScaledPixels(*offset_x), ScaledPixels(*offset_y));
-                let shadow = Bounds {
+                let moved = Bounds {
                     origin: input.origin + offset,
                     size: input.size,
-                }
-                .dilate(tail(*radius));
-                input.union(&shadow)
+                };
+                input.union(&moved).dilate(tail(*radius))
             }
             SceneFilter::Chain(filters) => filters
                 .iter()
@@ -446,6 +455,33 @@ impl GroupSpec {
     fn is_foldable(&self) -> bool {
         self.blend.is_normal() && self.filter.is_none() && self.backdrop_filter.is_none()
     }
+}
+
+/// Say, once, that a renderer with no isolated-group support has been handed a
+/// scene that carries one.
+///
+/// The wgpu and DirectX renderers walk a scene's [`Scene::batches`] and ignore
+/// its group boundaries entirely, so a subtree that asked to be flattened and
+/// then faded, blended or filtered is painted one primitive at a time straight
+/// onto what is underneath. Two overlapping children at half opacity come out
+/// at three quarters where they overlap, a blur does not happen, and a
+/// `backdrop-filter` does not happen. That is a wrong picture, and a wrong
+/// picture nobody is told about is the worst kind there is.
+///
+/// `reported` is the caller's own flag and is never cleared, so this is one
+/// line per renderer rather than one a frame: whatever puts a group in a scene
+/// puts one there every frame for as long as the window is open.
+pub fn report_groups_painted_without_isolation(scene: &Scene, reported: &mut bool) {
+    if *reported || scene.groups.is_empty() {
+        return;
+    }
+    *reported = true;
+    log::error!(
+        "this renderer does not composite isolated groups; the {} in this scene \
+         are painted without isolation, and any opacity, blend mode or filter on \
+         them is applied one primitive at a time or not at all",
+        scene.groups.len(),
+    );
 }
 
 /// One instruction in the order a scene has to be replayed in: see
@@ -916,9 +952,8 @@ impl Scene {
     /// `overflow: hidden`.
     fn grow_group_to_its_content(&mut self, group: &OpenGroup) {
         let content = self.group_content(group);
-        let mut painted: Option<Bounds<ScaledPixels>> = group
-            .child_bounds
-            .filter(|bounds| !bounds.is_empty());
+        let mut painted: Option<Bounds<ScaledPixels>> =
+            group.child_bounds.filter(|bounds| !bounds.is_empty());
         for bounds in self.content_boxes(&content) {
             if bounds.is_empty() {
                 continue;
@@ -3218,8 +3253,10 @@ mod tests {
         );
     }
 
-    /// A drop shadow reaches out to its own tail *around its offset*, and the
-    /// group itself is still painted where it always was.
+    /// A drop shadow reaches out to its own tail around its offset, and the
+    /// group itself is still painted where it always was - and the tail goes
+    /// round the un-offset silhouette too, because that is the image the
+    /// shadow is read back out of.
     #[test]
     fn a_drop_shadow_group_grows_by_the_offset_and_the_tail() {
         assert_eq!(
@@ -3232,8 +3269,9 @@ mod tests {
                 }),
                 None,
             ),
-            // The shadow covers -8..22 x --8..14, the quad 0..10 x 0..10.
-            scaled(0., -8., 22., 22.),
+            // The quad and its offset copy cover 0..16 x -2..10 between them,
+            // and three standard deviations is six.
+            scaled(-6., -8., 28., 24.),
         );
     }
 
@@ -3259,10 +3297,7 @@ mod tests {
     /// what was painted in it, which is what it has always been worth.
     #[test]
     fn an_unfiltered_group_is_still_the_size_of_its_content() {
-        assert_eq!(
-            filtered_group_bounds(None, None),
-            scaled(0., 0., 10., 10.)
-        );
+        assert_eq!(filtered_group_bounds(None, None), scaled(0., 0., 10., 10.));
         assert_eq!(
             filtered_group_bounds(Some(SceneFilter::ColorMatrix([0.; 20])), None),
             scaled(0., 0., 10., 10.),
@@ -3290,9 +3325,10 @@ mod tests {
                 ])),
                 None,
             ),
-            // The blur takes 0..10 out to -3..13; the shadow of that covers
-            // 4..26, and the blurred group is still painted at -3..13.
-            scaled(-3., -6., 29., 22.),
+            // The blur takes 0..10 out to -3..13 both ways; that and its
+            // offset copy cover -3..23 x -3..13, and the shadow's own three
+            // standard deviations go round all of it.
+            scaled(-6., -6., 32., 22.),
         );
     }
 

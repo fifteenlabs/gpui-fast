@@ -785,12 +785,13 @@ fn captured_log() -> &'static CapturedLog {
 }
 
 #[test]
-fn a_backdrop_filter_is_reported_rather_than_dropped_in_silence() {
-    // `GroupOptions::backdrop_filter` is recorded by the scene and applied by
-    // nobody. The promise `with_isolated_group` makes about everything it does
-    // not implement is that the renderer says so when it meets one, and a
-    // filter that is silently dropped is a wrong picture with nothing at all to
-    // point at.
+fn a_backdrop_filter_is_applied_rather_than_dropped_with_a_line_in_the_log() {
+    // `GroupOptions::backdrop_filter` used to be recorded by the scene and
+    // applied by nobody, and the only promise `with_isolated_group` could keep
+    // was that the renderer said so. It is applied now, so the promise to keep
+    // is the opposite one: the filter reaches the pixels *and* nothing is
+    // logged, because a line in the log now would mean something else had gone
+    // wrong.
     let log = captured_log();
     log.0
         .lock()
@@ -798,15 +799,14 @@ fn a_backdrop_filter_is_reported_rather_than_dropped_in_silence() {
         .clear();
 
     let frame = render_frame(window(), |_, window, _| {
+        window.paint_quad(gpui::fill(rect(0., 0., 200., 100.), red()));
         window.with_isolated_group(
             GroupOptions {
                 bounds: rect(20., 20., 160., 60.),
                 backdrop_filter: Some(SceneFilter::ColorMatrix(GRAYSCALE)),
                 ..Default::default()
             },
-            |window| {
-                window.paint_quad(gpui::fill(rect(20., 20., 160., 60.), red()));
-            },
+            |_| {},
         );
     });
 
@@ -816,16 +816,19 @@ fn a_backdrop_filter_is_reported_rather_than_dropped_in_silence() {
         .expect("the capturing logger is never poisoned")
         .clone();
     assert!(
-        lines.iter().any(|line| line.contains("backdrop filter")),
-        "the renderer composited a group carrying a backdrop filter without \
-         saying that it had dropped it; it logged {lines:?}"
+        !lines.iter().any(|line| line.contains("backdrop")),
+        "the renderer said something about the backdrop filter it was supposed \
+         to have applied: {lines:?}"
     );
 
-    // And the group itself still painted, so the line above is about a filter
-    // that was dropped rather than about a group that never happened.
     frame.assert_painted(
         at(100., 50.),
+        GRAY_RED,
+        "the red under a group whose backdrop filter greys it",
+    );
+    frame.assert_painted(
+        at(10., 50.),
         [255, 0, 0, 255],
-        "a red quad in a group whose backdrop filter was dropped",
+        "the red beside the group, which the filter does not reach",
     );
 }

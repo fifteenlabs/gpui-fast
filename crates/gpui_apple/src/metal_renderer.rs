@@ -4,7 +4,7 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, BrushExtend, ClipId, ClipPath,
-    ClipPathSegment, ComposeMode, ContentMask, DevicePixels, FillRule, GroupSpec, MixMode,
+    ClipPathSegment, ComposeMode, ContentMask, DevicePixels, FillRule, GroupSpec, Hsla, MixMode,
     PaintSurface, Path, PathBrush, Point, PrimitiveBatch, ScaledPixels, Scene, SceneFilter,
     SceneStep, Size, TileId, TransformationMatrix, point, size,
 };
@@ -224,10 +224,29 @@ pub struct MetalRenderer {
     clip_atlas_budget: ClipTextureBudget,
     clip_work_budget: ClipTextureBudget,
     group_targets: GroupTargets,
+    /// The working textures a group's filter chain runs through. Empty until a
+    /// scene carries a blur, a drop shadow or a backdrop filter.
+    filter_scratch: FilterScratch,
     /// Built the first time a scene actually composites a group, and only for
     /// the operators it uses: there are seven of them times a clipped and an
-    /// unclipped variant, and gpui's own UI asks for none.
-    group_composite_pipelines: HashMap<(GroupComposeMode, bool), metal::RenderPipelineState>,
+    /// unclipped variant times a backdrop and a plain one, and gpui's own UI
+    /// asks for none.
+    group_composite_pipelines: HashMap<(GroupComposeMode, bool, bool), metal::RenderPipelineState>,
+    /// Built the first time a scene carries a filter that needs a pass of its
+    /// own.
+    filter_pipelines: HashMap<FilterPipeline, metal::RenderPipelineState>,
+    /// Whether what this renderer draws the frame into can be copied out of
+    /// again, which is what a top-level backdrop filter needs.
+    ///
+    /// An offscreen target always can. A window's drawable cannot until the
+    /// layer is told to stop being framebuffer-only, which costs the display
+    /// some of its fast paths and is therefore not paid until a scene turns up
+    /// carrying a backdrop filter.
+    drawable_is_readable: bool,
+    /// Whether the layer has already been asked to stop being framebuffer-only.
+    /// The drawables it had already vended were made under the old setting, so
+    /// `drawable_is_readable` only follows on the frame after this is set.
+    layer_reads_requested: bool,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
@@ -648,7 +667,16 @@ impl MetalRenderer {
             clip_atlas_budget: ClipTextureBudget::default(),
             clip_work_budget: ClipTextureBudget::default(),
             group_targets: GroupTargets::default(),
+            filter_scratch: FilterScratch::default(),
             group_composite_pipelines: HashMap::new(),
+            filter_pipelines: HashMap::new(),
+            // A headless renderer draws into a texture of its own making, which
+            // is readable. A layer's drawables are framebuffer-only until
+            // something asks otherwise - except in a build with test support,
+            // where the layer is already told to allow reads so that a
+            // screenshot can be taken without ScreenCaptureKit.
+            drawable_is_readable: layer.is_none() || cfg!(any(test, feature = "test-support")),
+            layer_reads_requested: false,
             layer,
             presents_with_transaction: false,
             is_apple_gpu,
@@ -765,6 +793,24 @@ impl MetalRenderer {
                 return;
             }
         };
+        // A backdrop filter copies out of whatever the group is composited
+        // over, and at the top level that is the drawable itself. A
+        // framebuffer-only layer forbids the copy, so the first scene that asks
+        // for one buys the window out of it - the flag is not set from the
+        // start because it costs the display its direct-to-display path, and
+        // nothing in gpui's own UI has ever needed a backdrop filter. The
+        // drawables already in the layer's pool were made under the old flag,
+        // so this frame still composites over an unfiltered backdrop and says
+        // so; the next one does not.
+        if !self.drawable_is_readable {
+            if self.layer_reads_requested {
+                self.drawable_is_readable = true;
+            } else if scene_has_a_backdrop_filter(scene) {
+                layer.set_framebuffer_only(false);
+                self.layer_reads_requested = true;
+            }
+        }
+
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
@@ -995,6 +1041,7 @@ impl MetalRenderer {
         // to go and build one.
         self.render_clip_masks(clip_plan, writer, command_buffer)?;
         self.group_targets.begin_frame();
+        self.filter_scratch.begin_frame();
 
         // The scene is walked as steps rather than as batches so that a group
         // boundary can end one render pass and begin another. A scene with no
@@ -1003,6 +1050,7 @@ impl MetalRenderer {
         let mut target = ActiveTarget {
             texture: texture.to_owned(),
             render_target: RenderTarget::whole(viewport_size),
+            is_window: true,
         };
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -1041,6 +1089,11 @@ impl MetalRenderer {
                         continue;
                     };
                     command_encoder.end_encoding();
+                    // The filter passes and the backdrop copy run between the
+                    // group's own pass and the composite, on encoders of their
+                    // own: each writes a texture the next one reads, which one
+                    // pass cannot do.
+                    let prepared = self.prepare_group(&group, command_buffer, viewport_size);
                     target = group.parent.clone();
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
@@ -1048,7 +1101,8 @@ impl MetalRenderer {
                         target.render_target,
                         None,
                     );
-                    self.composite_group(&group, instance_bindings, command_encoder);
+                    self.composite_group(&group, &prepared, instance_bindings, command_encoder);
+                    self.release_prepared(prepared);
                     continue;
                 }
                 SceneStep::Run(run) => run,
@@ -1160,6 +1214,7 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
         self.group_targets.end_frame();
+        self.filter_scratch.end_frame();
 
         Ok(command_buffer.to_owned())
     }
@@ -1221,9 +1276,426 @@ impl MetalRenderer {
                     size: size(DevicePixels(rect.width), DevicePixels(rect.height)),
                     origin: point(DevicePixels(rect.x), DevicePixels(rect.y)),
                 },
+                is_window: false,
             },
             parent: parent.clone(),
         })
+    }
+
+    /// Run everything a group's `filter` and `backdrop_filter` ask for, between
+    /// the pass that painted the group and the one that composites it.
+    ///
+    /// Each step is a whole-image quad from one texture into another, and the
+    /// last texture written is what the composite samples. A step that cannot
+    /// have a working texture stops the chain where it is rather than losing
+    /// the steps already run, and the pool has already said why.
+    fn prepare_group(
+        &mut self,
+        group: &OpenGroup,
+        command_buffer: &metal::CommandBufferRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> PreparedGroup {
+        let mut prepared = PreparedGroup {
+            source: FilterImage {
+                texture: group.target.texture.clone(),
+                texture_size: group.texture_size,
+                rect: covering_rect(&group.bounds),
+                slot: None,
+            },
+            filter: GroupFilter::NONE,
+            backdrop: None,
+        };
+
+        if let Some(filter) = &group.spec.filter {
+            let mut ops = FilterOp::flatten(filter);
+            // A trailing run of colour matrices costs no pass at all: the
+            // composite's own fragment stage applies one on its way down, which
+            // is what it did when a matrix was the only filter there was.
+            if let Some(FilterOp::Matrices(matrices)) = ops.last() {
+                prepared.filter = *matrices;
+                ops.pop();
+            }
+            prepared.source = self.run_filter_ops(
+                &ops,
+                prepared.source,
+                FilterEdge::Transparent,
+                command_buffer,
+            );
+        }
+
+        if let Some(backdrop) = &group.spec.backdrop_filter {
+            prepared.backdrop =
+                self.prepare_backdrop(group, backdrop, command_buffer, viewport_size);
+        }
+
+        prepared
+    }
+
+    /// Copy what is already on the target underneath the group, filter the
+    /// copy, and hand back both: CSS `backdrop-filter`.
+    ///
+    /// Both halves are needed, not just the filtered one. The group's coverage
+    /// - its opacity, and the clip path in force - fades the *filter* in as
+    /// well as the group, so a fragment the group only half covers shows half
+    /// the filtered backdrop and half the backdrop it started from, and the
+    /// composite cannot read the destination it is writing to in order to
+    /// find the other half.
+    fn prepare_backdrop(
+        &mut self,
+        group: &OpenGroup,
+        filter: &SceneFilter,
+        command_buffer: &metal::CommandBufferRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<PreparedBackdrop> {
+        if GroupComposeMode::of(group.spec.blend.compose) != Some(GroupComposeMode::SrcOver) {
+            self.group_targets.report(format_args!(
+                "a backdrop filter under the {:?} compose operator is not implemented; the \
+                 group is composited over an unfiltered backdrop",
+                group.spec.blend.compose
+            ));
+            return None;
+        }
+        if !self.drawable_is_readable && group.parent.is_window {
+            // The layer's drawables were framebuffer-only when this one was
+            // handed out, so nothing may copy out of it. `draw` has already
+            // asked for readable ones; this group gets its backdrop from the
+            // next frame on.
+            self.group_targets.report(format_args!(
+                "the window's drawable cannot be read back yet; the group is composited over \
+                 an unfiltered backdrop for one frame"
+            ));
+            return None;
+        }
+
+        // The backdrop reaches past the group: a blur inside the group's own
+        // rectangle still draws on what is beside it, and cropping first would
+        // ring the group with a band the filter had nothing to work from. What
+        // there is to copy stops at the target underneath, which is the
+        // backdrop root - a group is composited onto its parent's target, so a
+        // nested group's backdrop is what is inside its parent and no further,
+        // which is exactly the boundary the filter effects specification draws.
+        let parent = DeviceRect {
+            x: i32::from(group.parent.render_target.origin.x),
+            y: i32::from(group.parent.render_target.origin.y),
+            width: i32::from(group.parent.render_target.size.width),
+            height: i32::from(group.parent.render_target.size.height),
+        };
+        let viewport = DeviceRect {
+            x: 0,
+            y: 0,
+            width: viewport_size.width.0,
+            height: viewport_size.height.0,
+        };
+        let wanted = covering_rect(&filter.painted_bounds(group.bounds));
+        let rect = wanted.intersect(&parent).intersect(&viewport);
+        if rect.is_empty() {
+            return None;
+        }
+
+        let original = self.filter_scratch.acquire(&self.device, rect)?;
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            &group.parent.texture,
+            0,
+            0,
+            metal::MTLOrigin {
+                x: (rect.x - parent.x) as u64,
+                y: (rect.y - parent.y) as u64,
+                z: 0,
+            },
+            metal::MTLSize {
+                width: rect.width as u64,
+                height: rect.height as u64,
+                depth: 1,
+            },
+            &original.texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+
+        // The chain must not release the copy: the composite reads it too. A
+        // clone without a slot is the same texture that nothing will hand back.
+        let mut borrowed = original.clone();
+        borrowed.slot = None;
+        let ops = FilterOp::flatten(filter);
+        let filtered = self.run_filter_ops(&ops, borrowed, FilterEdge::Clamp, command_buffer);
+        Some(PreparedBackdrop { original, filtered })
+    }
+
+    /// Run a flattened filter, one image at a time, and return the last one.
+    fn run_filter_ops(
+        &mut self,
+        ops: &[FilterOp],
+        input: FilterImage,
+        edge: FilterEdge,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> FilterImage {
+        let mut current = input;
+        for op in ops {
+            let next = match op {
+                FilterOp::Matrices(matrices) => {
+                    self.run_matrix_pass(&current, matrices, edge, command_buffer)
+                }
+                FilterOp::Blur { sigma_x, sigma_y } => {
+                    self.run_blur(&current, *sigma_x, *sigma_y, edge, command_buffer)
+                }
+                FilterOp::DropShadow {
+                    offset,
+                    sigma,
+                    color,
+                } => self.run_drop_shadow(&current, *offset, *sigma, *color, edge, command_buffer),
+            };
+            let Some(next) = next else {
+                break;
+            };
+            self.filter_scratch.release(&current);
+            current = next;
+        }
+        current
+    }
+
+    fn run_matrix_pass(
+        &mut self,
+        source: &FilterImage,
+        matrices: &GroupFilter,
+        edge: FilterEdge,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Option<FilterImage> {
+        let destination = self.filter_scratch.acquire(&self.device, source.rect)?;
+        let pass = FilterPass::new(source.size(), edge);
+        let pipeline = self.filter_pipeline(FilterPipeline::Matrices);
+        self.draw_filter_pass(
+            &pipeline,
+            &pass,
+            Some(matrices),
+            &source.texture,
+            None,
+            &destination,
+            command_buffer,
+        );
+        Some(destination)
+    }
+
+    /// A separable gaussian: one pass along x, one along y.
+    ///
+    /// Two passes rather than one square kernel because the gaussian is
+    /// separable and the saving is the whole cost model. A single pass over a
+    /// `(2n+1)` square reads `(2n+1)^2` texels; two one-dimensional passes read
+    /// `2(2n+1)`. At the sigma an email asks for - four device pixels, so
+    /// twelve texels of tail each way - that is 625 reads against 50.
+    fn run_blur(
+        &mut self,
+        source: &FilterImage,
+        sigma_x: f32,
+        sigma_y: f32,
+        edge: FilterEdge,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Option<FilterImage> {
+        let mut current: Option<FilterImage> = None;
+        for (sigma, direction) in [(sigma_x, point(1., 0.)), (sigma_y, point(0., 1.))] {
+            if sigma <= 0. {
+                continue;
+            }
+            let from = current.as_ref().unwrap_or(source);
+            let destination = match self.filter_scratch.acquire(&self.device, source.rect) {
+                Some(destination) => destination,
+                // Nothing has been released yet, so whatever the first pass
+                // produced is still a complete image - blurred along one axis
+                // rather than two, which is wrong, and already reported.
+                None => return current,
+            };
+            let pass = self.blur_pass(from, sigma, direction, edge);
+            let pipeline = self.filter_pipeline(FilterPipeline::Blur);
+            self.draw_filter_pass(
+                &pipeline,
+                &pass,
+                None,
+                &from.texture,
+                None,
+                &destination,
+                command_buffer,
+            );
+            if let Some(previous) = current.take() {
+                self.filter_scratch.release(&previous);
+            }
+            current = Some(destination);
+        }
+        current
+    }
+
+    /// The group's own alpha, blurred, offset and tinted, drawn behind the
+    /// group itself: CSS `drop-shadow()`.
+    ///
+    /// Unlike [`crate::MetalRenderer::draw_shadows`], which is handed a
+    /// rectangle and a corner radius and integrates the gaussian over that
+    /// shape analytically, this has no shape to integrate: the alpha it blurs
+    /// is whatever the group happened to paint - text, an image with holes in
+    /// it, a path - and the only way to blur that is to blur the pixels. The
+    /// two agree on what a standard deviation means and on how far the tail is
+    /// worth drawing, so a `drop-shadow` and a `box-shadow` of the same radius
+    /// come out the same weight. Where the two differ is in how each arrives at
+    /// it: the quad shadow's answer is analytic and this one is a sum over
+    /// texels, so at a standard deviation of a device pixel or two they part by
+    /// a few hundredths, and at zero the quad shadow antialiases an edge it
+    /// knows the shape of where this one takes the source's alpha as it stands.
+    fn run_drop_shadow(
+        &mut self,
+        source: &FilterImage,
+        offset: PointF,
+        sigma: f32,
+        color: Hsla,
+        edge: FilterEdge,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Option<FilterImage> {
+        // The shadow's own blur is always over transparent black, whatever the
+        // chain is running over: it is the source's alpha spreading into empty
+        // space, and clamping it to the edge would smear the outermost row of
+        // the group across the whole margin.
+        let blurred = if sigma > 0. {
+            Some(self.run_blur(
+                source,
+                sigma,
+                sigma,
+                FilterEdge::Transparent,
+                command_buffer,
+            )?)
+        } else {
+            None
+        };
+        let destination = self.filter_scratch.acquire(&self.device, source.rect);
+        let Some(destination) = destination else {
+            if let Some(blurred) = &blurred {
+                self.filter_scratch.release(blurred);
+            }
+            return None;
+        };
+
+        let mut pass = FilterPass::new(source.size(), edge);
+        pass.offset = offset;
+        pass.color = color;
+        let pipeline = self.filter_pipeline(FilterPipeline::DropShadow);
+        let shadow_texture = blurred.as_ref().unwrap_or(source).texture.clone();
+        self.draw_filter_pass(
+            &pipeline,
+            &pass,
+            None,
+            &source.texture,
+            Some(&shadow_texture),
+            &destination,
+            command_buffer,
+        );
+        if let Some(blurred) = &blurred {
+            self.filter_scratch.release(blurred);
+        }
+        Some(destination)
+    }
+
+    /// How many texels a blur reads, and how far apart.
+    ///
+    /// [`gpui::GAUSSIAN_BLUR_EXTENT`] standard deviations is the tail the scene
+    /// already grew the group's target by, so reading exactly that far is
+    /// reading everything there is and no more. Past [`MAX_BLUR_TAPS`] the
+    /// support stays where it is and the step widens, which is a coarser
+    /// Riemann sum of the same integral rather than a shorter one - the shape
+    /// the shadow fragment shader's five-step sum over y already has - and it
+    /// says so, because a coarser sum is an approximation and this file counts
+    /// those.
+    fn blur_pass(
+        &mut self,
+        source: &FilterImage,
+        sigma: f32,
+        direction: PointF,
+        edge: FilterEdge,
+    ) -> FilterPass {
+        // Both of these round up, on values that are positive by construction.
+        let divide_rounding_up = |value: i32, by: i32| (value + by - 1) / by;
+        let tail = (sigma * gpui::GAUSSIAN_BLUR_EXTENT).ceil().max(1.);
+        let tail = tail.min(i32::MAX as f32) as i32;
+        let stride = divide_rounding_up(tail, MAX_BLUR_TAPS).max(1);
+        if stride > 1 {
+            self.group_targets.report(format_args!(
+                "a gaussian of {sigma} device pixels reaches {tail} texels, past the \
+                 {MAX_BLUR_TAPS} one pass reads; it is integrated every {stride} texels instead"
+            ));
+        }
+        let mut pass = FilterPass::new(source.size(), edge);
+        pass.direction = direction;
+        pass.sigma = sigma;
+        pass.taps = divide_rounding_up(tail, stride);
+        pass.stride = stride;
+        pass
+    }
+
+    /// Draw one filter pass: a quad over the whole of `destination`, reading
+    /// `source` and writing what the pipeline's fragment stage makes of it.
+    #[allow(clippy::too_many_arguments, reason = "one call site per pass kind")]
+    fn draw_filter_pass(
+        &self,
+        pipeline: &metal::RenderPipelineState,
+        pass: &FilterPass,
+        matrices: Option<&GroupFilter>,
+        source: &metal::TextureRef,
+        blurred: Option<&metal::TextureRef>,
+        destination: &FilterImage,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        let encoder = new_command_encoder_for_texture(
+            command_buffer,
+            &destination.texture,
+            destination.render_target(),
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+        );
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_vertex_buffer(
+            FilterInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        encoder.set_fragment_bytes(
+            FilterInputIndex::Pass as u64,
+            mem::size_of::<FilterPass>() as u64,
+            pass as *const FilterPass as *const _,
+        );
+        let matrices = matrices.copied().unwrap_or(GroupFilter::NONE);
+        encoder.set_fragment_bytes(
+            FilterInputIndex::Filter as u64,
+            mem::size_of::<GroupFilter>() as u64,
+            &matrices as *const GroupFilter as *const _,
+        );
+        encoder.set_fragment_texture(FilterInputIndex::Source as u64, Some(source));
+        encoder.set_fragment_texture(
+            FilterInputIndex::Blurred as u64,
+            Some(blurred.unwrap_or(source)),
+        );
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        encoder.end_encoding();
+    }
+
+    /// The pipeline one kind of filter pass draws with, built the first time a
+    /// scene asks for it.
+    fn filter_pipeline(&mut self, kind: FilterPipeline) -> metal::RenderPipelineState {
+        if let Some(pipeline) = self.filter_pipelines.get(&kind) {
+            return pipeline.clone();
+        }
+        let pipeline = build_filter_pipeline_state(
+            &self.device,
+            &self.library,
+            kind,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        self.filter_pipelines.insert(kind, pipeline.clone());
+        pipeline
+    }
+
+    /// Give every working texture a prepared group holds back to the pool.
+    fn release_prepared(&mut self, prepared: PreparedGroup) {
+        self.filter_scratch.release(&prepared.source);
+        if let Some(backdrop) = &prepared.backdrop {
+            self.filter_scratch.release(&backdrop.original);
+            self.filter_scratch.release(&backdrop.filtered);
+        }
     }
 
     /// Draw a finished group's target onto the target underneath it: one quad
@@ -1231,6 +1703,7 @@ impl MetalRenderer {
     fn composite_group(
         &mut self,
         group: &OpenGroup,
+        prepared: &PreparedGroup,
         instance_bindings: &InstanceBindings,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -1238,12 +1711,6 @@ impl MetalRenderer {
             self.group_targets.report(format_args!(
                 "the {:?} blend mode is not implemented; the group is composited normally",
                 group.spec.blend.mix
-            ));
-        }
-        if let Some(backdrop) = &group.spec.backdrop_filter {
-            self.group_targets.report(format_args!(
-                "the backdrop filter {backdrop:?} is not implemented; the group is composited \
-                 over an unfiltered backdrop"
             ));
         }
         let compose = match GroupComposeMode::of(group.spec.blend.compose) {
@@ -1256,23 +1723,17 @@ impl MetalRenderer {
                 GroupComposeMode::SrcOver
             }
         };
-        let filter = match GroupFilter::of(group.spec.filter.as_ref()) {
-            Some(filter) => filter,
-            None => {
-                self.group_targets.report(format_args!(
-                    "the filter {:?} is not implemented; the group is composited unfiltered",
-                    group.spec.filter
-                ));
-                GroupFilter::NONE
-            }
-        };
         let clipped = group.spec.clip.is_clipped() && self.clip.is_some();
-        let pipeline = self.group_composite_pipeline(compose, clipped);
+        let backdrop = prepared.backdrop.as_ref();
+        let pipeline = self.group_composite_pipeline(compose, clipped, backdrop.is_some());
         command_encoder.set_render_pipeline_state(&pipeline);
 
+        let backdrop_rect = backdrop
+            .map(|backdrop| backdrop.original.rect)
+            .unwrap_or(DeviceRect::EMPTY);
         let composite = GroupComposite {
             bounds: group.bounds,
-            texture_size: group.texture_size,
+            texture_size: prepared.source.texture_size,
             clip: group.spec.clip,
             // `f32::clamp` hands a NaN straight back, and a NaN coverage in the
             // fragment stage is a NaN in every channel it multiplies. A group
@@ -1285,6 +1746,11 @@ impl MetalRenderer {
             } else {
                 group.spec.opacity.clamp(0., 1.)
             },
+            backdrop_origin: point(backdrop_rect.x as f32, backdrop_rect.y as f32),
+            backdrop_size: size(
+                DevicePixels(backdrop_rect.width),
+                DevicePixels(backdrop_rect.height),
+            ),
         };
         command_encoder.set_vertex_buffer(
             GroupCompositeInputIndex::Vertices as u64,
@@ -1309,12 +1775,22 @@ impl MetalRenderer {
         command_encoder.set_fragment_bytes(
             GroupCompositeInputIndex::Filter as u64,
             mem::size_of::<GroupFilter>() as u64,
-            &filter as *const GroupFilter as *const _,
+            &prepared.filter as *const GroupFilter as *const _,
         );
         command_encoder.set_fragment_texture(
             GroupCompositeInputIndex::GroupTexture as u64,
-            Some(&group.target.texture),
+            Some(&prepared.source.texture),
         );
+        if let Some(backdrop) = backdrop {
+            command_encoder.set_fragment_texture(
+                GroupCompositeInputIndex::BackdropTexture as u64,
+                Some(&backdrop.original.texture),
+            );
+            command_encoder.set_fragment_texture(
+                GroupCompositeInputIndex::FilteredBackdropTexture as u64,
+                Some(&backdrop.filtered.texture),
+            );
+        }
         self.bind_clip_mask(
             self.clip_variant(clipped),
             command_encoder,
@@ -1331,8 +1807,12 @@ impl MetalRenderer {
         &mut self,
         compose: GroupComposeMode,
         clipped: bool,
+        backdrop: bool,
     ) -> metal::RenderPipelineState {
-        if let Some(pipeline) = self.group_composite_pipelines.get(&(compose, clipped)) {
+        if let Some(pipeline) = self
+            .group_composite_pipelines
+            .get(&(compose, clipped, backdrop))
+        {
             return pipeline.clone();
         }
         let pipeline = build_group_composite_pipeline_state(
@@ -1340,10 +1820,11 @@ impl MetalRenderer {
             &self.library,
             compose,
             clipped,
+            backdrop,
             MTLPixelFormat::BGRA8Unorm,
         );
         self.group_composite_pipelines
-            .insert((compose, clipped), pipeline.clone());
+            .insert((compose, clipped, backdrop), pipeline.clone());
         pipeline
     }
 
@@ -2444,16 +2925,17 @@ fn build_group_composite_pipeline_state(
     library: &metal::LibraryRef,
     compose: GroupComposeMode,
     clipped: bool,
+    backdrop: bool,
     pixel_format: metal::MTLPixelFormat,
 ) -> metal::RenderPipelineState {
-    let constants = group_composite_constants(compose, clipped);
+    let constants = group_composite_constants(compose, clipped, backdrop);
     let vertex_fn = library
         .get_function("group_composite_vertex", Some(constants))
         .expect("error locating the group composite vertex function");
     let fragment_fn = library
         .get_function(
             "group_composite_fragment",
-            Some(group_composite_constants(compose, clipped)),
+            Some(group_composite_constants(compose, clipped, backdrop)),
         )
         .expect("error locating the group composite fragment function");
 
@@ -2466,7 +2948,17 @@ fn build_group_composite_pipeline_state(
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-    let (source, destination) = compose.blend_factors();
+    // A backdrop filter replaces what is underneath the group rather than
+    // blending with it, so the fragment stage does the whole composite - it was
+    // handed a copy of the destination to do it with - and the blend state gets
+    // out of the way. Where the group's coverage is zero that arithmetic
+    // returns the copy unchanged, which is the same pixel the destination
+    // already held.
+    let (source, destination) = if backdrop {
+        (metal::MTLBlendFactor::One, metal::MTLBlendFactor::Zero)
+    } else {
+        compose.blend_factors()
+    };
     color_attachment.set_source_rgb_blend_factor(source);
     color_attachment.set_source_alpha_blend_factor(source);
     color_attachment.set_destination_rgb_blend_factor(destination);
@@ -2475,6 +2967,37 @@ fn build_group_composite_pipeline_state(
     device
         .new_render_pipeline_state(&descriptor)
         .expect("could not create the group composite pipeline state")
+}
+
+/// The pipeline one kind of filter pass draws with.
+///
+/// No blending at all: a pass writes the whole of its destination and what it
+/// writes is the image, not something to mix with what the texture held from
+/// the group before it.
+fn build_filter_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    kind: FilterPipeline,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function("filter_pass_vertex", None)
+        .expect("error locating the filter pass vertex function");
+    let fragment_fn = library
+        .get_function(kind.fragment_function(), None)
+        .expect("error locating a filter pass fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(&format!("filter_{kind:?}"));
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create a filter pass pipeline state")
 }
 
 /// A one-texel texture to bind where a path rasterization pass has no image
@@ -2776,6 +3299,25 @@ enum GroupCompositeInputIndex {
     GroupTexture = 4,
     ClipMasks = 5,
     ClipAtlas = 6,
+    /// The copy of what was underneath the group, and the filtered copy beside
+    /// it. Bound, and declared in the shader, only for the `HAS_BACKDROP`
+    /// variant.
+    BackdropTexture = 7,
+    FilteredBackdropTexture = 8,
+}
+
+/// What one filter pass reads. Buffers and textures index separately in Metal,
+/// so `Vertices` and `Source` naming the same slot is not a collision.
+#[repr(C)]
+enum FilterInputIndex {
+    Vertices = 0,
+    Pass = 1,
+    Filter = 2,
+    Source = 3,
+    /// The blurred alpha a drop shadow draws behind its source. Every pass
+    /// declares it so that one pipeline layout serves all three; the two that
+    /// do not read it are bound their own source.
+    Blurred = 4,
 }
 
 #[repr(C)]
@@ -2931,10 +3473,6 @@ impl GroupFilter {
         matrices: [0.; 160],
     };
 
-    fn is_empty(&self) -> bool {
-        self.matrix_count == 0
-    }
-
     /// Adds one matrix, or fails when the chain is already
     /// [`MAX_GROUP_COLOR_MATRICES`] long.
     fn push(&mut self, matrix: &[f32; 20]) -> bool {
@@ -3029,8 +3567,15 @@ impl FilterPass {
 #[derive(Clone, Debug)]
 enum FilterOp {
     Matrices(GroupFilter),
-    Blur { sigma_x: f32, sigma_y: f32 },
-    DropShadow { offset: PointF, sigma: f32, color: Hsla },
+    Blur {
+        sigma_x: f32,
+        sigma_y: f32,
+    },
+    DropShadow {
+        offset: PointF,
+        sigma: f32,
+        color: Hsla,
+    },
 }
 
 impl FilterOp {
@@ -3090,6 +3635,49 @@ impl FilterOp {
 struct ActiveTarget {
     texture: metal::Texture,
     render_target: RenderTarget,
+    /// Whether this is the frame's own target rather than a group's.
+    ///
+    /// A backdrop filter has to copy out of whatever it is composited over, and
+    /// the frame's target is the one texture that may refuse: a window's
+    /// drawable is framebuffer-only until something asks for otherwise. A
+    /// group's target is a texture this file made and can always be read.
+    is_window: bool,
+}
+
+/// Everything compositing one group needs beyond the group itself.
+struct PreparedGroup {
+    /// The image the composite samples for the group: its own target, or
+    /// whatever the last filter pass wrote.
+    source: FilterImage,
+    /// The trailing run of colour matrices, which the composite applies itself
+    /// rather than spending a pass on.
+    filter: GroupFilter,
+    backdrop: Option<PreparedBackdrop>,
+}
+
+/// The two halves of a backdrop filter: what was underneath the group, and what
+/// the filter made of it.
+struct PreparedBackdrop {
+    original: FilterImage,
+    filtered: FilterImage,
+}
+
+/// The three shapes a filter pass takes, and so the three pipelines it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FilterPipeline {
+    Blur,
+    Matrices,
+    DropShadow,
+}
+
+impl FilterPipeline {
+    fn fragment_function(self) -> &'static str {
+        match self {
+            FilterPipeline::Blur => "filter_blur_fragment",
+            FilterPipeline::Matrices => "filter_matrix_fragment",
+            FilterPipeline::DropShadow => "filter_drop_shadow_fragment",
+        }
+    }
 }
 
 /// A group whose target is being drawn into, and everything compositing it
@@ -3307,6 +3895,15 @@ impl GroupTargets {
         self.reported = true;
         log::error!("{reason}");
     }
+}
+
+/// Whether any group in a scene asks for a backdrop filter, which is what
+/// decides whether the window's drawables have to become readable.
+fn scene_has_a_backdrop_filter(scene: &Scene) -> bool {
+    scene
+        .groups
+        .iter()
+        .any(|group| group.backdrop_filter.is_some())
 }
 
 /// A group target's extent, rounded up to whole [`GROUP_TEXTURE_QUANTUM`]s.
@@ -4413,6 +5010,7 @@ fn flatten_cubic(
 fn group_composite_constants(
     compose: GroupComposeMode,
     clipped: bool,
+    backdrop: bool,
 ) -> metal::FunctionConstantValues {
     let constants = clip_constants(clipped);
     let mode = compose as u32;
@@ -4420,6 +5018,11 @@ fn group_composite_constants(
         &mode as *const u32 as *const c_void,
         metal::MTLDataType::UInt,
         1,
+    );
+    constants.set_constant_value_at_index(
+        &backdrop as *const bool as *const c_void,
+        metal::MTLDataType::Bool,
+        2,
     );
     constants
 }
