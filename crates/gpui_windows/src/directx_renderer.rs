@@ -636,11 +636,15 @@ impl DirectXRenderer {
         let mut vertices = Vec::new();
 
         for path in paths {
+            if path.brush.is_some() {
+                warn_about_unresolved_path_brush();
+            }
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                content_mask: path.content_mask,
             }));
         }
 
@@ -1272,7 +1276,13 @@ struct PathRasterizationSprite {
     xy_position: Point<ScaledPixels>,
     st_position: Point<f32>,
     color: Background,
+    /// The path's bounds already clipped to the mask's rectangle, which is what
+    /// the hardware clip uses.
     bounds: Bounds<ScaledPixels>,
+    /// The whole mask, because a rounded one also needs its radii in the
+    /// fragment stage. Paths are rasterized into an offscreen texture and then
+    /// blitted without a mask, so this is the only stage that can apply one.
+    content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Clone, Copy)]
@@ -2067,4 +2077,24 @@ mod dxgi {
             number & 0xFFFF
         ))
     }
+}
+
+/// Says, once per process, that a path arrived carrying an image or gradient
+/// brush this renderer cannot resolve.
+///
+/// [`gpui::Window::paint_path_with_image`] and
+/// [`gpui::Window::paint_path_with_gradient`] resolve a brush on every backend -
+/// the image or the baked ramp lands in the sprite atlas whatever is drawing -
+/// but only the Metal renderer reads one back out. Here the path is filled with
+/// its `color`: nothing at all for an image brush, and the flat colour halfway
+/// along the stop list for a gradient. Either way a picture is quietly losing a
+/// background, which is worth a line in the log.
+fn warn_about_unresolved_path_brush() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "a path carries an image or gradient brush, which this renderer \
+             cannot resolve; it is filled with its solid colour instead"
+        );
+    });
 }

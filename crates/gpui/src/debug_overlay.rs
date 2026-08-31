@@ -3,8 +3,8 @@
 //! infinitely triggering new frames).
 
 use crate::{
-    BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene,
-    Size, point, rgba, size, transparent_black,
+    BorderStyle, Bounds, ClipId, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels,
+    Scene, Size, point, rgba, size, transparent_black,
 };
 use std::{collections::VecDeque, time::Duration};
 
@@ -114,6 +114,7 @@ impl DebugFrameOverlay {
                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
                 size: viewport,
             },
+            ..Default::default()
         };
 
         scene.insert_primitive(solid_quad(
@@ -219,6 +220,8 @@ fn solid_quad(
     Quad {
         order: 0,
         border_style: BorderStyle::Solid,
+        clip: ClipId::NONE,
+        pad: 0,
         bounds,
         content_mask: *content_mask,
         background: color.into(),

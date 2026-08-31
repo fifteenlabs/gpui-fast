@@ -16,6 +16,7 @@ use crate::{
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     PromisedFiles,
+    BlendMode, BrushExtend, ClipId, ClipPath, Gradient, GradientKey, GroupSpec, MAX_GRADIENT_CACHE_BYTES, PathBrush,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
@@ -24,6 +25,7 @@ use crate::{
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    SceneFilter,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -89,6 +91,17 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     width: Pixels(900.),
     height: Pixels(750.),
 };
+
+/// The largest image, in its own pixels, that [`Window::paint_path_with_image`]
+/// will take as a brush.
+///
+/// The sprite atlas sizes a new texture to whatever it is first asked to hold
+/// and never evicts one, so a 4000x3000 image would take a ~46 MB texture of its
+/// own for the life of the process. Anything within this shares the atlas's
+/// standard 1024-square texture with everything else; anything larger is
+/// refused here, where the caller still has the option of scaling it down,
+/// rather than quietly costing tens of megabytes.
+pub const MAX_BRUSH_IMAGE_SIZE: DevicePixels = DevicePixels(1024);
 
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
@@ -845,7 +858,11 @@ pub struct Hitbox {
     /// The bounds of the hitbox.
     #[deref]
     pub bounds: Bounds<Pixels>,
-    /// The content mask when the hitbox was inserted.
+    /// The content mask when the hitbox was inserted. Hit testing intersects
+    /// the hitbox with `content_mask.bounds` and ignores `corner_radii`, so a
+    /// rounded mask still reports hits in the corners it paints nothing in.
+    /// The whole mask is kept rather than just the rectangle because that is
+    /// the only thing standing between here and fixing that.
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
@@ -1221,6 +1238,20 @@ enum InputModality {
     Touch,
 }
 
+/// One gradient a window has baked into a texture and put in the sprite atlas.
+struct GradientRamp {
+    /// The baked texels. Held so the atlas entry can be removed again under the
+    /// [`RenderImageParams`] its id forms.
+    data: Arc<RenderImage>,
+    /// Where the atlas put them, so a repeat of the same gradient costs a map
+    /// lookup rather than an atlas one.
+    tile: AtlasTile,
+    /// What the texture costs, against [`MAX_GRADIENT_CACHE_BYTES`].
+    bytes: usize,
+    /// The value of [`Window::gradient_clock`] when this was last painted.
+    used: u64,
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1232,6 +1263,30 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    /// The gradients this window has baked into textures, so a gradient
+    /// repeated down a page bakes once.
+    ///
+    /// Bounded by [`MAX_GRADIENT_CACHE_BYTES`] and evicted least-recently-used
+    /// when the bound is reached: dropping an entry gives the atlas tile back,
+    /// through [`PlatformAtlas::remove`], so this is a working set rather than
+    /// a ceiling the window runs into once and never comes back from.
+    gradient_ramps: FxHashMap<GradientKey, GradientRamp>,
+    /// What [`Window::gradient_ramps`] is holding in the atlas right now,
+    /// against [`MAX_GRADIENT_CACHE_BYTES`].
+    gradient_ramp_bytes: usize,
+    /// Ticked once per gradient painted, so the least-recently-used entry can
+    /// be found without keeping a list in order.
+    gradient_clock: u64,
+    /// When this window last said it could not make room for a gradient, so it
+    /// can say so again later without saying it every frame.
+    gradient_ceiling_warned: Option<std::time::Instant>,
+    /// How many times a gradient has actually been evaluated into a texture.
+    ///
+    /// Counted rather than derived from the map's length, because the two say
+    /// different things: a bake that misses the cache and then overwrites its
+    /// own entry leaves the length alone, and that is exactly the regression the
+    /// cache exists to prevent.
+    gradient_bakes: usize,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2161,6 +2216,11 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            gradient_ramps: FxHashMap::default(),
+            gradient_ramp_bytes: 0,
+            gradient_clock: 0,
+            gradient_ceiling_warned: None,
+            gradient_bakes: 0,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -2255,13 +2315,25 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered. The mask is a rectangle, optionally with rounded corners.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The radius of each corner of the mask. All zero for a plain rectangle,
+    /// which is the common case and the one the shaders take a fast path for.
+    pub corner_radii: Corners<P>,
+}
+
+impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
+    /// Create a plain rectangular mask over the given bounds, with square corners.
+    pub fn new(bounds: Bounds<P>) -> Self {
+        Self {
+            bounds,
+            corner_radii: Corners::default(),
+        }
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -2269,13 +2341,63 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
+    ///
+    /// The intersection of two rounded rectangles is not itself a rounded
+    /// rectangle, so the radii are carried over per corner: a corner keeps its
+    /// radius only where the result still lands on that same corner, and a
+    /// corner rounded by either mask stays rounded. A corner that the other
+    /// mask cut away becomes square, which is what clipping it should look
+    /// like.
     pub fn intersect(&self, other: &Self) -> Self {
-        let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        // The edges are compared against the two inputs, never against the
+        // result's own `right()`/`bottom()`. Those are `origin + size` with
+        // `size` computed as `far - near`, and `fl(near + fl(far - near))`
+        // comes back unequal to `far` for a few percent of arbitrary float
+        // pairs - which would drop a corner's radius at what looks from the
+        // outside like random scroll offsets.
+        let top_left = self.bounds.origin.max(&other.bounds.origin);
+        let bottom_right = self
+            .bounds
+            .bottom_right()
+            .min(&other.bounds.bottom_right())
+            .max(&top_left);
+        let mine = self.corner_radii_landing_on(top_left, bottom_right);
+        let theirs = other.corner_radii_landing_on(top_left, bottom_right);
+        ContentMask {
+            bounds: Bounds::from_corners(top_left, bottom_right),
+            corner_radii: Corners {
+                top_left: mine.top_left.max(theirs.top_left),
+                top_right: mine.top_right.max(theirs.top_right),
+                bottom_right: mine.bottom_right.max(theirs.bottom_right),
+                bottom_left: mine.bottom_left.max(theirs.bottom_left),
+            },
+        }
+    }
+
+    /// The radii this mask contributes to an intersection spanning `top_left`
+    /// to `bottom_right`: a corner keeps its radius exactly where both of the
+    /// edges meeting at it are still this mask's own.
+    fn corner_radii_landing_on(
+        &self,
+        top_left: Point<Pixels>,
+        bottom_right: Point<Pixels>,
+    ) -> Corners<Pixels> {
+        let left = self.bounds.left() == top_left.x;
+        let right = self.bounds.right() == bottom_right.x;
+        let top = self.bounds.top() == top_left.y;
+        let bottom = self.bounds.bottom() == bottom_right.y;
+        let keep = |corner: Pixels, held: bool| if held { corner } else { Pixels::ZERO };
+        Corners {
+            top_left: keep(self.corner_radii.top_left, left && top),
+            top_right: keep(self.corner_radii.top_right, right && top),
+            bottom_right: keep(self.corner_radii.bottom_right, right && bottom),
+            bottom_left: keep(self.corner_radii.bottom_left, left && bottom),
+        }
     }
 }
 
@@ -3396,7 +3518,7 @@ impl Window {
     fn underline(&self, origin: Point<Pixels>, width: Pixels, style: &UnderlineStyle) -> Underline {
         Underline {
             order: 0,
-            pad: 0,
+            clip: ClipId::NONE,
             bounds: self.underline_bounds(origin, width, style),
             content_mask: self.snapped_content_mask(),
             color: style
@@ -3446,11 +3568,25 @@ impl Window {
         )
     }
 
+    /// The content mask every primitive is clipped against, in device pixels.
+    ///
+    /// A plain rectangle is expanded outward to whole device pixels. The mask
+    /// doubles as the hardware clip rectangle, and a rectangular mask is
+    /// enforced by that clip alone, so rounding it outward is what keeps the
+    /// clip from eating a partially covered pixel the element meant to paint.
+    ///
+    /// A mask with radii cannot be treated that way: the corner arcs are
+    /// computed from this very rectangle, so expanding it by up to a device
+    /// pixel puts every arc that far outside where the caller asked for it.
+    /// A rounded mask is therefore scaled exactly, and the antialiasing at its
+    /// edge comes from the shader's own signed distance field instead.
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+        let mask = self.content_mask();
+        if mask.corner_radii == Corners::default() {
+            return ContentMask::new(self.cover_bounds(mask.bounds));
         }
+        mask.scale(self.scale_factor())
     }
 
     /// Call to prevent the default action of an event. Currently only used to prevent
@@ -4301,6 +4437,63 @@ impl Window {
         }
     }
 
+    /// Invoke the given function with every primitive it paints clipped to
+    /// `clip_path`, on top of the clip already in force.
+    ///
+    /// This is the escape hatch from [`ContentMask`], which is a rectangle with
+    /// four *circular* corner radii and nothing else. A [`ClipPath`] is an
+    /// arbitrary outline with a fill rule, so it can express elliptical corner
+    /// radii, a CSS `clip-path`, or any shape a document painter hands over.
+    /// It is not free the way a content mask is, so nothing uses it unless it
+    /// asks for it.
+    ///
+    /// The path's bounding box is intersected into the content mask as well,
+    /// which costs nothing and tightens both the hardware scissor rectangle and
+    /// the CPU-side culling in [`Scene::insert_primitive`] to the part of the
+    /// screen the path could possibly cover. The clip is registered inside that
+    /// tightened mask and carries it, so a rasterizer can size the mask it
+    /// allocates to the part of the window the clip can actually reach rather
+    /// than to the whole shape: a clip in a scrolled container is mostly off
+    /// screen, and its mask should cost only what is on screen.
+    ///
+    /// Only the Metal backend rasterizes the mask - see
+    /// [`Self::supports_clip_paths`], which is how a caller that would draw the
+    /// wrong picture without one can refuse instead. The wgpu and DirectX
+    /// backends carry the clip through the scene and ignore it.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn with_clip_path<R>(
+        &mut self,
+        clip_path: &ClipPath<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let mask = ContentMask::new(clip_path.bounds());
+        self.with_content_mask(Some(mask), |window| {
+            let scale = window.scale_factor();
+            let visible = window.content_mask().bounds.scale(scale);
+            window
+                .next_frame
+                .scene
+                .push_clip(clip_path.scale(scale), visible);
+            let result = f(window);
+            window.next_frame.scene.pop_clip();
+            result
+        })
+    }
+
+    /// Whether this window's renderer can rasterize a [`ClipPath`] into a mask.
+    ///
+    /// True on Metal, false on the wgpu and DirectX backends, which still carry
+    /// clip paths through the scene and ignore them. A caller whose picture
+    /// would be wrong without real clipping should check this and fall back
+    /// rather than paint something misleading.
+    pub fn supports_clip_paths(&self) -> bool {
+        cfg!(target_os = "macos")
+    }
+
     /// Updates the global element offset relative to the current offset. This is used to implement
     /// scrolling. This method should only be called during the prepaint phase of element drawing.
     pub fn with_element_offset<R>(
@@ -4333,7 +4526,16 @@ impl Window {
         result
     }
 
-    pub(crate) fn with_element_opacity<R>(
+    /// Invoke the given function with `opacity` multiplied into the alpha of
+    /// each primitive painted inside it. Passing `None` leaves the current
+    /// opacity alone; nested calls multiply, so 0.5 inside 0.5 paints at 0.25.
+    ///
+    /// This is per-primitive fading, NOT group opacity. Every primitive is
+    /// faded on its own and they still composite against each other, so two
+    /// overlapping opaque children at 0.5 come out at 0.75 in the overlap,
+    /// where CSS `opacity` on a group would give 0.5. Group opacity needs the
+    /// subtree drawn offscreen and composited once, which this does not do.
+    pub fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
         f: impl FnOnce(&mut Self) -> R,
@@ -4442,6 +4644,7 @@ impl Window {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                ..Default::default()
             })
     }
 
@@ -4624,6 +4827,13 @@ impl Window {
     /// When `content_mask` is provided, the deferred element will be clipped to that region during
     /// both prepaint and paint. When `None`, no additional clipping is applied.
     ///
+    /// A deferred element is not part of whatever isolated group was open when
+    /// it was deferred: it is painted afterwards, at the top level, so it
+    /// receives none of that group's opacity, blending or filtering. That
+    /// cannot happen through [`Window::with_isolated_group`], which runs in
+    /// the paint phase while this runs in prepaint, and the assertion below
+    /// says so if it ever becomes possible.
+    ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn defer_draw(
         &mut self,
@@ -4633,6 +4843,11 @@ impl Window {
         content_mask: Option<ContentMask<Pixels>>,
     ) {
         self.invalidator.debug_assert_prepaint();
+        debug_assert_eq!(
+            self.next_frame.scene.group_depth(),
+            0,
+            "a draw deferred inside an isolated group escapes it"
+        );
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
@@ -4674,6 +4889,84 @@ impl Window {
         result
     }
 
+    /// Paint the subtree `f` paints as an isolated group: it is drawn to a
+    /// target of its own and composited onto the window once, so `opacity`, a
+    /// blend mode and any filter apply to the subtree as a whole.
+    ///
+    /// This is what [`Window::with_element_opacity`] is not. That fades each
+    /// primitive on its own and lets them composite against each other, so two
+    /// overlapping opaque children at 0.5 come out at 0.75 where they overlap;
+    /// CSS `opacity` on a box, `mask-image`, an inset box shadow, a blend mode
+    /// and a `filter` all need the subtree flattened first, and that is this.
+    ///
+    /// The Metal renderer draws a group to a target of its own and composites
+    /// it; the wgpu and DirectX renderers do not yet, and paint the subtree
+    /// un-isolated. A group whose contents do not overlap needs no target on
+    /// any backend and its opacity is folded into its primitives, which is
+    /// what gpui has always done and stays exactly right - see
+    /// [`Scene::push_group`].
+    ///
+    /// The Metal renderer applies every [`SceneFilter`] - colour matrices, a
+    /// separable gaussian blur, a drop shadow - and applies
+    /// `options.backdrop_filter` to a copy of what is already underneath the
+    /// group. A mix mode other than `Normal` is still recorded but not applied;
+    /// the Metal renderer logs once per frame when it meets one.
+    ///
+    /// `options.bounds` sizes the target but does not clip the subtree: the
+    /// scene grows the target to cover everything painted inside it, and
+    /// further still when a filter blurs, so the gaussian tail is not cut off
+    /// at the ink's edge. A group that folds away cannot clip - there is no
+    /// target to clip to - so a group that did would paint one picture or the
+    /// other depending on whether its contents happened to overlap. The content
+    /// mask in force is the one bound the result does keep: a blur may not
+    /// paint outside an ancestor's `overflow: hidden`.
+    ///
+    /// A group may sit inside a [`Window::paint_layer`] and a layer may sit
+    /// inside a group, but neither may straddle the other.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn with_isolated_group<R>(
+        &mut self,
+        options: GroupOptions,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.content_mask();
+        let target = self.cover_bounds(options.bounds.intersect(&content_mask.bounds));
+        let scale = self.scale_factor();
+        let spec = GroupSpec {
+            bounds: target,
+            clip: self.next_frame.scene.current_clip(),
+            opacity: options.opacity,
+            blend: options.blend,
+            filter: options.filter.map(|filter| filter.scale(scale)),
+            backdrop_filter: options.backdrop_filter.map(|filter| filter.scale(scale)),
+            mask: Some(self.cover_bounds(content_mask.bounds)),
+        };
+
+        self.next_frame.scene.push_group(spec);
+        let result = f(self);
+        self.next_frame.scene.pop_group();
+        result
+    }
+
+    /// Paint the subtree `f` paints at `opacity`, as one image: the group
+    /// form of [`Window::with_element_opacity`], and the common case of
+    /// [`Window::with_isolated_group`].
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn with_group_opacity<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        opacity: f32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_isolated_group(GroupOptions::opacity(bounds, opacity), f)
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
@@ -4707,7 +5000,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                clip: ClipId::NONE,
             });
         }
     }
@@ -4752,7 +5045,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                clip: ClipId::NONE,
             });
         }
     }
@@ -4813,6 +5106,8 @@ impl Window {
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
             order: 0,
+            clip: ClipId::NONE,
+            pad: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
@@ -4832,7 +5127,9 @@ impl Window {
         let outer_bounds = quad.bounds;
         let inner_bounds = Self::largest_border_interior(&quad);
 
-        if inner_bounds.is_empty() {
+        // A rounded content mask is evaluated against the mask's own rectangle, so
+        // tightening that rectangle per strip below would round the wrong corners.
+        if inner_bounds.is_empty() || quad.content_mask.corner_radii != Corners::default() {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -4864,9 +5161,7 @@ impl Window {
             let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
             if !content_mask_bounds.is_empty() {
                 self.next_frame.scene.insert_primitive(Quad {
-                    content_mask: ContentMask {
-                        bounds: content_mask_bounds,
-                    },
+                    content_mask: ContentMask::new(content_mask_bounds),
                     ..quad
                 });
             }
@@ -4876,18 +5171,361 @@ impl Window {
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
+    pub fn paint_path(&mut self, path: Path<Pixels>, color: impl Into<Background>) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        path.content_mask = content_mask;
         let color: Background = color.into();
+        // The mask is taken in device pixels, the same way a quad takes it, so
+        // that a quad background and the path drawn over it round their corners
+        // against one rectangle rather than two that differ by a fraction of a
+        // device pixel.
+        let content_mask = self.snapped_content_mask();
+        let mut path = path.scale(scale_factor);
+        path.content_mask = content_mask;
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        self.next_frame.scene.insert_primitive(path);
+    }
+
+    /// Fill the given `Path` with an image rather than a colour.
+    ///
+    /// `brush_transform` maps the image's own pixel rectangle - its top-left at
+    /// the origin, one image pixel to one logical pixel - into the coordinate
+    /// space the path is in, so the unit transformation lays the image down at
+    /// its natural size in the window's top-left corner and
+    /// `TransformationMatrix::unit().translate(..).scale(..)` puts it where a
+    /// `background-image` wants it. Its translation is in the same logical
+    /// pixels as the path's own coordinates, not in the device pixels
+    /// `TransformationMatrix::translate`'s parameter type is named for.
+    ///
+    /// `x_extend` and `y_extend` say what fills the path beyond that one copy
+    /// of the image; `alpha` multiplies the image's own, on top of the current
+    /// element opacity.
+    ///
+    /// The image goes into the sprite atlas under the same key
+    /// [`Window::paint_image`] uses, so an image drawn both ways is uploaded
+    /// once. That is also why this returns a `Result`: the atlas can refuse.
+    ///
+    /// Only the Metal renderer resolves the brush. Elsewhere the path is filled
+    /// with the image's average colour - the closest a flat fill gets to the
+    /// picture that was asked for - and the renderer says so in the log. Filling
+    /// it with the path's own default would draw nothing at all, since that
+    /// default is transparent.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_path_with_image(
+        &mut self,
+        path: Path<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        brush_transform: TransformationMatrix,
+        x_extend: BrushExtend,
+        y_extend: BrushExtend,
+        alpha: f32,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let image_size = data.size(frame_index);
+        if image_size.width.0 <= 0 || image_size.height.0 <= 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            image_size.width <= MAX_BRUSH_IMAGE_SIZE && image_size.height <= MAX_BRUSH_IMAGE_SIZE,
+            "an image brush may be at most {}x{} pixels, and this one is {}x{}: \
+             the atlas would give it a texture of its own and never take it back",
+            MAX_BRUSH_IMAGE_SIZE.0,
+            MAX_BRUSH_IMAGE_SIZE.0,
+            image_size.width.0,
+            image_size.height.0
+        );
+        let brush_to_image = brush_transform
+            .invert()
+            .context("an image brush transform that collapses the image to a line or a point")?;
+
+        let params = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        };
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.into(), &mut || {
+                Ok(Some((
+                    image_size,
+                    Cow::Borrowed(
+                        data.as_bytes(frame_index)
+                            .expect("It's the caller's job to pass a valid frame index"),
+                    ),
+                )))
+            })?
+            .expect("Callback above only returns Some");
+
+        let scale_factor = self.scale_factor();
+        // Everything between the fragment being shaded and the texel it reads
+        // is folded into one matrix here: device pixels back to logical ones,
+        // logical ones back through the caller's transform, and the image's own
+        // pixel size down to the unit square the extend modes are defined on.
+        let screen_to_brush = TransformationMatrix::unit()
+            .scale(size(
+                1. / image_size.width.0 as f32,
+                1. / image_size.height.0 as f32,
+            ))
+            .compose(brush_to_image)
+            .compose(
+                TransformationMatrix::unit().scale(size(1. / scale_factor, 1. / scale_factor)),
+            );
+
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        let mut path = path.scale(scale_factor);
+        path.content_mask = content_mask;
+        // What a renderer that cannot resolve a brush paints. `Path::color`
+        // defaults to a transparent black, so leaving it alone would make a
+        // brushed path invisible on wgpu and DirectX rather than merely flat.
+        path.color = crate::solid_background(average_image_color(&data, frame_index, image_size))
+            .opacity(alpha * opacity);
+        path.brush = Some(PathBrush {
+            tile,
+            screen_to_brush,
+            x_extend,
+            y_extend,
+            opacity: alpha * opacity,
+        });
+        self.next_frame.scene.insert_primitive(path);
+        Ok(())
+    }
+
+    /// Fill the given `Path` with a multi-stop linear, radial or sweep
+    /// gradient.
+    ///
+    /// This is the multi-stop counterpart to painting a path with a
+    /// [`Background`]. A `Background` carries a linear gradient of exactly two
+    /// stops, and gpui's own UI is full of them; nothing here changes that path
+    /// or costs it anything. A [`Gradient`], by contrast, is evaluated on the
+    /// CPU into a small texture and drawn through the same brush machinery
+    /// [`Window::paint_path_with_image`] uses, which is what buys three or more
+    /// stops, `repeating-linear-gradient`, `radial-gradient` and
+    /// `conic-gradient` without widening a single record a shader reads.
+    ///
+    /// `alpha` multiplies the stops' own alpha, on top of the current element
+    /// opacity.
+    ///
+    /// The bake is cached per window by everything that went into it, so a
+    /// gradient repeated down a page is one texture and one atlas tile. The
+    /// cache holds [`MAX_GRADIENT_CACHE_BYTES`] and evicts the
+    /// least-recently-used gradient - and its atlas tile - to make room, so a
+    /// document with more distinct gradients than that is a document that
+    /// re-bakes as it is scrolled, not one whose gradients stop working. A
+    /// gradient whose geometry is degenerate - a zero-length axis, a zero
+    /// radius, a single stop - is painted flat, because there is no parameter
+    /// to run along; so is one that cannot be given room, which needs every
+    /// entry in the cache to be in use in the frame being painted.
+    ///
+    /// Only the Metal renderer resolves the brush. Elsewhere the path is filled
+    /// with the flat colour set here, and the renderer says so in the log.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_path_with_gradient(
+        &mut self,
+        path: Path<Pixels>,
+        gradient: &Gradient,
+        alpha: f32,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        if gradient.stops.is_empty() {
+            return Ok(());
+        }
+        let scale_factor = self.scale_factor();
+        let Some(plan) = gradient.plan(path.bounds, scale_factor) else {
+            self.paint_path(path, gradient.flat_fallback(alpha));
+            return Ok(());
+        };
+
+        self.gradient_clock += 1;
+        let used = self.gradient_clock;
+        let tile = match self.gradient_ramps.get_mut(&plan.key) {
+            Some(ramp) => {
+                ramp.used = used;
+                ramp.tile
+            }
+            None => {
+                let bytes = plan.key.byte_size();
+                if !self.make_room_for_a_gradient(bytes) {
+                    self.warn_about_the_gradient_bake_ceiling();
+                    self.paint_path(path, gradient.flat_fallback(alpha));
+                    return Ok(());
+                }
+                let buffer = image::RgbaImage::from_raw(
+                    plan.size.width,
+                    plan.size.height,
+                    plan.bake(gradient),
+                )
+                .context("a baked gradient whose bytes do not fill its texture")?;
+                let data = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
+                let image_size = size(
+                    DevicePixels(plan.size.width as i32),
+                    DevicePixels(plan.size.height as i32),
+                );
+                let params = RenderImageParams {
+                    image_id: data.id,
+                    frame_index: 0,
+                };
+                let tile = self
+                    .sprite_atlas
+                    .get_or_insert_with(&params.into(), &mut || {
+                        Ok(Some((
+                            image_size,
+                            Cow::Borrowed(
+                                data.as_bytes(0)
+                                    .expect("a baked gradient always has its one frame"),
+                            ),
+                        )))
+                    })?
+                    .expect("Callback above only returns Some");
+                self.gradient_bakes += 1;
+                self.gradient_ramp_bytes += bytes;
+                self.gradient_ramps.insert(
+                    plan.key.clone(),
+                    GradientRamp {
+                        data,
+                        tile,
+                        bytes,
+                        used,
+                    },
+                );
+                tile
+            }
+        };
+
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        // The flat colour is what the backends that cannot resolve a brush will
+        // paint, and what a `Background` two-stop approximation would have been
+        // closest to. On Metal it is never read: the brush replaces the fill.
+        let mut path = path.scale(scale_factor);
+        path.content_mask = content_mask;
+        path.color = gradient.flat_fallback(alpha).opacity(opacity);
+        path.brush = Some(PathBrush {
+            tile,
+            screen_to_brush: plan.screen_to_brush,
+            x_extend: plan.x_extend,
+            y_extend: plan.y_extend,
+            opacity: alpha * opacity,
+        });
+        self.next_frame.scene.insert_primitive(path);
+        Ok(())
+    }
+
+    /// Evict baked gradients until `bytes` more of them fit under
+    /// [`MAX_GRADIENT_CACHE_BYTES`], and say whether they do.
+    ///
+    /// Least-recently-used first, and never one whose tile a path in a live
+    /// scene is still pointing at: giving a tile back lets the next bake be
+    /// allocated over it, and a path that was painted earlier in this frame -
+    /// or replayed into it from a cached subtree, which never touches this
+    /// cache at all - would then sample the new gradient's texels. The scene
+    /// being painted and the one the renderer was last handed are both asked,
+    /// so a frame still on its way to the GPU counts as live too.
+    fn make_room_for_a_gradient(&mut self, bytes: usize) -> bool {
+        if bytes > MAX_GRADIENT_CACHE_BYTES {
+            return false;
+        }
+        if self.gradient_ramp_bytes + bytes <= MAX_GRADIENT_CACHE_BYTES {
+            return true;
+        }
+
+        let mut live = FxHashSet::default();
+        for scene in [&self.next_frame.scene, &self.rendered_frame.scene] {
+            live.extend(
+                scene
+                    .paths
+                    .iter()
+                    .filter_map(|path| path.brush.as_ref())
+                    .map(|brush| (brush.tile.texture_id, brush.tile.tile_id.0)),
+            );
+        }
+
+        while self.gradient_ramp_bytes + bytes > MAX_GRADIENT_CACHE_BYTES {
+            let evicted = self
+                .gradient_ramps
+                .iter()
+                .filter(|(_, ramp)| !live.contains(&(ramp.tile.texture_id, ramp.tile.tile_id.0)))
+                .min_by_key(|(_, ramp)| ramp.used)
+                .map(|(key, _)| key.clone());
+            let Some(key) = evicted else {
+                return false;
+            };
+            let ramp = self
+                .gradient_ramps
+                .remove(&key)
+                .expect("the key came from the map a statement ago");
+            self.gradient_ramp_bytes -= ramp.bytes;
+            self.sprite_atlas.remove(
+                &RenderImageParams {
+                    image_id: ramp.data.id,
+                    frame_index: 0,
+                }
+                .into(),
+            );
+        }
+        true
+    }
+
+    /// Says that this window could not make room to bake a gradient, at most
+    /// once a minute.
+    ///
+    /// Beyond this point gradients still paint - as the flat colour their stop
+    /// list holds halfway along - so the symptom is a page that goes subtly
+    /// flat rather than one that goes blank, which is exactly the kind of thing
+    /// that needs saying out loud rather than being left to be noticed. Per
+    /// window rather than per process, because a second window hitting the same
+    /// wall is a second thing worth knowing; rate-limited, because it is asked
+    /// once per gradient and a page full of them would otherwise fill a log.
+    fn warn_about_the_gradient_bake_ceiling(&mut self) {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let now = std::time::Instant::now();
+        if self
+            .gradient_ceiling_warned
+            .is_some_and(|last| now.duration_since(last) < EVERY)
+        {
+            return;
+        }
+        self.gradient_ceiling_warned = Some(now);
+        log::warn!(
+            "this window is holding {} of baked gradients, every one of them in use in the \
+             frame being painted, so it has no room to bake another; further gradients are \
+             painted flat until one of them falls out of the frame",
+            MAX_GRADIENT_CACHE_BYTES
+        );
+    }
+
+    /// How many times this window has evaluated a gradient into a texture and
+    /// put it in the atlas.
+    ///
+    /// Exposed for the render tests, whose job includes proving two negatives:
+    /// gpui's own UI paints two-stop [`Background`] gradients constantly and
+    /// this must stay at zero while it does, and a gradient repeated down a page
+    /// must move it once rather than once per copy.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn baked_gradient_count(&self) -> usize {
+        self.gradient_bakes
+    }
+
+    /// How many isolated groups the frame being painted has kept: the ones the
+    /// scene could not fold away, and so the ones a renderer gives a target of
+    /// its own.
+    ///
+    /// Exposed for the render tests, where a group that folded away and a group
+    /// that was composited paint the same pixels almost everywhere - which makes
+    /// "the same pixels" a useless claim about compositing unless something says
+    /// which of the two actually happened.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn isolated_group_count(&self) -> usize {
+        self.next_frame.scene.groups.len()
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -4925,7 +5563,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
-            pad: 0,
+            clip: ClipId::NONE,
             bounds,
             content_mask: self.snapped_content_mask(),
             thickness: self.snap_stroke(style.thickness),
@@ -4998,7 +5636,7 @@ impl Window {
             if subpixel_rendering {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
                     order: 0,
-                    pad: 0,
+                    clip: ClipId::NONE,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -5008,7 +5646,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    clip: ClipId::NONE,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -5089,7 +5727,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                clip: ClipId::NONE,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -5155,7 +5793,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            clip: ClipId::NONE,
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),
@@ -5261,7 +5899,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            clip: ClipId::NONE,
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
@@ -5289,6 +5927,7 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
+            clip: ClipId::NONE,
             bounds,
             content_mask,
             image_buffer,
@@ -7904,6 +8543,55 @@ impl From<[u8; 20]> for ElementId {
     }
 }
 
+/// What [`Window::with_isolated_group`] does to the subtree painted inside it.
+///
+/// Lengths are in logical pixels; the group reaches the scene in device
+/// pixels. See [`GroupSpec`], which is what this becomes.
+#[derive(Clone, Debug)]
+pub struct GroupOptions {
+    /// The part of the window the subtree paints into. The group's target is
+    /// sized from this intersected with the content mask in force, so a group
+    /// that claims more than it paints costs more than it has to.
+    ///
+    /// It is a floor rather than a clip: the scene grows a group's target to
+    /// cover whatever was painted inside it, because a group is not supposed to
+    /// clip and a group that folds away cannot. Getting these bounds wrong
+    /// costs memory, never a picture.
+    pub bounds: Bounds<Pixels>,
+    /// The alpha the whole subtree is composited at, `0.0..=1.0`.
+    pub opacity: f32,
+    /// How the subtree's result is combined with what is underneath it.
+    pub blend: BlendMode,
+    /// A filter applied to the subtree's own result before compositing.
+    pub filter: Option<SceneFilter>,
+    /// A filter applied to what is underneath before the subtree is drawn over
+    /// it: CSS `backdrop-filter`.
+    pub backdrop_filter: Option<SceneFilter>,
+}
+
+impl GroupOptions {
+    /// A group that only fades its subtree.
+    pub fn opacity(bounds: Bounds<Pixels>, opacity: f32) -> Self {
+        Self {
+            bounds,
+            opacity,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for GroupOptions {
+    fn default() -> Self {
+        Self {
+            bounds: Bounds::default(),
+            opacity: 1.0,
+            blend: BlendMode::NORMAL,
+            filter: None,
+            backdrop_filter: None,
+        }
+    }
+}
+
 /// A rectangle to be rendered in the window at the given position and size.
 /// Passed as an argument [`Window::paint_quad`].
 #[derive(Clone)]
@@ -8016,6 +8704,62 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
     }
 }
 
+/// A flat stand-in for an image brush: the image averaged over a fixed grid of
+/// its texels.
+///
+/// The renderers that cannot resolve a brush fill the path with this, so it has
+/// to be cheap on every paint - a fixed number of taps whatever the image's size
+/// - and close enough that a page of `background-image` boxes reads as a page
+/// rather than as a row of holes. The colour is weighted by alpha and the alpha
+/// averaged on its own, so a mostly transparent image stands in as a wash rather
+/// than as a solid block of whatever colour its opaque corner happened to be.
+fn average_image_color(
+    data: &RenderImage,
+    frame_index: usize,
+    image_size: Size<DevicePixels>,
+) -> Hsla {
+    const TAPS: u32 = 4;
+
+    let width = image_size.width.0.max(0) as u32;
+    let height = image_size.height.0.max(0) as u32;
+    let Some(bytes) = data.as_bytes(frame_index) else {
+        return transparent_black();
+    };
+    if width == 0 || height == 0 {
+        return transparent_black();
+    }
+
+    let (mut red, mut green, mut blue) = (0., 0., 0.);
+    let (mut alpha, mut taps) = (0f32, 0f32);
+    for row in 0..TAPS {
+        let y = (row * 2 + 1) * height / (TAPS * 2);
+        for column in 0..TAPS {
+            let x = (column * 2 + 1) * width / (TAPS * 2);
+            let index = ((y * width + x) * 4) as usize;
+            let Some(texel) = bytes.get(index..index + 4) else {
+                continue;
+            };
+            // The atlas - and so a `RenderImage` - holds straight BGRA.
+            let texel_alpha = texel[3] as f32 / 255.;
+            red += texel[2] as f32 / 255. * texel_alpha;
+            green += texel[1] as f32 / 255. * texel_alpha;
+            blue += texel[0] as f32 / 255. * texel_alpha;
+            alpha += texel_alpha;
+            taps += 1.;
+        }
+    }
+    if taps == 0. || alpha <= 0. {
+        return transparent_black();
+    }
+    crate::Rgba {
+        r: red / alpha,
+        g: green / alpha,
+        b: blue / alpha,
+        a: alpha / taps,
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -8025,6 +8769,9 @@ mod tests {
         time::Duration,
     };
 
+    use std::sync::Arc;
+
+    use crate::GroupSpec;
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, ContentMask, Context, DispatchPhase,
         DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
@@ -8034,6 +8781,7 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
+        BrushExtend, ClipId, ClipPath, Corners, Path, RenderImage, TransformationMatrix, fill, red,
     };
 
     #[gpui::test]
@@ -9864,6 +10612,388 @@ mod tests {
             })
             .unwrap();
     }
+
+    struct ClipsItsChild {
+        inside: Rc<RefCell<Option<(ContentMask<Pixels>, ClipId)>>>,
+        outside: Rc<Cell<ClipId>>,
+    }
+
+    impl Render for ClipsItsChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let inside = self.inside.clone();
+            let outside = self.outside.clone();
+            div().size_full().child(canvas(
+                |_, _, _| {},
+                move |_, _, window, _cx| {
+                    let path = ClipPath::rounded_rect(
+                        Bounds {
+                            origin: point(px(10.), px(20.)),
+                            size: size(px(30.), px(40.)),
+                        },
+                        Corners::default(),
+                    );
+                    window.with_clip_path(&path, |window| {
+                        *inside.borrow_mut() = Some((
+                            window.content_mask(),
+                            window.next_frame.scene.current_clip(),
+                        ));
+                    });
+                    outside.set(window.next_frame.scene.current_clip());
+                },
+            ))
+        }
+    }
+
+    /// `with_clip_path` pushes the clip for the scope and takes it away again,
+    /// and tightens the content mask to the path's bounding box on the way in
+    /// so the hardware scissor and the CPU-side culling both narrow for free.
+    #[test]
+    fn test_with_clip_path_scopes_the_clip_and_tightens_the_mask() {
+        let mut cx = TestAppContext::single();
+
+        let inside = Rc::new(RefCell::new(None));
+        let outside = Rc::new(Cell::new(ClipId(u32::MAX)));
+        let window = cx.add_window({
+            let inside = inside.clone();
+            let outside = outside.clone();
+            move |_, _| ClipsItsChild { inside, outside }
+        });
+
+        let (mask, clip) = inside.borrow_mut().take().expect("the canvas should paint");
+        assert_eq!(
+            mask.bounds,
+            Bounds {
+                origin: point(px(10.), px(20.)),
+                size: size(px(30.), px(40.)),
+            }
+        );
+        assert_eq!(clip, ClipId(1));
+        assert_eq!(outside.get(), ClipId::NONE);
+
+        // A caller whose picture would be wrong without a real mask has to be
+        // able to find out whether it is going to get one. The Metal renderer
+        // rasterizes them; the wgpu and DirectX ones still carry clip paths
+        // through the scene and ignore them.
+        cx.update_window(window.into(), |_, window, _| {
+            assert_eq!(
+                window.supports_clip_paths(),
+                cfg!(target_os = "macos"),
+                "only the Metal renderer rasterizes clip masks"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The bounds a group claims, in logical pixels.
+    const GROUP_BOUNDS: (f32, f32, f32, f32) = (10., 20., 30., 40.);
+
+    struct GroupsItsChild {
+        depth_inside: Rc<Cell<usize>>,
+        depth_outside: Rc<Cell<usize>>,
+        recorded: Rc<RefCell<Option<GroupSpec>>>,
+        alphas: Rc<RefCell<Vec<f32>>>,
+        scale: Rc<Cell<f32>>,
+        overlapping: bool,
+    }
+
+    impl Render for GroupsItsChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let depth_inside = self.depth_inside.clone();
+            let depth_outside = self.depth_outside.clone();
+            let recorded = self.recorded.clone();
+            let alphas = self.alphas.clone();
+            let scale = self.scale.clone();
+            let overlapping = self.overlapping;
+            div().size_full().child(canvas(
+                |_, _, _| {},
+                move |_, _, window, _cx| {
+                    let (x, y, width, height) = GROUP_BOUNDS;
+                    let bounds = Bounds {
+                        origin: point(px(x), px(y)),
+                        size: size(px(width), px(height)),
+                    };
+                    window.with_group_opacity(bounds, 0.5, |window| {
+                        depth_inside.set(window.next_frame.scene.group_depth());
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(px(x), px(y)),
+                                size: size(px(10.), px(10.)),
+                            },
+                            red(),
+                        ));
+                        let second = if overlapping { x + 5. } else { x + 20. };
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(px(second), px(y)),
+                                size: size(px(10.), px(10.)),
+                            },
+                            red(),
+                        ));
+                    });
+                    depth_outside.set(window.next_frame.scene.group_depth());
+                    scale.set(window.scale_factor());
+                    *recorded.borrow_mut() = window.next_frame.scene.groups.last().cloned();
+                    *alphas.borrow_mut() = window
+                        .next_frame
+                        .scene
+                        .quads
+                        .iter()
+                        .map(|quad| quad.background.solid.a)
+                        .collect();
+                },
+            ))
+        }
+    }
+
+    fn paint_a_group(overlapping: bool) -> GroupsItsChild {
+        let child = GroupsItsChild {
+            depth_inside: Rc::new(Cell::new(usize::MAX)),
+            depth_outside: Rc::new(Cell::new(usize::MAX)),
+            recorded: Rc::new(RefCell::new(None)),
+            alphas: Rc::new(RefCell::new(Vec::new())),
+            scale: Rc::new(Cell::new(0.)),
+            overlapping,
+        };
+        let mut cx = TestAppContext::single();
+        let handle = GroupsItsChild {
+            depth_inside: child.depth_inside.clone(),
+            depth_outside: child.depth_outside.clone(),
+            recorded: child.recorded.clone(),
+            alphas: child.alphas.clone(),
+            scale: child.scale.clone(),
+            overlapping,
+        };
+        cx.add_window(move |_, _| handle);
+        child
+    }
+
+    /// A group whose children overlap is the case group opacity exists for -
+    /// fading them one at a time would show the seam - so the scene keeps it
+    /// and leaves the primitives alone until a backend can composite it.
+    #[test]
+    fn test_with_group_opacity_records_a_group_around_overlapping_children() {
+        let painted = paint_a_group(true);
+
+        assert_eq!(painted.depth_inside.get(), 1, "a group is open inside");
+        assert_eq!(painted.depth_outside.get(), 0, "and closed again outside");
+
+        let scale = painted.scale.get();
+        let (x, y, width, height) = GROUP_BOUNDS;
+        let spec = painted
+            .recorded
+            .borrow()
+            .clone()
+            .expect("an overlapping group should be recorded");
+        assert_eq!(
+            spec.bounds,
+            Bounds {
+                origin: point(ScaledPixels(x * scale), ScaledPixels(y * scale)),
+                size: size(ScaledPixels(width * scale), ScaledPixels(height * scale)),
+            },
+            "the group's target is its bounds in device pixels"
+        );
+        assert_eq!(spec.opacity, 0.5);
+        assert_eq!(spec.clip, ClipId::NONE);
+        assert!(spec.blend.is_normal());
+        assert_eq!(
+            *painted.alphas.borrow(),
+            vec![1., 1.],
+            "nothing was faded per primitive, which would have been wrong"
+        );
+    }
+
+    /// Children that do not overlap fade to the same pixels one at a time as
+    /// they would as a group, so the group is folded away and the frame is the
+    /// one gpui would have painted before groups existed.
+    #[test]
+    fn test_with_group_opacity_folds_into_children_that_do_not_overlap() {
+        let painted = paint_a_group(false);
+
+        assert_eq!(painted.depth_inside.get(), 1);
+        assert_eq!(painted.depth_outside.get(), 0);
+        assert!(
+            painted.recorded.borrow().is_none(),
+            "a foldable group leaves nothing behind"
+        );
+        assert_eq!(*painted.alphas.borrow(), vec![0.5, 0.5]);
+    }
+
+    /// The scene one paint callback left behind.
+    struct PaintedScene {
+        paths: Vec<Path<ScaledPixels>>,
+        groups: Vec<GroupSpec>,
+    }
+
+    struct PaintsWhateverItIsGiven {
+        paint: Rc<dyn Fn(&mut Window)>,
+        painted: Rc<RefCell<Option<PaintedScene>>>,
+    }
+
+    impl Render for PaintsWhateverItIsGiven {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paint = self.paint.clone();
+            let painted = self.painted.clone();
+            div().size_full().child(canvas(
+                |_, _, _| {},
+                move |_, _, window, _cx| {
+                    paint(window);
+                    *painted.borrow_mut() = Some(PaintedScene {
+                        paths: window.next_frame.scene.paths.clone(),
+                        groups: window.next_frame.scene.groups.clone(),
+                    });
+                },
+            ))
+        }
+    }
+
+    /// Run `paint` inside a real paint pass and hand back what it put in the
+    /// scene.
+    fn paint_into_a_scene(paint: impl Fn(&mut Window) + 'static) -> PaintedScene {
+        let painted = Rc::new(RefCell::new(None));
+        let view = PaintsWhateverItIsGiven {
+            paint: Rc::new(paint),
+            painted: painted.clone(),
+        };
+        let mut cx = TestAppContext::single();
+        cx.add_window(move |_, _| view);
+        painted
+            .borrow_mut()
+            .take()
+            .expect("the canvas paints as the window opens")
+    }
+
+    /// A four-texel image, half `left` and half `right`, in the straight BGRA a
+    /// `RenderImage` holds.
+    fn two_colour_image(left: [u8; 4], right: [u8; 4]) -> Arc<RenderImage> {
+        let mut buffer = image::RgbaImage::new(4, 4);
+        for (x, _, pixel) in buffer.enumerate_pixels_mut() {
+            let [r, g, b, a] = if x < 2 { left } else { right };
+            *pixel = image::Rgba([b, g, r, a]);
+        }
+        Arc::new(RenderImage::new([image::Frame::new(buffer)]))
+    }
+
+    fn a_square_path(x: f32, y: f32, side: f32) -> Path<Pixels> {
+        let bounds = Bounds {
+            origin: point(px(x), px(y)),
+            size: size(px(side), px(side)),
+        };
+        let mut path = Path::new(bounds.origin);
+        path.line_to(bounds.top_right());
+        path.line_to(bounds.bottom_right());
+        path.line_to(bounds.bottom_left());
+        path
+    }
+
+    /// A group holding one brushed path is overlap-free by construction, so it
+    /// always folds - and a fold that only touched `Path::color` would fade
+    /// nothing at all, because a backend that resolves the brush never reads
+    /// that colour. `<div style="opacity: .5">` around a `background-image` is
+    /// exactly this shape.
+    #[test]
+    fn test_a_folded_group_fades_the_image_a_path_is_brushed_with() {
+        let image = two_colour_image([255, 0, 0, 255], [0, 0, 255, 255]);
+        let painted = paint_into_a_scene(move |window| {
+            window.with_group_opacity(
+                Bounds {
+                    origin: point(px(0.), px(0.)),
+                    size: size(px(50.), px(50.)),
+                },
+                0.5,
+                |window| {
+                    window
+                        .paint_path_with_image(
+                            a_square_path(0., 0., 50.),
+                            image.clone(),
+                            0,
+                            TransformationMatrix::unit(),
+                            BrushExtend::Pad,
+                            BrushExtend::Pad,
+                            1.,
+                        )
+                        .expect("the test atlas takes a four-texel image");
+                },
+            );
+        });
+
+        assert!(
+            painted.groups.is_empty(),
+            "a group holding one path cannot overlap itself, so it folds - and \
+             this test is about what folding does"
+        );
+        let brush = painted.paths[0]
+            .brush
+            .expect("the path kept the brush it was painted with");
+        assert_eq!(
+            brush.opacity, 0.5,
+            "the group's opacity has to reach the brush, which is the only \
+             thing a backend that resolves one looks at"
+        );
+    }
+
+    /// A path with an image brush on a renderer that cannot resolve one is
+    /// filled with `Path::color`, and that colour defaults to a transparent
+    /// black: without a fallback the whole picture is missing rather than flat.
+    #[test]
+    fn test_a_brushed_path_carries_a_flat_colour_for_the_renderers_that_ignore_brushes() {
+        let image = two_colour_image([255, 0, 0, 255], [0, 0, 255, 255]);
+        let painted = paint_into_a_scene(move |window| {
+            window
+                .paint_path_with_image(
+                    a_square_path(0., 0., 50.),
+                    image.clone(),
+                    0,
+                    TransformationMatrix::unit(),
+                    BrushExtend::Pad,
+                    BrushExtend::Pad,
+                    1.,
+                )
+                .expect("the test atlas takes a four-texel image");
+        });
+
+        let color = crate::Rgba::from(painted.paths[0].color.solid);
+        assert!(
+            color.a > 0.99,
+            "a brushed path came back at an alpha of {}, which on wgpu and \
+             DirectX is a path that draws nothing at all",
+            color.a
+        );
+        assert!(
+            (color.r - 0.5).abs() < 0.05 && (color.b - 0.5).abs() < 0.05 && color.g < 0.05,
+            "an image half red and half blue should stand in as the average of \
+             the two, and came back as {color:?}"
+        );
+    }
+
+    /// And the fallback fades with the element opacity and the caller's alpha,
+    /// the way the brush's own multiplier does.
+    #[test]
+    fn test_the_flat_colour_of_a_brushed_path_carries_the_opacity() {
+        let image = two_colour_image([255, 0, 0, 255], [255, 0, 0, 255]);
+        let painted = paint_into_a_scene(move |window| {
+            window.with_element_opacity(Some(0.5), |window| {
+                window
+                    .paint_path_with_image(
+                        a_square_path(0., 0., 50.),
+                        image.clone(),
+                        0,
+                        TransformationMatrix::unit(),
+                        BrushExtend::Pad,
+                        BrushExtend::Pad,
+                        0.5,
+                    )
+                    .expect("the test atlas takes a four-texel image");
+            });
+        });
+
+        let color = crate::Rgba::from(painted.paths[0].color.solid);
+        assert!(
+            (color.a - 0.25).abs() < 0.01,
+            "half the element opacity and half the caller's alpha is a quarter, \
+             and the flat fallback came back at {}",
+            color.a
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "inspector", debug_assertions)))]
@@ -10103,5 +11233,160 @@ mod zoom_tests {
             !view.read_with(cx, |view, _| view.clicked),
             "a click outside the magnified target hit it anyway"
         );
+    }
+}
+
+#[cfg(test)]
+mod content_mask_tests {
+    use crate::{Bounds, ContentMask, Corners, Pixels, point, px, size};
+
+    fn mask(x: f32, y: f32, w: f32, h: f32, radii: f32) -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: Bounds {
+                origin: point(px(x), px(y)),
+                size: size(px(w), px(h)),
+            },
+            corner_radii: Corners::all(px(radii)),
+        }
+    }
+
+    #[test]
+    fn a_corner_the_other_mask_cut_away_stops_being_round() {
+        // The right half is clipped off, so the two right corners are no longer
+        // this mask's corners and must not stay rounded.
+        let rounded = mask(0., 0., 100., 100., 8.);
+        let left_half = mask(0., 0., 50., 100., 0.);
+
+        let clipped = rounded.intersect(&left_half);
+
+        assert_eq!(clipped.corner_radii.top_left, px(8.));
+        assert_eq!(clipped.corner_radii.bottom_left, px(8.));
+        assert_eq!(clipped.corner_radii.top_right, Pixels::ZERO);
+        assert_eq!(clipped.corner_radii.bottom_right, Pixels::ZERO);
+    }
+
+    #[test]
+    fn a_corner_rounded_by_either_mask_stays_rounded() {
+        let rounded = mask(0., 0., 100., 100., 8.);
+        let inner_rounded = mask(0., 0., 100., 100., 4.);
+
+        let both = rounded.intersect(&inner_rounded);
+
+        assert_eq!(both.corner_radii.top_left, px(8.));
+    }
+
+    #[test]
+    fn a_mask_that_is_not_clipped_keeps_every_radius() {
+        let rounded = mask(10., 10., 50., 50., 6.);
+        let covering = mask(0., 0., 100., 100., 0.);
+
+        let kept = rounded.intersect(&covering);
+
+        assert_eq!(kept.bounds, rounded.bounds);
+        assert_eq!(kept.corner_radii, Corners::all(px(6.)));
+    }
+
+    #[test]
+    fn scaling_scales_the_radii_with_the_bounds() {
+        let scaled = mask(0., 0., 10., 10., 4.).scale(2.0);
+
+        assert_eq!(scaled.bounds.size.width.0, 20.);
+        assert_eq!(scaled.corner_radii.top_left.0, 8.);
+    }
+
+    #[test]
+    fn a_plain_rectangular_mask_has_no_radii() {
+        let plain = mask(0., 0., 10., 10., 0.);
+
+        assert_eq!(plain.corner_radii, Corners::default());
+    }
+
+    #[test]
+    fn a_corner_the_other_mask_left_alone_keeps_its_radius_at_fractional_offsets() {
+        // A scrolled bubble: the viewport cuts its left edge and leaves the
+        // other three alone, so both right corners are still the bubble's own
+        // and must stay round.
+        //
+        // The coordinates are deliberately fractional and not on a half-pixel
+        // boundary. Deciding which edges survived by comparing against the
+        // intersection's own `right()` - `origin.x + (right - origin.x)`, a
+        // subtract-and-add roundtrip through f32 - answers "no" here, and for
+        // a few percent of arbitrary coordinate pairs generally: 32.1 + (170.3
+        // - 32.1) is 170.30002, not 170.3.
+        let bubble = mask(10.1, 40.1, 160.2, 118.9, 8.);
+        let viewport = mask(32.1, 10.7, 190.9, 200.3, 0.);
+        let (left, right) = (px(32.1), bubble.bounds.right());
+        assert!(
+            left + (right - left) != right,
+            "these coordinates survive the roundtrip, so the test would pass either way"
+        );
+
+        let clipped = bubble.intersect(&viewport);
+
+        assert_eq!(clipped.corner_radii.top_right, px(8.));
+        assert_eq!(clipped.corner_radii.bottom_right, px(8.));
+        assert_eq!(clipped.corner_radii.top_left, Pixels::ZERO);
+        assert_eq!(clipped.corner_radii.bottom_left, Pixels::ZERO);
+    }
+
+    #[test]
+    fn a_corner_the_clipping_mask_never_touched_keeps_its_radius_at_every_offset() {
+        // The case above, swept over a grid of fractional offsets: a bubble
+        // scrolling past the left edge of a viewport. Deciding the surviving
+        // edges by comparing against the intersection's own `right()` gets 31
+        // of these 3600 wrong, and each one is a bubble whose right-hand
+        // corners are square at one scroll offset and round at the next.
+        let mut checked = 0;
+        for i in 0..60 {
+            let left = i as f32 * 3.7 + 0.3;
+            let bubble = mask(left, 40.1, 160.2, 118.9, 8.);
+            for j in 0..60 {
+                let cut_at = left + j as f32 * 1.9 + 11.3;
+                let viewport = mask(cut_at, 10.7, 190.9, 200.3, 0.);
+                assert!(
+                    viewport.bounds.left() > bubble.bounds.left()
+                        && viewport.bounds.left() < bubble.bounds.right()
+                        && viewport.bounds.right() > bubble.bounds.right()
+                        && viewport.bounds.top() < bubble.bounds.top()
+                        && viewport.bounds.bottom() > bubble.bounds.bottom(),
+                    "the viewport has to cut the bubble's left edge and only that one"
+                );
+
+                let clipped = bubble.intersect(&viewport);
+
+                assert_eq!(
+                    clipped.corner_radii.top_right,
+                    px(8.),
+                    "the top-right corner of a bubble cut at {cut_at} went square"
+                );
+                assert_eq!(
+                    clipped.corner_radii.bottom_right,
+                    px(8.),
+                    "the bottom-right corner of a bubble cut at {cut_at} went square"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3600);
+    }
+
+    #[test]
+    fn crossing_masks_keep_the_radii_of_whichever_edges_survived() {
+        // The result takes its left and top from one mask and its right and
+        // bottom from the other, so exactly one corner of each survives.
+        let a = mask(10.3, 20.7, 150.15, 130.45, 5.);
+        let b = mask(40.9, 50.35, 170.65, 140.05, 9.);
+
+        let crossed = a.intersect(&b);
+
+        assert_eq!(crossed.bounds.origin, point(px(40.9), px(50.35)));
+        assert_eq!(crossed.corner_radii.top_left, px(9.), "b's top-left");
+        assert_eq!(
+            crossed.corner_radii.bottom_right,
+            px(5.),
+            "a's bottom-right"
+        );
+        assert_eq!(crossed.corner_radii.top_right, Pixels::ZERO);
+        assert_eq!(crossed.corner_radii.bottom_left, Pixels::ZERO);
     }
 }
