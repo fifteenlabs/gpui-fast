@@ -484,6 +484,26 @@ pub fn report_groups_painted_without_isolation(scene: &Scene, reported: &mut boo
     );
 }
 
+/// Says, once per process, that a path arrived carrying an image or gradient
+/// brush this renderer cannot resolve.
+///
+/// [`crate::Window::paint_path_with_image`] and
+/// [`crate::Window::paint_path_with_gradient`] resolve a brush on every backend -
+/// the image or the baked ramp lands in the sprite atlas whatever is drawing -
+/// but only the Metal renderer reads one back out. Here the path is filled with
+/// its `color`: nothing at all for an image brush, and the flat colour halfway
+/// along the stop list for a gradient. Either way a picture is quietly losing a
+/// background, which is worth a line in the log.
+pub fn report_unresolved_path_brush() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "a path carries an image or gradient brush, which this renderer \
+             cannot resolve; it is filled with its solid colour instead"
+        );
+    });
+}
+
 /// One instruction in the order a scene has to be replayed in: see
 /// [`Scene::steps`].
 #[derive(Debug)]
