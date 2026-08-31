@@ -88,6 +88,7 @@ mod apple_build {
         // Source files from gpui that define types used in shaders
         let gpui_src_paths = [
             gpui_dir.join("src/scene.rs"),
+            gpui_dir.join("src/clip_path.rs"),
             gpui_dir.join("src/geometry.rs"),
             gpui_dir.join("src/color.rs"),
             gpui_dir.join("src/window.rs"),

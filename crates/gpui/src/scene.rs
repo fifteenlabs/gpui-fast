@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ClipPath, ContentMask, Corners, Edges, Hsla,
-    Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ClipPath, ContentMask, Corners, DevicePixels,
+    Edges, Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, size,
 };
 use std::{
     fmt::Debug,
@@ -2286,6 +2286,217 @@ impl PathVertex<Pixels> {
         PathVertex {
             xy_position: self.xy_position.scale(factor),
             st_position: self.st_position,
+        }
+    }
+}
+
+/// A width and height in whole device pixels: the size of a coverage atlas, or
+/// of the working attachments one nesting level is rendered through.
+///
+/// This is renderer-independent bookkeeping rather than geometry: it is whole
+/// texels, it is never negative in practice, and it exists to be handed to a
+/// texture allocator. [`Bounds<DevicePixels>`](Bounds) is the geometry type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extent {
+    /// The width, in whole device pixels.
+    pub width: i32,
+    /// The height, in whole device pixels.
+    pub height: i32,
+}
+
+impl Extent {
+    /// The extent that holds nothing.
+    pub const ZERO: Self = Extent {
+        width: 0,
+        height: 0,
+    };
+
+    /// The smallest extent that holds both.
+    pub fn max(self, other: Self) -> Self {
+        Extent {
+            width: self.width.max(other.width),
+            height: self.height.max(other.height),
+        }
+    }
+
+    /// What a BGRA8 texture of this size costs.
+    pub fn bytes(self) -> usize {
+        self.width.max(0) as usize * self.height.max(0) as usize * 4
+    }
+
+    /// Rounded up to whole `quantum`s, and never to nothing: a size that
+    /// wobbles by a pixel is then the same allocation, and a texture is never
+    /// asked for with a side of zero.
+    pub fn quantized_to(self, quantum: i32) -> Self {
+        let round = |value: i32| {
+            let quanta = (value.max(1) + quantum - 1) / quantum;
+            quanta * quantum
+        };
+        Extent {
+            width: round(self.width),
+            height: round(self.height),
+        }
+    }
+}
+
+/// How large a set of textures is allowed to stay once a frame stops needing
+/// them.
+///
+/// Growing is immediate: a frame that cannot fit what it needs draws the wrong
+/// picture. Shrinking waits for `SHRINK_FRAMES` consecutive frames that would
+/// all have fitted in something smaller, because recreating the textures is not
+/// free and a list scrolling a clipped element in and out of view would
+/// otherwise do it every few frames.
+#[derive(Default)]
+pub struct TextureBudget<const SHRINK_FRAMES: u32> {
+    /// What is currently allocated.
+    current: Extent,
+    /// The largest a frame has needed since the present run of small frames
+    /// began, and so what shrinking would shrink to.
+    peak: Extent,
+    /// How many consecutive frames have fitted inside `peak`.
+    frames: u32,
+}
+
+impl<const SHRINK_FRAMES: u32> TextureBudget<SHRINK_FRAMES> {
+    /// The size the next frame starts from: what is already allocated, unless
+    /// a long enough run of frames has all fitted inside something smaller.
+    pub fn floor(&mut self) -> Extent {
+        if self.frames >= SHRINK_FRAMES {
+            self.current = self.peak;
+            self.peak = Extent::ZERO;
+            self.frames = 0;
+        }
+        self.current
+    }
+
+    /// What the frame allocated, and what it would have been enough to
+    /// allocate.
+    pub fn observe(&mut self, allocated: Extent, needed: Extent) {
+        self.current = allocated;
+        if needed.width < allocated.width || needed.height < allocated.height {
+            self.peak = self.peak.max(needed);
+            self.frames += 1;
+        } else {
+            self.peak = Extent::ZERO;
+            self.frames = 0;
+        }
+    }
+}
+
+/// A rectangle of whole device pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceRect {
+    /// The left edge.
+    pub x: i32,
+    /// The top edge.
+    pub y: i32,
+    /// The width; zero or less is empty.
+    pub width: i32,
+    /// The height; zero or less is empty.
+    pub height: i32,
+}
+
+/// How far from the origin a rectangle in scaled pixels is taken seriously by
+/// [`DeviceRect::covering`].
+///
+/// A clip path is arbitrary, so its box can be arbitrary too, and `f32 as i32`
+/// saturates: two saturated edges subtracted from one another overflow. Any
+/// window is orders of magnitude inside this, and such a box is intersected
+/// with the viewport straight afterwards.
+const COORDINATE_LIMIT: f32 = (1 << 24) as f32;
+
+impl DeviceRect {
+    /// A rectangle enclosing nothing, which is what a clip that lets nothing
+    /// through gets.
+    pub const EMPTY: Self = DeviceRect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    };
+
+    /// The whole window, which every other rectangle is clamped inside.
+    pub fn viewport(size: Size<DevicePixels>) -> Self {
+        DeviceRect {
+            x: 0,
+            y: 0,
+            width: size.width.0,
+            height: size.height.0,
+        }
+    }
+
+    /// The whole device pixels a device-space rectangle touches.
+    pub fn covering(bounds: &Bounds<ScaledPixels>) -> Self {
+        let clamp = |value: f32| value.clamp(-COORDINATE_LIMIT, COORDINATE_LIMIT);
+        let x = clamp(bounds.origin.x.0).floor() as i32;
+        let y = clamp(bounds.origin.y.0).floor() as i32;
+        let right = clamp(bounds.origin.x.0 + bounds.size.width.0).ceil() as i32;
+        let bottom = clamp(bounds.origin.y.0 + bounds.size.height.0).ceil() as i32;
+        DeviceRect {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+
+    /// Whether the rectangle encloses no pixel at all.
+    pub fn is_empty(&self) -> bool {
+        self.width <= 0 || self.height <= 0
+    }
+
+    /// The pixels both rectangles hold.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+
+    /// The smallest rectangle holding both; an empty rectangle contributes
+    /// nothing rather than dragging the result to the origin.
+    pub fn union(&self, other: &Self) -> Self {
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+
+    /// The size alone, with an empty rectangle reading as zero.
+    pub fn extent(&self) -> Extent {
+        Extent {
+            width: self.width.max(0),
+            height: self.height.max(0),
+        }
+    }
+
+    /// The same rectangle as scene geometry.
+    pub fn bounds(&self) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(self.x as f32), ScaledPixels(self.y as f32)),
+            size: size(
+                ScaledPixels(self.width.max(0) as f32),
+                ScaledPixels(self.height.max(0) as f32),
+            ),
         }
     }
 }
