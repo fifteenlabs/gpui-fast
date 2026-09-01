@@ -3812,10 +3812,6 @@ pub struct MetalHeadlessRenderer {
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 impl MetalHeadlessRenderer {
-    pub fn new() -> Self {
-        Self::with_transparency(false)
-    }
-
     /// A headless renderer whose target is cleared to transparent rather than
     /// opaque black, so a test can read the scene's own alpha back.
     pub fn with_transparency(transparent: bool) -> Self {

@@ -270,13 +270,22 @@ impl Gradient {
         self
     }
 
-    /// The flat fill a renderer that cannot resolve a brush paints instead of
-    /// this gradient, and the one a degenerate or unbakeable gradient collapses
-    /// to: the stop list halfway along, at `alpha`.
+    /// The colour the stop list comes to halfway along: the flat fill a
+    /// renderer that cannot resolve a brush paints instead of this gradient,
+    /// and the one a degenerate or unbakeable gradient collapses to.
+    ///
+    /// Worth caching beside a baked ramp rather than asking again per frame:
+    /// it is the same colour every time, and arriving at it normalizes the
+    /// stop list and converts every stop into the interpolation space - a
+    /// `powf` and a `cbrt` apiece under Oklab - for a value the Metal renderer
+    /// never reads.
+    pub(crate) fn flat_midpoint(&self) -> Hsla {
+        sample(&self.normalized_stops(), 0.5, self.color_space).into()
+    }
+
+    /// [`Gradient::flat_midpoint`] at `alpha`.
     pub(crate) fn flat_fallback(&self, alpha: f32) -> crate::Background {
-        let stops = self.normalized_stops();
-        let color: Hsla = sample(&stops, 0.5, self.color_space).into();
-        crate::solid_background(color).opacity(alpha)
+        crate::solid_background(self.flat_midpoint()).opacity(alpha)
     }
 
     /// The stops as the bake reads them: converted once into the interpolation
@@ -302,7 +311,6 @@ impl Gradient {
 /// under.
 pub(crate) struct GradientPlan {
     pub key: GradientKey,
-    pub size: Size<u32>,
     pub screen_to_brush: TransformationMatrix,
     pub x_extend: BrushExtend,
     pub y_extend: BrushExtend,
@@ -422,10 +430,6 @@ impl Gradient {
         };
         Some(GradientPlan {
             key: self.key(FieldKey::Ramp, RAMP_TEXELS, 1),
-            size: Size {
-                width: RAMP_TEXELS,
-                height: 1,
-            },
             screen_to_brush,
             x_extend: self.extend,
             y_extend: BrushExtend::Pad,
@@ -494,10 +498,6 @@ impl Gradient {
         };
         Some(GradientPlan {
             key: self.key(FieldKey::Radial { half_extent }, texels, texels),
-            size: Size {
-                width: texels,
-                height: texels,
-            },
             screen_to_brush,
             // Everything outside the baked square is past the last ring the path
             // can reach, so padding it is padding a colour the extend mode has
@@ -560,10 +560,6 @@ impl Gradient {
                 texels,
                 texels,
             ),
-            size: Size {
-                width: texels,
-                height: texels,
-            },
             screen_to_brush,
             x_extend: BrushExtend::Pad,
             y_extend: BrushExtend::Pad,
@@ -599,6 +595,16 @@ impl Gradient {
 }
 
 impl GradientPlan {
+    /// The texture's size in texels, which the key already names: it is part of
+    /// what a bake is cached under, so holding it twice is one more thing to
+    /// keep in step.
+    pub(crate) fn size(&self) -> Size<u32> {
+        Size {
+            width: self.key.width,
+            height: self.key.height,
+        }
+    }
+
     /// Evaluate the stop list into the straight (un-premultiplied) BGRA the
     /// sprite atlas holds.
     ///
@@ -608,7 +614,7 @@ impl GradientPlan {
     /// multiplying in the brush opacity and the path's coverage.
     pub(crate) fn bake(&self, gradient: &Gradient) -> Vec<u8> {
         let stops = gradient.normalized_stops();
-        let (width, height) = (self.size.width, self.size.height);
+        let (width, height) = (self.key.width, self.key.height);
         let mut bytes = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
             for x in 0..width {

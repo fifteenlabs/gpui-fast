@@ -467,13 +467,18 @@ struct ClipShape {
     fill_rule: FillRule,
     parent: Option<usize>,
     depth: usize,
-    wants_mask: bool,
 }
 
 impl ClipShape {
+    /// Whether a mask is being rasterized for this clip at all, rather than it
+    /// falling back to its rectangle for being nested too deep.
+    fn wants_mask(&self) -> bool {
+        self.depth < MAX_CLIP_DEPTH
+    }
+
     /// Whether this clip is asking for a tile of the atlas at all.
     fn wants_tile(&self) -> bool {
-        self.wants_mask && !self.device.is_empty() && !self.contours.is_empty()
+        self.wants_mask() && !self.device.is_empty() && !self.contours.is_empty()
     }
 }
 
@@ -582,7 +587,6 @@ impl ClipPlan {
                 fill_rule: scene_clip.path.fill_rule(),
                 parent,
                 depth,
-                wants_mask,
             });
         }
 
