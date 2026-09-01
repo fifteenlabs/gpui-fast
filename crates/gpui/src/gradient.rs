@@ -917,7 +917,7 @@ mod tests {
         let gradient = Gradient::radial(point(px(50.), px(50.)), size(px(50.), px(50.)), stops());
         let plan = gradient.plan(bounds(), 1.).expect("a well-formed radius");
         let baked = plan.bake(&gradient);
-        let texels = plan.size.width;
+        let texels = plan.size().width;
         let at = |x: u32, y: u32| {
             let index = ((y * texels + x) * 4) as usize;
             [baked[index], baked[index + 1], baked[index + 2]]
@@ -1031,12 +1031,12 @@ mod tests {
         };
         assert_eq!(half_extent, 10, "ten rings out to the path's edge");
         assert!(
-            plan.size.width >= 2 * half_extent * TEXELS_PER_PERIOD,
+            plan.size().width >= 2 * half_extent * TEXELS_PER_PERIOD,
             "a bake {} texels across has to resolve {} traversals of the stop \
              list, which is {} texels each",
-            plan.size.width,
+            plan.size().width,
             2 * half_extent,
-            plan.size.width / (2 * half_extent),
+            plan.size().width / (2 * half_extent),
         );
     }
 
@@ -1062,10 +1062,10 @@ mod tests {
         let plan = gradient.plan(small, 1.).expect("a well-formed sweep");
 
         assert!(
-            plan.size.width >= turns * TEXELS_PER_PERIOD,
+            plan.size().width >= turns * TEXELS_PER_PERIOD,
             "a sweep whose stop list runs {turns} times around the circle baked \
              into {} texels",
-            plan.size.width,
+            plan.size().width,
         );
     }
 
@@ -1080,7 +1080,7 @@ mod tests {
         };
         let gradient = Gradient::radial(point(px(20.), px(20.)), size(px(2.), px(2.)), stops());
         let plan = gradient.plan(small, 1.).expect("a well-formed radius");
-        assert_eq!(plan.size.width, MIN_FIELD_TEXELS);
+        assert_eq!(plan.size().width, MIN_FIELD_TEXELS);
     }
 
     #[test]
