@@ -144,6 +144,15 @@ impl CosmicTextSystem {
         }))
     }
 
+    /// Loads every font file under `dir`, memory-mapped rather than read into
+    /// the heap. Platforms whose font directories fontdb does not scan on its
+    /// own (Android) call this with the system font directory.
+    pub fn load_fonts_dir(&self, dir: impl AsRef<std::path::Path>) {
+        let mut state = self.0.write();
+        state.font_system.db_mut().load_fonts_dir(dir);
+        state.font_ids_by_family_cache.clear();
+    }
+
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
         let font_system = FontSystem::new_with_locale_and_db(
             "en-US".to_string(),
