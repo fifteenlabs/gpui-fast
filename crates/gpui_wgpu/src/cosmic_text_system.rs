@@ -153,6 +153,15 @@ impl CosmicTextSystem {
         state.font_ids_by_family_cache.clear();
     }
 
+    /// Loads one font file, memory-mapped. For platforms that pick and
+    /// choose among the system's files rather than taking a whole directory.
+    pub fn load_font_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let mut state = self.0.write();
+        state.font_system.db_mut().load_font_file(path)?;
+        state.font_ids_by_family_cache.clear();
+        Ok(())
+    }
+
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
         let font_system = FontSystem::new_with_locale_and_db(
             "en-US".to_string(),
