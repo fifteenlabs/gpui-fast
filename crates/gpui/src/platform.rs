@@ -2531,6 +2531,33 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// The kind of content the field holds, which picks the software keyboard
+    /// layout (digits, a dial pad, an email keyboard) and whether the text is
+    /// treated as secret.
+    pub content_type: TextInputContentType,
+}
+
+/// The kind of content a text field holds, as a hint for software keyboards.
+///
+/// The variants follow the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>)
+/// plus `Password`, which HTML expresses through `type=password`; they map
+/// onto Android's `InputType` classes and iOS's `UIKeyboardType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputContentType {
+    /// Free text.
+    #[default]
+    Text,
+    /// Whole numbers, such as a verification code.
+    Number,
+    /// A telephone number.
+    Phone,
+    /// An email address.
+    Email,
+    /// A URL.
+    Url,
+    /// A secret: the platform disables suggestions, learning and previews.
+    Password,
 }
 
 /// Automatic capitalization applied by software keyboards.
