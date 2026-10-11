@@ -373,8 +373,10 @@ thread_local! {
 /// The `on_request_frame` callback uses this to defer draw requests that
 /// arrive re-entrantly while a draw is already on the stack (e.g. via nested
 /// message pumping in the Windows window procedure), instead of running a
-/// nested draw or panicking on the already-borrowed App.
-fn draw_in_progress() -> bool {
+/// nested draw or panicking on the already-borrowed App. Code that must only
+/// run while a view renders (a reactive read that records what the frame
+/// depends on) asserts it.
+pub fn draw_in_progress() -> bool {
     CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
 }
 
