@@ -271,7 +271,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, false, None, window, cx);
         (layout_id, state)
     }
 
@@ -345,7 +345,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, false, None, window, cx);
         (layout_id, state)
     }
 
@@ -393,6 +393,8 @@ pub struct StyledText {
     runs: Option<Vec<TextRun>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
+    hug_rows: bool,
+    trailing_reserve: Option<Size<Pixels>>,
     layout: TextLayout,
 }
 
@@ -404,6 +406,8 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
+            hug_rows: false,
+            trailing_reserve: None,
             layout: TextLayout::default(),
         }
     }
@@ -537,6 +541,26 @@ impl StyledText {
         self.runs = Some(runs);
         self
     }
+
+    /// Measure the text as its widest wrapped row rather than as the wrap width, so a
+    /// shrink-to-fit container hugs the text. Each row counts its trailing whitespace,
+    /// exactly as wrapping does, so a layout at the measured width breaks the same way.
+    pub fn hug_rows(mut self) -> Self {
+        self.hug_rows = true;
+        self
+    }
+
+    /// Reserve room for a box that trails the text, such as a message timestamp.
+    ///
+    /// If the last row has room for the box, the measured width grows so the box can
+    /// sit beside it; otherwise the measured height grows by the box's height so the
+    /// box can sit on a row of its own below the text. The lines themselves are laid
+    /// out as if the reserve did not exist, so index/position mapping is unaffected.
+    /// The caller paints the box at the bottom-right of this element's bounds.
+    pub fn with_trailing_reserve(mut self, reserve: Size<Pixels>) -> Self {
+        self.trailing_reserve = Some(reserve);
+        self
+    }
 }
 
 impl Element for StyledText {
@@ -571,7 +595,14 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let layout_id = self.layout.layout(
+            self.text.clone(),
+            runs,
+            self.hug_rows,
+            self.trailing_reserve,
+            window,
+            cx,
+        );
         (layout_id, ())
     }
 
@@ -626,8 +657,34 @@ struct TextLayoutInner {
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
+    hug_rows: bool,
+    trailing_reserve: Option<Size<Pixels>>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+}
+
+/// Grows a measured text size to make room for a box trailing the last line.
+///
+/// The box shares the last line when it fits beside it within `wrap_width`
+/// (or always, for an unconstrained measurement); otherwise it gets a row of
+/// its own below the text, `reserve.height` tall.
+fn fit_trailing_reserve(
+    size: Size<Pixels>,
+    last_line_width: Pixels,
+    reserve: Size<Pixels>,
+    wrap_width: Option<Pixels>,
+) -> Size<Pixels> {
+    let beside_last_line = (last_line_width + reserve.width).ceil();
+    match wrap_width {
+        Some(wrap_width) if beside_last_line > wrap_width => Size {
+            width: size.width.max(reserve.width.ceil()),
+            height: size.height + reserve.height,
+        },
+        _ => Size {
+            width: size.width.max(beside_last_line),
+            height: size.height,
+        },
+    }
 }
 
 impl TextLayout {
@@ -635,6 +692,8 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        hug_rows: bool,
+        trailing_reserve: Option<Size<Pixels>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -685,7 +744,11 @@ impl TextLayout {
 
                 // Only use cached layout if:
                 // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
+                // 2. wrap_width matches (or both are None), or the requested width lies
+                //    between the cached size and the cached wrap width: every row already
+                //    fits, so the lines break identically and the size is unchanged. A
+                //    hugging text is measured at its container's width and then laid out
+                //    at its own, and this keeps the second pass from re-shaping.
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
                 // 4. the cached layout was not truncated (a truncated layout answers an
@@ -693,9 +756,15 @@ impl TextLayout {
                 //    sizing with whatever width some earlier measure pass happened to use)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && (wrap_width.is_none()
+                        || wrap_width == text_layout.wrap_width
+                        || text_layout.wrap_width.zip(wrap_width).is_some_and(
+                            |(cached, requested)| size.width <= requested && requested <= cached,
+                        ))
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
+                    && hug_rows == text_layout.hug_rows
+                    && trailing_reserve == text_layout.trailing_reserve
                 {
                     return size;
                 }
@@ -759,6 +828,8 @@ impl TextLayout {
                         line_height,
                         wrap_width,
                         truncate_width,
+                        hug_rows,
+                        trailing_reserve,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -771,6 +842,20 @@ impl TextLayout {
                     size.height += line_size.height;
                     size.width = size.width.max(line_size.width).ceil();
                 }
+                if hug_rows || trailing_reserve.is_some() {
+                    let (widest_row, last_row) = lines
+                        .iter()
+                        .flat_map(|line| line.row_widths())
+                        .fold((Pixels::ZERO, Pixels::ZERO), |(widest, _), row| {
+                            (widest.max(row), row)
+                        });
+                    if hug_rows {
+                        size.width = widest_row.ceil();
+                    }
+                    if let Some(reserve) = trailing_reserve {
+                        size = fit_trailing_reserve(size, last_row, reserve, wrap_width);
+                    }
+                }
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {
                     lines,
@@ -778,6 +863,8 @@ impl TextLayout {
                     line_height,
                     wrap_width,
                     truncate_width,
+                    hug_rows,
+                    trailing_reserve,
                     size: Some(size),
                     bounds: None,
                 });
@@ -1316,6 +1403,67 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{px, size};
+
+    #[test]
+    fn trailing_reserve_shares_the_last_line_when_it_fits() {
+        let fitted = fit_trailing_reserve(
+            size(px(200.), px(40.)),
+            px(120.),
+            size(px(50.), px(16.)),
+            Some(px(300.)),
+        );
+        assert_eq!(fitted, size(px(200.), px(40.)));
+
+        let fitted = fit_trailing_reserve(
+            size(px(30.), px(20.)),
+            px(30.),
+            size(px(50.), px(16.)),
+            Some(px(300.)),
+        );
+        assert_eq!(fitted, size(px(80.), px(20.)));
+    }
+
+    #[test]
+    fn trailing_reserve_takes_its_own_row_when_it_does_not_fit() {
+        let fitted = fit_trailing_reserve(
+            size(px(300.), px(40.)),
+            px(280.),
+            size(px(50.), px(16.)),
+            Some(px(300.)),
+        );
+        assert_eq!(fitted, size(px(300.), px(56.)));
+
+        let fitted = fit_trailing_reserve(
+            size(px(20.), px(20.)),
+            px(20.),
+            size(px(50.), px(16.)),
+            Some(px(40.)),
+        );
+        assert_eq!(fitted, size(px(50.), px(36.)));
+    }
+
+    #[test]
+    fn trailing_reserve_is_inline_for_an_unconstrained_measurement() {
+        let fitted = fit_trailing_reserve(
+            size(px(300.), px(40.)),
+            px(280.),
+            size(px(50.), px(16.)),
+            None,
+        );
+        assert_eq!(fitted, size(px(330.), px(40.)));
+    }
+
+    #[test]
+    fn trailing_reserve_after_an_empty_last_line_stays_inline() {
+        let fitted = fit_trailing_reserve(
+            size(px(300.), px(60.)),
+            px(0.),
+            size(px(50.), px(16.)),
+            Some(px(300.)),
+        );
+        assert_eq!(fitted, size(px(300.), px(60.)));
+    }
 
     #[test]
     fn test_into_element_for() {

@@ -332,6 +332,27 @@ impl WrappedLineLayout {
         &self.wrap_boundaries
     }
 
+    /// The width of each wrapped row, measured the way wrapping measures a row: from the
+    /// row's first glyph to the next row's first glyph, so a row's trailing whitespace
+    /// counts and a layout at exactly a row's width breaks in the same place.
+    pub fn row_widths(&self) -> impl Iterator<Item = Pixels> + '_ {
+        let layout = &self.unwrapped_layout;
+        let mut row_start_x = Pixels::ZERO;
+        self.wrap_boundaries
+            .iter()
+            .map(move |boundary| {
+                layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                    .position
+                    .x
+            })
+            .chain([layout.width])
+            .map(move |row_end_x| {
+                let width = row_end_x - row_start_x;
+                row_start_x = row_end_x;
+                width
+            })
+    }
+
     /// The font size of this layout
     pub fn font_size(&self) -> Pixels {
         self.unwrapped_layout.font_size
