@@ -1505,6 +1505,7 @@ impl App {
         tracked_entities.extend(entities.iter().copied());
         self.tracked_entities
             .insert(window_handle.id, tracked_entities);
+        crate::fast::dependencies::forget_released(self);
     }
 
     pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {
@@ -2229,6 +2230,7 @@ impl App {
             }
 
             for (entity_id, mut entity) in dropped {
+                crate::fast::dependencies::note_released(self, entity_id);
                 self.observers.remove(&entity_id);
                 self.event_listeners.remove(&entity_id);
                 self.window_invalidators_by_entity.remove(&entity_id);
