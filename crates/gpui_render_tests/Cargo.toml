@@ -1,0 +1,32 @@
+[package]
+name = "gpui_render_tests"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+# `gpui/test-support` changes how gpui behaves at runtime (among other things it
+# redraws every dirty window on each effect flush), so it must never reach a
+# normal build of an application. Keeping every renderer dependency here, in
+# dev-dependencies, confines it to this crate's own test binaries.
+[dev-dependencies]
+anyhow.workspace = true
+image.workspace = true
+log.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# A surface primitive is a `CVPixelBuffer`, so a test that paints one has to be
+# able to make one. These are the same versions gpui itself takes, so the type
+# a test builds is the type `Window::paint_surface` accepts.
+core-foundation.workspace = true
+core-video.workspace = true
+gpui_macos = { workspace = true, features = ["font-kit"] }
+gpui_platform = { workspace = true, features = ["test-support"] }

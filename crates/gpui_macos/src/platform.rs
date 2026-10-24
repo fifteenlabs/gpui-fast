@@ -1561,7 +1561,7 @@ extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
     }
 }
 
-unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
+pub(crate) unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
     let path: *mut c_char = msg_send![url, fileSystemRepresentation];
     anyhow::ensure!(!path.is_null(), "url is not a file path: {}", unsafe {
         CStr::from_ptr(url.absoluteString().UTF8String()).to_string_lossy()

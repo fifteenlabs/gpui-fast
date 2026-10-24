@@ -12,8 +12,9 @@ use std::mem;
 
 use crate::fast::rounded_clip::{ClipOperation, Shape};
 use crate::{
-    AtlasTextureId, AtlasTextureKind, AtlasTile, ContentMask, LayerContent, LayerFrame, LayerKey,
-    PolychromeSprite, Rgba, Scene, TileId, scene::PaintOperation,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, ClipId, ClipPath, ContentMask,
+    LayerContent, LayerFrame, LayerKey, PolychromeSprite, Rgba, ScaledPixels, Scene, TileId,
+    scene::PaintOperation,
 };
 
 const CLIP_TEXTURE_BASE: u32 = 0xF100_0000;
@@ -21,9 +22,10 @@ const GEOMETRY_KEY: LayerKey = LayerKey(u32::MAX);
 
 /// Materialize private paint scopes as existing, renderer-readable layer
 /// objects. Preserve the original operation stream for retained paint ranges.
-pub(crate) fn compile(scene: &mut Scene) {
+/// Returns whether the scene was rebuilt, leaving its last run open.
+pub(crate) fn compile(scene: &mut Scene) -> bool {
     if scene.fast_rounded_clip.scopes.is_empty() || scene.fast_rounded_clip.compiled {
-        return;
+        return false;
     }
     let operations = mem::take(&mut scene.paint_operations);
     let layers: Vec<LayerFrame> = scene
@@ -39,6 +41,8 @@ pub(crate) fn compile(scene: &mut Scene) {
         scene
     };
     let mut stack = vec![new_scene()];
+    // Clip paths open where a rounded clip begins clip its child scene too.
+    let mut clips: Vec<(ClipPath<ScaledPixels>, Bounds<ScaledPixels>)> = Vec::new();
     let mut shapes = Vec::new();
     let mut redundant = Vec::new();
     for operation in &operations {
@@ -48,7 +52,11 @@ pub(crate) fn compile(scene: &mut Scene) {
                 redundant.push(already_active);
                 shapes.push(*shape);
                 if !already_active {
-                    stack.push(new_scene());
+                    let mut child = new_scene();
+                    for (path, visible) in &clips {
+                        child.push_clip(path.clone(), *visible);
+                    }
+                    stack.push(child);
                 }
             }
             PaintOperation::FastRoundedClip(ClipOperation::End) => {
@@ -74,13 +82,11 @@ pub(crate) fn compile(scene: &mut Scene) {
                 });
                 parent.insert_primitive(PolychromeSprite {
                     order: 0,
-                    pad: 0,
+                    clip: ClipId::NONE,
                     grayscale: false.into(),
                     opacity: 1.,
                     bounds: shape.bounds,
-                    content_mask: ContentMask {
-                        bounds: shape.bounds,
-                    },
+                    content_mask: ContentMask::new(shape.bounds),
                     corner_radii: shape.radii.map(|radius| radius.width),
                     tile: AtlasTile {
                         texture_id: AtlasTextureId {
@@ -99,6 +105,18 @@ pub(crate) fn compile(scene: &mut Scene) {
                 .insert_primitive(primitive.clone()),
             PaintOperation::StartLayer(bounds) => stack.last_mut().unwrap().push_layer(*bounds),
             PaintOperation::EndLayer => stack.last_mut().unwrap().pop_layer(),
+            PaintOperation::PushClip(path, visible) => {
+                clips.push((path.clone(), *visible));
+                stack.last_mut().unwrap().push_clip(path.clone(), *visible);
+            }
+            PaintOperation::PopClip => {
+                clips.pop();
+                stack.last_mut().unwrap().pop_clip();
+            }
+            PaintOperation::StartGroup(spec) => {
+                stack.last_mut().unwrap().push_group(spec.clone());
+            }
+            PaintOperation::EndGroup => stack.last_mut().unwrap().pop_group(),
         }
     }
     assert!(
@@ -111,6 +129,7 @@ pub(crate) fn compile(scene: &mut Scene) {
     compiled.fast_rounded_clip.compiled = true;
     compiled.sort_scratch = mem::take(&mut scene.sort_scratch);
     *scene = compiled;
+    true
 }
 
 fn geometry(shape: Shape) -> LayerFrame {

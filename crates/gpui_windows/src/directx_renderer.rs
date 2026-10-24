@@ -56,6 +56,9 @@ pub(crate) struct DirectXRenderer {
     pub(crate) skip_draws: bool,
     pub(crate) fast_frame: crate::fast::frame::FrameState,
     pub(crate) fast_composition: crate::fast::composition::DirectXComposition,
+
+    /// Whether this renderer has already said that it cannot isolate a group.
+    reported_groups: bool,
 }
 
 /// Direct3D objects
@@ -198,6 +201,7 @@ impl DirectXRenderer {
             skip_draws: false,
             fast_frame: crate::fast::frame::FrameState::default(),
             fast_composition: crate::fast::composition::DirectXComposition::default(),
+            reported_groups: false,
         })
     }
 
@@ -347,6 +351,7 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        report_groups_painted_without_isolation(scene, &mut self.reported_groups);
         self.render(scene, background_appearance)?;
         self.present()
     }
@@ -652,11 +657,15 @@ impl DirectXRenderer {
         let mut vertices = Vec::new();
 
         for path in paths {
+            if path.brush.is_some() {
+                report_unresolved_path_brush();
+            }
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                content_mask: path.content_mask,
             }));
         }
 
@@ -1288,7 +1297,13 @@ pub(crate) struct PathRasterizationSprite {
     pub(crate) xy_position: Point<ScaledPixels>,
     pub(crate) st_position: Point<f32>,
     pub(crate) color: Background,
+    /// The path's bounds already clipped to the mask's rectangle, which is what
+    /// the hardware clip uses.
     pub(crate) bounds: Bounds<ScaledPixels>,
+    /// The whole mask, because a rounded one also needs its radii in the
+    /// fragment stage. Paths are rasterized into an offscreen texture and then
+    /// blitted without a mask, so this is the only stage that can apply one.
+    pub(crate) content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Clone, Copy)]

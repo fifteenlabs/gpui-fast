@@ -40,9 +40,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
-    hash, point, px, size,
+    PromisedFiles, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
+    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window,
+    WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -1309,6 +1309,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn tab_bar_visible(&self) -> bool {
         false
     }
+    /// The files promised by the drag that just landed, if the drop
+    /// carried any (macOS file promises). Only meaningful while a
+    /// [`FileDropEvent::Submit`] is being dispatched, and taking them
+    /// leaves none behind for a second caller.
+    fn take_promised_files(&self) -> Option<PromisedFiles> {
+        None
+    }
     fn set_edited(&mut self, _edited: bool) {}
     fn set_document_path(&self, _path: Option<&std::path::Path>) {}
     fn toggle_simple_fullscreen(&self) {}
@@ -2000,6 +2007,17 @@ impl From<TileId> for etagere::AllocId {
     }
 }
 
+/// Laid-out bounds, in the units the platform expects back.
+///
+/// Both places an input handler's geometry leaves for the OS — the IME
+/// candidate rectangle and the selection rectangle — have to undo the zoom,
+/// because the platform positions those windows in its own coordinates and
+/// knows nothing about it.
+fn to_screen(mut bounds: Bounds<Pixels>, zoom: f32) -> Bounds<Pixels> {
+    bounds *= zoom;
+    bounds
+}
+
 #[expect(missing_docs)]
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
@@ -2116,7 +2134,12 @@ impl PlatformInputHandler {
 
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                let zoom = window.zoom();
+                self.handler
+                    .bounds_for_range(range_utf16, window, cx)
+                    .map(|bounds| to_screen(bounds, zoom))
+            })
             .ok()
             .flatten()
     }
@@ -2177,9 +2200,11 @@ impl PlatformInputHandler {
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
         let marked_range = self.handler.marked_text_range(window, cx);
         let selection = self.handler.selected_text_range(true, window, cx)?;
+        let zoom = window.zoom();
         Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
             self.handler.bounds_for_range(range, window, cx)
         })
+        .map(|bounds| to_screen(bounds, zoom))
     }
 
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
@@ -2193,7 +2218,12 @@ impl PlatformInputHandler {
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                // Arrives from the platform in the window's own units; the handler
+                // compares it against laid-out text.
+                let point = point / window.zoom();
+                self.handler.character_index_for_point(point, window, cx)
+            })
             .ok()
             .flatten()
     }
@@ -2518,6 +2548,33 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// The kind of content the field holds, which picks the software keyboard
+    /// layout (digits, a dial pad, an email keyboard) and whether the text is
+    /// treated as secret.
+    pub content_type: TextInputContentType,
+}
+
+/// The kind of content a text field holds, as a hint for software keyboards.
+///
+/// The variants follow the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>)
+/// plus `Password`, which HTML expresses through `type=password`; they map
+/// onto Android's `InputType` classes and iOS's `UIKeyboardType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputContentType {
+    /// Free text.
+    #[default]
+    Text,
+    /// Whole numbers, such as a verification code.
+    Number,
+    /// A telephone number.
+    Phone,
+    /// An email address.
+    Email,
+    /// A URL.
+    Url,
+    /// A secret: the platform disables suggestions, learning and previews.
+    Password,
 }
 
 /// Automatic capitalization applied by software keyboards.
@@ -2638,6 +2695,14 @@ pub struct WindowOptions {
 
     /// Whether to render the window using the Display P3 color space on macOS.
     pub use_display_p3: bool,
+    /// Whether the platform should draw a drop shadow around the window.
+    /// Defaults to `true`. (macOS only.)
+    ///
+    /// The shadow follows the window's frame, so a window whose content
+    /// doesn't fill it — a transparent window laying out floating cards, say —
+    /// gets a shadow around the empty space too. Turn it off and let the
+    /// content draw its own.
+    pub shadow: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2706,6 +2771,11 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub use_display_p3: bool,
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+        allow(dead_code)
+    )]
+    pub shadow: bool,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2768,6 +2838,7 @@ impl Default for WindowOptions {
             window_decorations: None,
             tabbing_identifier: None,
             use_display_p3: false,
+            shadow: true,
         }
     }
 }

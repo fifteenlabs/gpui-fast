@@ -2223,3 +2223,60 @@ mod tests {
         });
     }
 }
+
+/// Redraw requests, counted per view type.
+///
+/// `Context::<T>::notify` is the single funnel every `cx.notify()` passes
+/// through, and it is generic over `T`, so the notifying view's type name is
+/// available there for nothing — attribution needs no registration and no
+/// per-entity bookkeeping. A frame counter alone only says the window
+/// redrew; this says who asked it to, which is what separates "the user
+/// scrolled" from "this view notifies on every store event whether or not
+/// anything it renders changed".
+///
+/// A `Vec` rather than a map because the number of distinct view types is in
+/// the tens — a linear scan beats hashing at that size, and it is
+/// const-constructible, so the counter needs no lazy init on the path it
+/// instruments.
+#[cfg(feature = "notify-attribution")]
+static NOTIFY_COUNTS: spin::Mutex<Vec<(&'static str, u64)>> = spin::Mutex::new(Vec::new());
+
+/// Count one redraw request from `type_name`. Compiles away entirely without
+/// the `notify-attribution` feature, which is why the call site in
+/// `Context::notify` is unconditional.
+#[cfg(feature = "notify-attribution")]
+#[doc(hidden)]
+pub fn record_notify(type_name: &'static str) {
+    let mut counts = NOTIFY_COUNTS.lock();
+    match counts.iter_mut().find(|(name, _)| *name == type_name) {
+        Some((_, count)) => *count += 1,
+        None => counts.push((type_name, 1)),
+    }
+}
+
+#[cfg(not(feature = "notify-attribution"))]
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_notify(_type_name: &'static str) {}
+
+/// Redraw requests per view type, most frequent first. Always empty without
+/// the `notify-attribution` feature.
+pub fn notify_counts() -> Vec<(&'static str, u64)> {
+    #[cfg(feature = "notify-attribution")]
+    {
+        let mut counts = NOTIFY_COUNTS.lock().clone();
+        counts
+            .sort_unstable_by(|(a_name, a), (b_name, b)| b.cmp(a).then_with(|| a_name.cmp(b_name)));
+        counts
+    }
+    #[cfg(not(feature = "notify-attribution"))]
+    Vec::new()
+}
+
+/// Drop every recorded count, so a following measurement covers only what
+/// happens after it — scoping attribution to one scroll or one search
+/// instead of the whole session.
+pub fn reset_notify_counts() {
+    #[cfg(feature = "notify-attribution")]
+    NOTIFY_COUNTS.lock().clear();
+}

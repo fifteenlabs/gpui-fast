@@ -2,10 +2,10 @@
 
 struct SubpixelSprite {
     order: u32,
-    pad: u32,
+    clip: u32,
     tile: AtlasTile,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     transformation: TransformationMatrix,
 }
@@ -15,7 +15,9 @@ struct SubpixelSpriteOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) mask_corner_radii: vec4<f32>,
 }
 
 struct SubpixelSpriteFragmentOutput {
@@ -32,7 +34,9 @@ fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.mask_bounds = content_mask_varying_bounds(sprite.content_mask);
+    out.mask_corner_radii = content_mask_varying_corner_radii(sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     return out;
 }
 
@@ -49,8 +53,11 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
         return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
     }
 
+    let mask = content_mask_from_varyings(input.mask_bounds, input.mask_corner_radii);
+    let mask_alpha = content_mask_alpha(input.position.xy, mask);
+
     var out = SubpixelSpriteFragmentOutput();
     out.foreground = vec4<f32>(input.color.rgb, 1.0);
-    out.alpha = vec4<f32>(input.color.a * alpha_corrected, 1.0);
+    out.alpha = vec4<f32>(input.color.a * alpha_corrected * mask_alpha, 1.0);
     return out;
 }

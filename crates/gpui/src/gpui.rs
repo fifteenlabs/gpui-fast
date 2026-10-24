@@ -14,6 +14,7 @@ mod asset_cache;
 mod assets;
 #[path = "fast/bounds_tree.rs"]
 mod bounds_tree;
+mod clip_path;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
@@ -30,6 +31,7 @@ mod gestures;
 mod global;
 #[cfg(gpui_hot_reload)]
 mod hot_reload;
+mod gradient;
 mod input;
 mod inspector;
 mod interactive;
@@ -44,6 +46,7 @@ pub mod profiler;
     test,
     target_os = "windows",
     target_os = "linux",
+    target_os = "android",
     target_family = "wasm",
     feature = "test-support",
     feature = "bench-support"
@@ -107,6 +110,7 @@ pub use app::*;
 pub(crate) use arena::*;
 pub use asset_cache::*;
 pub use assets::*;
+pub use clip_path::*;
 pub use color::*;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]
@@ -131,6 +135,7 @@ pub use global::*;
 pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
 };
+pub use gradient::*;
 pub use spring::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
@@ -209,7 +214,12 @@ pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;
-#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "android",
+    target_family = "wasm"
+))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;

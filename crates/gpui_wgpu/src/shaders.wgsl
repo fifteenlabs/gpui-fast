@@ -111,6 +111,14 @@ struct Corners {
     bottom_left: f32,
 }
 
+// Mirrors `ContentMask<ScaledPixels>` on the Rust side, which is uploaded to
+// these shaders as raw bytes - the field order and sizes here have to match it
+// exactly.
+struct ContentMask {
+    bounds: Bounds,
+    corner_radii: Corners,
+}
+
 struct Edges {
     top: f32,
     right: f32,
@@ -386,6 +394,64 @@ fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
     }
 }
 
+// Repacks a mask carried through flat varyings, which is cheaper than
+// re-reading the whole instance record in a fragment shader that would not
+// otherwise need it - on the WebGL transport a record load is several texture
+// fetches.
+fn content_mask_from_varyings(bounds: vec4<f32>, corner_radii: vec4<f32>) -> ContentMask {
+    return ContentMask(
+        Bounds(bounds.xy, bounds.zw),
+        Corners(corner_radii.x, corner_radii.y, corner_radii.z, corner_radii.w),
+    );
+}
+
+fn content_mask_varying_bounds(mask: ContentMask) -> vec4<f32> {
+    return vec4<f32>(mask.bounds.origin, mask.bounds.size);
+}
+
+fn content_mask_varying_corner_radii(mask: ContentMask) -> vec4<f32> {
+    return vec4<f32>(
+        mask.corner_radii.top_left,
+        mask.corner_radii.top_right,
+        mask.corner_radii.bottom_right,
+        mask.corner_radii.bottom_left,
+    );
+}
+
+// Coverage of the content mask at this point: 1 inside, 0 outside, antialiased
+// across a rounded edge.
+//
+// A rectangular mask - which is nearly every mask - is already clipped exactly
+// by the interpolated clip distances in the vertex stage, so it takes the fast
+// path out.
+fn content_mask_alpha(point: vec2<f32>, mask: ContentMask) -> f32 {
+    if (mask.corner_radii.top_left == 0.0 &&
+        mask.corner_radii.top_right == 0.0 &&
+        mask.corner_radii.bottom_right == 0.0 &&
+        mask.corner_radii.bottom_left == 0.0) {
+        return 1.0;
+    }
+
+    let half_size = mask.bounds.size / 2.0;
+    let center = mask.bounds.origin + half_size;
+    let center_to_point = point - center;
+
+    // A radius wider than half the mask cannot be drawn as written: the four
+    // corner arcs would overlap, and picking one of them by quadrant would leave
+    // a step where the quadrants meet. `ContentMask::intersect` produces such
+    // radii routinely - a radius kept from a tall parent, landing on a short
+    // intersection - so clamp here rather than trust the caller. These are the
+    // semantics of `Corners::clamp_radii_for_quad_size` on the Rust side.
+    // Clamping the radius the quadrant already selected is the same as clamping
+    // all four and then selecting, since the selection is per-quadrant.
+    let corner_radius = min(
+        pick_corner_radius(center_to_point, mask.corner_radii),
+        min(half_size.x, half_size.y));
+
+    let corner_center_to_point = (abs(center_to_point) - half_size) + corner_radius;
+    return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
+}
+
 // Abstract away the final color transformation based on the
 // target alpha compositing mode.
 fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
@@ -519,8 +585,10 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 struct Quad {
     order: u32,
     border_style: u32,
+    clip: u32,
+    pad: u32, // keep the record an even number of words
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     background: Background,
     border_color: Hsla,
     corner_radii: Corners,
@@ -557,7 +625,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color1 = gradient.color1;
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
     return out;
 }
 
@@ -569,6 +637,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     }
 
     let quad = load_quad(input.quad_id);
+    let mask_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
 
     let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
@@ -584,7 +653,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, mask_alpha);
     }
 
     let size = quad.bounds.size;
@@ -650,7 +719,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, mask_alpha);
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -889,7 +958,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return blend_color(color, saturate(antialias_threshold - outer_sdf) * mask_alpha);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -953,7 +1022,7 @@ struct Shadow {
     // The shadow rect for drop shadows; the "hole" rect for inset shadows.
     bounds: Bounds,
     corner_radii: Corners,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
     // clip so the shadow never escapes the element.
@@ -961,7 +1030,7 @@ struct Shadow {
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    pad: u32, // align to 8 bytes
+    clip: u32, // also aligns the record to 8 bytes
 }
 
 struct ShadowVarying {
@@ -992,7 +1061,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     out.position = to_device_position(unit_vertex, geometry);
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask.bounds);
     return out;
 }
 
@@ -1042,6 +1111,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
+    alpha *= content_mask_alpha(input.position.xy, shadow.content_mask);
+
     return blend_color(input.color, alpha);
 }
 
@@ -1052,6 +1123,7 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    content_mask: ContentMask,
 }
 
 
@@ -1106,6 +1178,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     );
     let color = gradient_color(background, input.position.xy, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
+    alpha *= content_mask_alpha(input.position.xy, v.content_mask);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
 
@@ -1148,9 +1221,9 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
 
 struct Underline {
     order: u32,
-    pad: u32,
+    clip: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     thickness: f32,
     wavy: u32,
@@ -1174,7 +1247,7 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     out.position = to_device_position(unit_vertex, underline.bounds);
     out.color = hsla_to_rgba(underline.color);
     out.underline_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask.bounds);
     return out;
 }
 
@@ -1189,9 +1262,10 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     }
 
     let underline = load_underline(input.underline_id);
+    let mask_alpha = content_mask_alpha(input.position.xy, underline.content_mask);
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(input.color, input.color.a * mask_alpha);
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1207,17 +1281,17 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha * input.color.a * mask_alpha);
 }
 
 // --- monochrome sprites --- //
 
 struct MonochromeSprite {
     order: u32,
-    pad: u32,
+    clip: u32,
     tile: AtlasTile,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     transformation: TransformationMatrix,
 }
@@ -1227,7 +1301,9 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) mask_corner_radii: vec4<f32>,
 }
 
 @vertex
@@ -1240,7 +1316,9 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.mask_bounds = content_mask_varying_bounds(sprite.content_mask);
+    out.mask_corner_radii = content_mask_varying_corner_radii(sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     return out;
 }
 
@@ -1254,19 +1332,21 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    let mask = content_mask_from_varyings(input.mask_bounds, input.mask_corner_radii);
+    let mask_alpha = content_mask_alpha(input.position.xy, mask);
+    return blend_color(input.color, alpha_corrected * mask_alpha);
 }
 
 // --- polychrome sprites --- //
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    clip: u32,
     tile: AtlasTile,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     corner_radii: Corners,
 }
 
@@ -1287,7 +1367,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position(unit_vertex, sprite.bounds);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
     return out;
 }
 
@@ -1307,14 +1387,15 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    let mask_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * mask_alpha);
 }
 
 // --- surfaces --- //
 
 struct SurfaceParams {
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1342,7 +1423,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, surface_locals.bounds);
     out.texture_position = unit_vertex;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask.bounds);
     return out;
 }
 
@@ -1358,5 +1439,13 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return ycbcr_to_RGB * y_cb_cr;
+    let color = ycbcr_to_RGB * y_cb_cr;
+    // The `surfaces` pipeline is built with the same blend state as the quad and
+    // sprite pipelines, so the mask has to go through `blend_color` rather than
+    // scale the alpha channel by hand: under premultiplied alpha the colour is
+    // scaled too, and masking only the alpha would leave the cut edge
+    // un-darkened and fringed. `ycbcr_to_RGB` always returns alpha 1, so this
+    // reduces to alpha = mask_alpha.
+    let mask_alpha = content_mask_alpha(input.position.xy, surface_locals.content_mask);
+    return blend_color(color, mask_alpha);
 }

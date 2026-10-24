@@ -42,6 +42,10 @@ pub(crate) struct TextMeasureInputs {
     text_style: Rc<TextStyle>,
     font_size: Pixels,
     line_height: Pixels,
+    /// Whether the text is as wide as its widest row rather than its box.
+    hug_rows: bool,
+    /// Room kept for an element at the end of the last row.
+    trailing_reserve: Option<Size<Pixels>>,
     /// The layout of the element whose inputs these are, or of a later one
     /// that took the measurement over while leaving the node with these.
     layout: RefCell<TextLayout>,
@@ -138,6 +142,8 @@ impl TextMeasureInputs {
             && style.white_space == other_style.white_space
             && style.line_clamp == other_style.line_clamp
             && style.text_overflow == other_style.text_overflow
+            && self.hug_rows == other.hug_rows
+            && self.trailing_reserve == other.trailing_reserve
             // Only truncation reads the style's own font.
             && (!self.truncates() || same_font(style, other_style)))
         {
@@ -195,10 +201,14 @@ pub(crate) fn layout_text(
     layout: &TextLayout,
     text: SharedString,
     runs: Option<Vec<TextRun>>,
+    hug_rows: bool,
+    trailing_reserve: Option<Size<Pixels>>,
     window: &mut Window,
     cx: &mut App,
 ) -> LayoutId {
-    let inputs = measure_inputs(layout, text, runs.unwrap_or_default(), window);
+    let mut inputs = measure_inputs(layout, text, runs.unwrap_or_default(), window);
+    inputs.hug_rows = hug_rows;
+    inputs.trailing_reserve = trailing_reserve;
     window.request_carried_measured_layout(
         inputs,
         adopt_measurement,
@@ -229,6 +239,8 @@ fn measure_inputs(
         text_style,
         font_size,
         line_height,
+        hug_rows: false,
+        trailing_reserve: None,
         layout: RefCell::new(layout.clone()),
     }
 }
@@ -381,10 +393,13 @@ fn measure_text(
         text_style,
         font_size,
         line_height,
+        hug_rows,
+        trailing_reserve,
         layout,
     } = inputs;
     let layout = &*layout.borrow();
     let (font_size, line_height) = (*font_size, *line_height);
+    let (hug_rows, trailing_reserve) = (*hug_rows, *trailing_reserve);
     let wrap_width = if text_style.white_space == WhiteSpace::Normal {
         known_dimensions.width.or(match available_space.width {
             AvailableSpace::Definite(x) => Some(x),
@@ -421,9 +436,18 @@ fn measure_text(
                     .iter()
                     .all(|line| line.wrap_boundaries.is_empty()))
             || (text_layout.wrap_width.is_none()
-                && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width)))
+                && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width))
+            // Every row already fits a width between the size and the wrap
+            // width it was taken at, so the lines break the same: a hugging
+            // text is measured at its container's width and then laid out at
+            // its own, and this keeps the second pass from shaping again.
+            || text_layout.wrap_width.zip(wrap_width).is_some_and(
+                |(cached, requested)| size.width <= requested && requested <= cached,
+            ))
         && truncate_width.is_none()
         && text_layout.truncate_width.is_none()
+        && hug_rows == text_layout.hug_rows
+        && trailing_reserve == text_layout.trailing_reserve
     {
         return size;
     }
@@ -485,6 +509,8 @@ fn measure_text(
             line_height,
             wrap_width,
             truncate_width,
+            hug_rows,
+            trailing_reserve,
             size: Some(Size::default()),
             bounds: None,
         });
@@ -497,12 +523,28 @@ fn measure_text(
         size.height += line_size.height;
         size.width = size.width.max(line_size.width).ceil();
     }
+    if hug_rows || trailing_reserve.is_some() {
+        let (widest_row, last_row) = lines
+            .iter()
+            .flat_map(|line| line.row_widths())
+            .fold((Pixels::ZERO, Pixels::ZERO), |(widest, _), row| {
+                (widest.max(row), row)
+            });
+        if hug_rows {
+            size.width = widest_row.ceil();
+        }
+        if let Some(reserve) = trailing_reserve {
+            size = crate::elements::fit_trailing_reserve(size, last_row, reserve, wrap_width);
+        }
+    }
     layout.0.borrow_mut().replace(TextLayoutInner {
         lines,
         len,
         line_height,
         wrap_width,
         truncate_width,
+        hug_rows,
+        trailing_reserve,
         size: Some(size),
         bounds: None,
     });
@@ -593,6 +635,8 @@ fn copy_measurement(inner: &TextLayoutInner) -> TextLayoutInner {
         line_height: inner.line_height,
         wrap_width: inner.wrap_width,
         truncate_width: inner.truncate_width,
+        hug_rows: inner.hug_rows,
+        trailing_reserve: inner.trailing_reserve,
         size: inner.size,
         bounds: None,
     }

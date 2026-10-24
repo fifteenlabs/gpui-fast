@@ -1352,7 +1352,7 @@ impl StateInner {
                         item.index,
                         &mut item_origin,
                     );
-                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    window.with_content_mask(Some(ContentMask::new(bounds)), |window| {
                         item.element.prepaint_at(item_origin, window, cx);
                     });
 
@@ -1698,7 +1698,7 @@ impl Element for List {
             }
         });
 
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(ContentMask::new(bounds)), |window| {
             crate::fast::layers::lists::begin_paint_list(window, cx, &self.state);
             for item in &mut prepaint.layout.item_layouts {
                 crate::fast::layers::lists::paint_row(

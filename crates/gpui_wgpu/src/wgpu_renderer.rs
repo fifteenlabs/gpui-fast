@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -81,9 +81,30 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PodContentMask {
+    bounds: PodBounds,
+    corner_radii: [f32; 4],
+}
+
+impl From<ContentMask<ScaledPixels>> for PodContentMask {
+    fn from(mask: ContentMask<ScaledPixels>) -> Self {
+        Self {
+            bounds: mask.bounds.into(),
+            corner_radii: [
+                mask.corner_radii.top_left.0,
+                mask.corner_radii.top_right.0,
+                mask.corner_radii.bottom_right.0,
+                mask.corner_radii.bottom_left.0,
+            ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
-    content_mask: PodBounds,
+    content_mask: PodContentMask,
 }
 
 #[repr(C)]
@@ -108,7 +129,12 @@ pub(crate) struct PathRasterizationVertex {
     pub(crate) xy_position: Point<ScaledPixels>,
     pub(crate) st_position: Point<f32>,
     pub(crate) color: Background,
+    /// The path's bounds already clipped to the mask's rectangle, which is what
+    /// the hardware clip uses.
     pub(crate) bounds: Bounds<ScaledPixels>,
+    /// The whole mask, because a rounded one also needs its radii in the
+    /// fragment stage.
+    pub(crate) content_mask: ContentMask<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -264,6 +290,9 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// Whether this renderer has already said that it composites no isolated
+    /// groups. See [`gpui::report_groups_painted_without_isolation`].
+    reported_groups: bool,
 }
 
 impl WgpuRenderer {
@@ -487,6 +516,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            reported_groups: false,
         })
     }
 }
@@ -1139,6 +1169,8 @@ impl WgpuRenderer {
         let RendererState::Ready { surface, core } = &mut self.state else {
             return false;
         };
+
+        gpui::report_groups_painted_without_isolation(scene, &mut self.reported_groups);
 
         if let Some(error) = self.last_surface_error.take().or_else(|| {
             self.device_errors
@@ -1837,12 +1869,16 @@ impl WgpuRendererCore {
     ) -> Result<bool> {
         let mut vertices = Vec::new();
         for path in paths {
+            if path.brush.is_some() {
+                gpui::report_unresolved_path_brush();
+            }
             let bounds = path.clipped_bounds();
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask: path.content_mask,
             }));
         }
 
@@ -2611,6 +2647,7 @@ impl RenderingParameters {
 mod tests {
     use super::*;
     use gpui::{
+    use std::collections::HashMap;
         BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, MonochromeSprite,
         PolychromeSprite, Quad, Shadow, Size, SubpixelSprite, Underline, linear_color_stop,
         linear_gradient,
@@ -2641,8 +2678,10 @@ mod tests {
         Quad {
             order: 0,
             border_style: BorderStyle::Solid,
+            clip: gpui::ClipId::NONE,
+            pad: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             background: color.into(),
             border_color: color,
             corner_radii: Corners::default(),
@@ -2794,16 +2833,148 @@ mod tests {
             .expect("shader should validate");
     }
 
+    /// The WebGL guard above pins the texture transport; this one pins the
+    /// storage-buffer transport, which lays the same records out by WGSL's
+    /// rules rather than by hand.
+    ///
+    /// Every record is bound as `var<storage, read> array<T>`, and an array's
+    /// stride is its element size rounded up to the element's alignment. The
+    /// records all embed `Bounds { origin: vec2<f32>, size: vec2<f32> }`, whose
+    /// alignment is 8, so they inherit alignment 8 and their strides round up
+    /// to a multiple of 8 bytes. A record with an odd number of 32-bit words
+    /// therefore gets a GPU stride one word longer than its Rust `size_of`, and
+    /// every element past the first is read at the wrong offset — on every
+    /// storage-buffer backend, without the WGSL failing to validate.
+    #[test]
+    fn storage_record_sizes_match_shader_array_strides() {
+        // `SubpixelSprite` is declared in the subpixel shader, which also
+        // includes the storage transport, so between the two variants the map
+        // covers every record. Reading it out of the real sources means a
+        // record that changes shape in WGSL is caught here.
+        let mut strides = storage_array_strides(STORAGE_BUFFER_SHADERS);
+        strides.extend(storage_array_strides(SUBPIXEL_SHADERS));
+
+        assert_array_stride::<Quad>(&strides, "Quad");
+        assert_array_stride::<Shadow>(&strides, "Shadow");
+        assert_array_stride::<PathRasterizationVertex>(&strides, "PathRasterizationVertex");
+        assert_array_stride::<PathSprite>(&strides, "PathSprite");
+        assert_array_stride::<Underline>(&strides, "Underline");
+        assert_array_stride::<MonochromeSprite>(&strides, "MonochromeSprite");
+        assert_array_stride::<SubpixelSprite>(&strides, "SubpixelSprite");
+        assert_array_stride::<PolychromeSprite>(&strides, "PolychromeSprite");
+    }
+
+    fn assert_array_stride<T>(strides: &HashMap<String, u32>, wgsl_name: &str) {
+        let stride = *strides.get(wgsl_name).unwrap_or_else(|| {
+            panic!("{wgsl_name} should be bound as a storage array in the shaders")
+        }) as usize;
+        let size = std::mem::size_of::<T>();
+        assert_eq!(
+            size,
+            stride,
+            "`{wgsl_name}` is {size} bytes in Rust but the GPU reads it with a \
+             stride of {stride} bytes, so every element after the first lands at \
+             the wrong offset.\n\
+             The usual cause is a field that leaves the record an ODD number of \
+             32-bit words ({} words here): the record embeds a `Bounds`, whose \
+             `vec2<f32>` members give it alignment 8, and an array stride is \
+             rounded up to the element's alignment — so an odd word count buys a \
+             word of padding on the GPU that Rust's `#[repr(C)]` layout does not \
+             have.\n\
+             Add or remove a 4-byte field on both sides so the word count is even.",
+            size.div_ceil(4),
+        );
+    }
+
+    /// Array strides, keyed by element type name, for every `var<storage>`
+    /// binding in `source`, computed with naga's own layout rules.
+    fn storage_array_strides(source: &str) -> HashMap<String, u32> {
+        let module = naga::front::wgsl::parse_str(source).expect("shader should parse");
+        let mut layouter = naga::proc::Layouter::default();
+        layouter
+            .update(module.to_ctx())
+            .expect("shader types should have a layout");
+
+        module
+            .global_variables
+            .iter()
+            .filter(|(_, variable)| matches!(variable.space, naga::AddressSpace::Storage { .. }))
+            .filter_map(|(_, variable)| {
+                let naga::TypeInner::Array { base, .. } = module.types[variable.ty].inner else {
+                    return None;
+                };
+                let name = module.types[base].name.clone()?;
+                Some((name, layouter[base].to_stride()))
+            })
+            .collect()
+    }
+
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 28 * 4);
+
+        // The literals above only pin the Rust side. These read the strides the
+        // WebGL loaders actually use, so a record that grows without the
+        // texture reader following it fails here rather than on a user's screen.
+        assert_eq!(
+            std::mem::size_of::<Quad>(),
+            webgl_word_stride("load_quad") * 4
+        );
+        assert_eq!(
+            std::mem::size_of::<Shadow>(),
+            webgl_word_stride("load_shadow") * 4
+        );
+        assert_eq!(
+            std::mem::size_of::<PathRasterizationVertex>(),
+            webgl_word_stride("load_path_vertex") * 4
+        );
+        assert_eq!(
+            std::mem::size_of::<PathSprite>(),
+            webgl_word_stride("load_path_sprite") * 4
+        );
+        assert_eq!(
+            std::mem::size_of::<Underline>(),
+            webgl_word_stride("load_underline") * 4
+        );
+        assert_eq!(
+            std::mem::size_of::<MonochromeSprite>(),
+            webgl_word_stride("load_mono_sprite") * 4
+        );
+        assert_eq!(
+            std::mem::size_of::<PolychromeSprite>(),
+            webgl_word_stride("load_poly_sprite") * 4
+        );
+    }
+
+    /// The multiplier in the `instance_cursor(id * Nu)` call that opens the
+    /// named WebGL loader, which is that record's stride in 32-bit words.
+    fn webgl_word_stride(loader: &str) -> usize {
+        let body = WEBGL_SHADERS
+            .split_once(&format!("fn {loader}("))
+            .unwrap_or_else(|| panic!("{loader} should be defined in the WebGL shaders"))
+            .1;
+        let argument = body
+            .split_once("instance_cursor(")
+            .expect("loader should open a cursor")
+            .1
+            .split_once(')')
+            .expect("cursor call should be closed")
+            .0;
+        argument
+            .rsplit_once('*')
+            .expect("cursor argument should be an index times a stride")
+            .1
+            .trim()
+            .trim_end_matches('u')
+            .parse()
+            .expect("stride should be a literal word count")
     }
 
     #[test]

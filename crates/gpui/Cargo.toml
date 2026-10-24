@@ -56,6 +56,10 @@ hot-reload = [
     "dep:smol",
     "dep:subsecond",
 ]
+# Counts redraw requests per view type in `Context::notify`, readable via
+# `profiler::notify_counts`. Off by default: it costs a lock and a short
+# scan on a path that runs whenever any view changes.
+notify-attribution = []
 
 [lib]
 path = "src/gpui.rs"
