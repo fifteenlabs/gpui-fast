@@ -594,6 +594,19 @@ impl Default for GroupSpec {
 }
 
 impl GroupSpec {
+    /// This group moved by `delta`, with what it covers.
+    pub(crate) fn translated(&self, delta: Point<ScaledPixels>) -> Self {
+        let mv = |bounds: Bounds<ScaledPixels>| Bounds {
+            origin: bounds.origin + delta,
+            size: bounds.size,
+        };
+        Self {
+            bounds: mv(self.bounds),
+            mask: self.mask.map(mv),
+            ..self.clone()
+        }
+    }
+
     /// Whether compositing this group is indistinguishable from drawing its
     /// primitives straight onto the target, *given* that nothing inside it
     /// overlaps anything else inside it.
@@ -822,7 +835,10 @@ impl Scene {
     /// of the group and receives none of its opacity, blending or filtering.
     /// It cannot happen through [`crate::Window::with_isolated_group`], which
     /// runs in the paint phase while `defer_draw` is prepaint-only.
-    pub fn push_group(&mut self, spec: GroupSpec) -> GroupId {
+    pub fn push_group(&mut self, mut spec: GroupSpec) -> GroupId {
+        // Stamped here for the reason `insert_primitive` stamps primitives: a
+        // replayed group carries the previous frame's clip id.
+        spec.clip = self.current_clip();
         let reopen = self.open_run.clone();
         let steps_len = self.steps.len();
         let segments_len = self.segments.len();
@@ -1264,22 +1280,26 @@ impl Scene {
         let operations = &prev_scene.paint_operations[range];
         Self::debug_assert_groups_are_balanced(operations);
         for operation in operations {
-            match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::FastRoundedClip(fast_clip) => {
-                    crate::fast::rounded_clip::record(self, *fast_clip)
-                }
-                PaintOperation::PushClip(path, visible) => {
-                    self.push_clip(path.clone(), *visible);
-                }
-                PaintOperation::PopClip => self.pop_clip(),
-                PaintOperation::StartGroup(spec) => {
-                    self.push_group(spec.clone());
-                }
-                PaintOperation::EndGroup => self.pop_group(),
+            self.apply(operation);
+        }
+    }
+
+    pub(crate) fn apply(&mut self, operation: &PaintOperation) {
+        match operation {
+            PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+            PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+            PaintOperation::EndLayer => self.pop_layer(),
+            PaintOperation::FastRoundedClip(fast_clip) => {
+                crate::fast::rounded_clip::record(self, *fast_clip)
             }
+            PaintOperation::PushClip(path, visible) => {
+                self.push_clip(path.clone(), *visible);
+            }
+            PaintOperation::PopClip => self.pop_clip(),
+            PaintOperation::StartGroup(spec) => {
+                self.push_group(spec.clone());
+            }
+            PaintOperation::EndGroup => self.pop_group(),
         }
     }
 
@@ -1401,6 +1421,7 @@ pub(crate) enum PrimitiveKind {
     Surface,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
@@ -1910,6 +1931,16 @@ impl TransformationMatrix {
                     + self.rotation_scale[1][1] * other.translation[1],
             ],
         }
+    }
+
+    /// This transformation applied to a point `delta` back from where it is
+    /// asked about: for something that maps positions on a scene, moving
+    /// what it maps by `delta` without changing what it maps it to.
+    pub fn pretranslated(mut self, delta: Point<ScaledPixels>) -> Self {
+        for (row, translation) in self.rotation_scale.iter().zip(&mut self.translation) {
+            *translation -= row[0] * delta.x.0 + row[1] * delta.y.0;
+        }
+        self
     }
 
     /// Apply transformation to a point, mainly useful for debugging

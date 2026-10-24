@@ -106,6 +106,7 @@ impl LayerInput {
                     size: hitbox.content_mask.bounds.size,
                 }
                 .intersect(&viewport),
+                corner_radii: Default::default(),
             },
             behavior: hitbox.behavior,
         })
@@ -325,6 +326,7 @@ pub(crate) fn hitbox_mask(window: &mut Window) -> ContentMask<Pixels> {
     painting.input.hitbox_masks.push(noted);
     ContentMask {
         bounds: mask.bounds.intersect(&painting.viewport),
+        corner_radii: Default::default(),
     }
 }
 
@@ -367,6 +369,7 @@ fn unclip(
     );
     ContentMask {
         bounds: Bounds::from_corners(top_left, bottom_right),
+        corner_radii: Default::default(),
     }
 }
 

@@ -3844,6 +3844,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_render_tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui_macos",
+ "gpui_platform",
+ "image",
+ "log",
+ "objc2-core-foundation",
+ "objc2-core-video",
+]
+
+[[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
 dependencies = [

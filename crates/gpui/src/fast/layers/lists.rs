@@ -56,7 +56,7 @@ use crate::{
             policy::{self, Decision},
             record::LayerRecord,
             reuse,
-            scene::{LayerContent, LayerPart, move_primitive},
+            scene::{LayerContent, LayerPart, move_operation, translate_operation},
             tiles::{combine_tile_hashes, dirty_tiles, part_tile_hashes},
         },
     },
@@ -1625,21 +1625,7 @@ fn drawn_alike(a: &Row, b: &Row) -> bool {
             .scene
             .paint_operations
             .iter()
-            .map(|operation| match operation {
-                PaintOperation::Primitive(primitive) => {
-                    let mut primitive = primitive.clone();
-                    move_primitive(&mut primitive, to_row);
-                    PaintOperation::Primitive(primitive)
-                }
-                PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(Bounds {
-                    origin: bounds.origin + to_row,
-                    size: bounds.size,
-                }),
-                PaintOperation::EndLayer => PaintOperation::EndLayer,
-                PaintOperation::FastRoundedClip(clip) => {
-                    PaintOperation::FastRoundedClip(clip.translated(to_row))
-                }
-            })
+            .map(|operation| translate_operation(operation, to_row))
             .collect();
         let (tiles, _) = part_tile_hashes(&operations, paint::TILE_SIZE);
         tiles.first().map_or(0, |(_, hash)| *hash)
@@ -2348,9 +2334,15 @@ pub(crate) fn end_list(
         };
         let origin = point(anchor_origin.x, top);
         let began = begin_row(window, list, row);
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            element.prepaint_at(origin, window, cx);
-        });
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds,
+                corner_radii: Default::default(),
+            }),
+            |window| {
+                element.prepaint_at(origin, window, cx);
+            },
+        );
         if began {
             end_row(window, list);
         }
@@ -2524,9 +2516,10 @@ pub(crate) fn begin_paint_rows(window: &mut Window, cx: &mut App, id: Option<&Gl
         spans: Vec::new(),
     };
     if state.swapped {
-        window
-            .content_mask_stack
-            .push(ContentMask { bounds: region });
+        window.content_mask_stack.push(ContentMask {
+            bounds: region,
+            corner_radii: Default::default(),
+        });
         mem::swap(&mut window.next_frame.scene, &mut state.scene);
         state.recording = Some(cx.begin_recording_dependencies());
         state.reads_start = reads_len();
@@ -2839,12 +2832,7 @@ pub(crate) fn end_paint_rows(window: &mut Window, cx: &mut App, id: Option<&Glob
             .map(|operation| mem::replace(operation, PaintOperation::EndLayer))
             .collect();
         for operation in &mut row_operations {
-            match operation {
-                PaintOperation::Primitive(primitive) => move_primitive(primitive, to_content),
-                PaintOperation::StartLayer(bounds) => bounds.origin = bounds.origin + to_content,
-                PaintOperation::EndLayer => {}
-                PaintOperation::FastRoundedClip(clip) => *clip = clip.translated(to_content),
-            }
+            move_operation(operation, to_content);
         }
         let (row_operations, overlay, whole) =
             match crate::fast::layers::overlay::split(&row_operations) {

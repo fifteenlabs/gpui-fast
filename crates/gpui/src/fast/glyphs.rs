@@ -226,7 +226,7 @@ impl Window {
             if subpixel_rendering {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
                     order: 0,
-                    pad: 0,
+                    clip: crate::ClipId::NONE,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -236,7 +236,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    clip: crate::ClipId::NONE,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),

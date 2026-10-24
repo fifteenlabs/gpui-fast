@@ -904,15 +904,15 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        if let Some(command_buffer) = crate::fast::paths::draw_primitives_to_texture(
-            self,
-            scene,
-            instance_bindings,
-            writer,
-            texture,
-            viewport_size,
-        )? {
-            return Ok(command_buffer);
+        if crate::fast::rounded_clip::has_groups(scene) {
+            return crate::fast::rounded_clip::draw(
+                self,
+                scene,
+                instance_bindings,
+                writer,
+                texture,
+                viewport_size,
+            );
         }
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
@@ -1865,7 +1865,7 @@ impl MetalRenderer {
             if bound_texture != Some(run.texture) {
                 let texture = run
                     .texture
-                    .map(|texture_id| self.sprite_atlas.metal_texture(texture_id));
+                    .and_then(|texture_id| self.sprite_atlas.metal_texture(texture_id));
                 command_encoder.set_fragment_texture(
                     PathRasterizationInputIndex::BrushAtlas as u64,
                     Some(texture.as_deref().unwrap_or(&self.default_brush_texture)),
@@ -2199,7 +2199,7 @@ impl MetalRenderer {
             texture_id,
             &sprites,
             instance_bindings,
-            viewport_size,
+            render_target,
             command_encoder,
         ) {
             return;
@@ -2736,7 +2736,7 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
 /// the unclipped pipeline because its clipped twin was never built, which is a
 /// picture with the clip path silently missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrimitivePipeline {
+pub(crate) enum PrimitivePipeline {
     PathsRasterization = 0,
     Shadows,
     Quads,
@@ -3376,7 +3376,7 @@ pub struct RenderTarget {
 impl RenderTarget {
     /// The whole window, which is what every pass drew into before groups
     /// existed and what every pass outside a group still draws into.
-    fn whole(size: Size<DevicePixels>) -> Self {
+    pub(crate) fn whole(size: Size<DevicePixels>) -> Self {
         RenderTarget {
             size,
             origin: point(DevicePixels(0), DevicePixels(0)),
@@ -3925,14 +3925,16 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(PaintSurface {
             order: 0,
+            clip: ClipId::NONE,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);
         scene.finish();
 
-        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())), false);
         let image = renderer
             .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
             .unwrap();

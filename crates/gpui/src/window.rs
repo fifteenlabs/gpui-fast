@@ -6,25 +6,24 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
-    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
-    prelude::*, px, rems, size, transparent_black, PromisedFiles, BlendMode, BrushExtend, ClipId,
-    ClipPath, Gradient, GradientKey, GroupSpec, MAX_GRADIENT_CACHE_BYTES, PathBrush, GradientPlan,
-    SceneFilter, ImageId,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BlendMode, BorderStyle, Bounds,
+    BoxShadow, BrushExtend, Capslock, ClipId, ClipPath, Context, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Gradient, GradientKey, GradientPlan, GroupSpec, Hsla,
+    ImageId, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, MAX_GRADIENT_CACHE_BYTES, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, PathBrush, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromisedFiles, PromptButton, PromptLevel,
+    Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay,
+    ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, ScaledPixels, Scene, SceneFilter, Shadow, SharedString,
+    Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
+    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -3531,6 +3530,7 @@ impl Window {
                         point(start, bounds.top()),
                         point(end, bounds.bottom()),
                     ),
+                    corner_radii: Default::default(),
                 },
                 ..underline
             });
@@ -8844,15 +8844,15 @@ mod tests {
 
     use crate::GroupSpec;
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, ContentMask, Context, DispatchPhase,
-        DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
-        FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent,
-        Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
-        canvas, div, hsla, point, px, size,
-        BrushExtend, ClipId, ClipPath, Corners, Path, RenderImage, TransformationMatrix, fill, red,
+        AnyWindowHandle, AppContext as _, Bounds, BrushExtend, ClipId, ClipPath, ContentMask,
+        Context, Corners, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths,
+        FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _, InteractiveElement as _,
+        IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton, MouseDownEvent,
+        MouseMoveEvent, ParentElement, Path, Pixels, PlatformInput, Point, Render, RenderImage,
+        RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled, TestAppContext,
+        TouchDragEvent, TouchEvent, TouchId, TouchPhase, TransformationMatrix, Underline,
+        UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, fill, hsla, point,
+        px, red, size,
     };
 
     #[gpui::test]
@@ -10467,6 +10467,7 @@ mod tests {
             let original_opacity = window.element_opacity();
             let mask = ContentMask {
                 bounds: Bounds::from_corners(point(px(4.), px(10.)), point(px(16.), px(12.))),
+                corner_radii: Default::default(),
             };
             let style = UnderlineStyle {
                 thickness: px(2.),
@@ -10615,6 +10616,7 @@ mod tests {
                             point(px(-1000.), px(-1000.)),
                             point(px(1000.), px(1000.)),
                         ),
+                        corner_radii: Default::default(),
                     });
                     paint(window);
                     window.content_mask_stack.pop();
@@ -10647,7 +10649,7 @@ mod tests {
         assert_eq!(actual.thickness, expected.thickness);
         assert_eq!(actual.wavy, expected.wavy);
         assert_eq!(actual.color, expected.color);
-        assert_eq!(actual.pad, expected.pad);
+        assert_eq!(actual.clip, expected.clip);
     }
 
     fn underline_device_columns(underlines: &[Underline]) -> Vec<i32> {

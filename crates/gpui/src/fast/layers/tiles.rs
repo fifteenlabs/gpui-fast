@@ -14,13 +14,16 @@
 use crate::{
     AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Point, ScaledPixels, Scene,
     TileCoord, TransformationMatrix,
-    fast::layers::scene::{drawn_bounds, translate_primitive, visible_bounds},
+    fast::layers::scene::{drawn_bounds, translate_operation, translate_primitive, visible_bounds},
     point,
     scene::{PaintOperation, Primitive},
     size,
 };
 use collections::{FxHashMap, FxHasher};
-use std::hash::Hasher;
+use std::{
+    fmt::{self, Write as _},
+    hash::Hasher,
+};
 
 /// The hash of every tile of `region` (content space, device pixels), empty
 /// tiles included: the primitives of `content` visible over each, in drawing
@@ -75,6 +78,15 @@ pub(crate) fn tile_hashes(
                     clip.translated(delta).hash(hasher);
                 }
             }
+            scope => {
+                for (coord, hasher) in &mut hashers {
+                    let delta = point(
+                        ScaledPixels(-(coord.x as f32) * tile_size as f32),
+                        ScaledPixels(-(coord.y as f32) * tile_size as f32),
+                    );
+                    hash_scope(&translate_operation(scope, delta), hasher);
+                }
+            }
         }
     }
     hashers
@@ -115,6 +127,7 @@ pub(crate) fn part_tile_hashes(
             PaintOperation::StartLayer(_) => hasher.write_u8(1),
             PaintOperation::EndLayer => hasher.write_u8(2),
             PaintOperation::FastRoundedClip(clip) => clip.hash(&mut hasher),
+            scope => hash_scope(scope, &mut hasher),
         }
     }
     let hash = hasher.finish();
@@ -254,8 +267,8 @@ fn hash_primitive(primitive: &Primitive, tile: &Bounds<ScaledPixels>, hasher: &m
                 hash_f32(vertex.xy_position.y.0, hasher);
                 hash_f32(vertex.st_position.x, hasher);
                 hash_f32(vertex.st_position.y, hasher);
-                hash_mask(&vertex.content_mask, tile, hasher);
             }
+            hash_path_brush(path.brush.as_ref(), hasher);
         }
         Primitive::Underline(underline) => {
             hasher.write_u8(3);
@@ -300,6 +313,31 @@ fn hash_primitive(primitive: &Primitive, tile: &Bounds<ScaledPixels>, hasher: &m
     }
 }
 
+/// Hashes a clip path or isolated group marker, which reaches every tile
+/// after it until it is popped. Through its `Debug` form, which prints every
+/// float exactly: these are rare, and a filter has too many parts to hash
+/// by hand.
+fn hash_scope(operation: &PaintOperation, hasher: &mut FxHasher) {
+    struct Sink<'a>(&'a mut FxHasher);
+    impl fmt::Write for Sink<'_> {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0.write(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut sink = Sink(hasher);
+    let _ = match operation {
+        PaintOperation::PushClip(path, visible) => write!(sink, "c{path:?}{visible:?}"),
+        PaintOperation::PopClip => write!(sink, "C"),
+        PaintOperation::StartGroup(spec) => write!(sink, "g{spec:?}"),
+        PaintOperation::EndGroup => write!(sink, "G"),
+        PaintOperation::Primitive(_)
+        | PaintOperation::StartLayer(_)
+        | PaintOperation::EndLayer
+        | PaintOperation::FastRoundedClip(_) => Ok(()),
+    };
+}
+
 fn hash_f32(value: f32, hasher: &mut FxHasher) {
     hasher.write_u32(value.to_bits());
 }
@@ -313,6 +351,36 @@ fn hash_bounds(bounds: &Bounds<ScaledPixels>, hasher: &mut FxHasher) {
 
 fn hash_mask(mask: &ContentMask<ScaledPixels>, tile: &Bounds<ScaledPixels>, hasher: &mut FxHasher) {
     hash_clipped(&mask.bounds, tile, hasher);
+    for radius in [
+        mask.corner_radii.top_left,
+        mask.corner_radii.top_right,
+        mask.corner_radii.bottom_right,
+        mask.corner_radii.bottom_left,
+    ] {
+        hash_f32(radius.0, hasher);
+    }
+}
+
+fn hash_path_brush(brush: Option<&crate::PathBrush>, hasher: &mut FxHasher) {
+    let Some(brush) = brush else {
+        hasher.write_u8(0);
+        return;
+    };
+    hasher.write_u8(1);
+    hasher.write_u32(brush.tile.texture_id.index);
+    hasher.write_u32(brush.tile.tile_id.0);
+    for value in brush
+        .screen_to_brush
+        .rotation_scale
+        .iter()
+        .flatten()
+        .chain(&brush.screen_to_brush.translation)
+    {
+        hash_f32(*value, hasher);
+    }
+    hasher.write_u8(brush.x_extend as u8);
+    hasher.write_u8(brush.y_extend as u8);
+    hash_f32(brush.opacity, hasher);
 }
 
 /// Hashes the part of `bounds` inside `tile`, all empty parts alike.

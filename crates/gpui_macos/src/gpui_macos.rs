@@ -51,7 +51,7 @@ pub use platform::MacPlatform;
 /// Core Text-backed text system. Exported so tests that need real glyph
 /// measurement can build one without standing up a whole `MacPlatform`.
 #[cfg(feature = "font-kit")]
-pub use text_system::MacTextSystem;
+pub use gpui_apple::AppleTextSystem;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

@@ -1224,6 +1224,8 @@ mod tests {
                 text_style,
                 font_size,
                 line_height,
+                hug_rows: false,
+                trailing_reserve: None,
                 layout: RefCell::new(TextLayout::default()),
             };
             let probe = |width| Size {

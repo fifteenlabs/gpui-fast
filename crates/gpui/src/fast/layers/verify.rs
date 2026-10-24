@@ -54,12 +54,7 @@ fn clip_to(primitive: &mut Primitive, mask: &Bounds<ScaledPixels>) {
     let content_mask = match primitive {
         Primitive::Shadow(p) => &mut p.content_mask,
         Primitive::Quad(p) => &mut p.content_mask,
-        Primitive::Path(p) => {
-            for vertex in &mut p.vertices {
-                vertex.content_mask.bounds = vertex.content_mask.bounds.intersect(mask);
-            }
-            &mut p.content_mask
-        }
+        Primitive::Path(p) => &mut p.content_mask,
         Primitive::Underline(p) => &mut p.content_mask,
         Primitive::MonochromeSprite(p) => &mut p.content_mask,
         Primitive::SubpixelSprite(p) => &mut p.content_mask,
@@ -88,14 +83,10 @@ fn expand_layer(
                 clip_to(&mut moved, viewport);
                 scratch.insert_primitive(moved);
             }
-            PaintOperation::StartLayer(bounds) => scratch.push_layer(Bounds {
-                origin: bounds.origin + translation,
-                size: bounds.size,
-            }),
-            PaintOperation::EndLayer => scratch.pop_layer(),
-            PaintOperation::FastRoundedClip(clip) => {
-                crate::fast::rounded_clip::record(&mut scratch, clip.translated(translation))
-            }
+            scope => scratch.apply(&crate::fast::layers::scene::translate_operation(
+                scope,
+                translation,
+            )),
         }
     }
     scratch.finish();

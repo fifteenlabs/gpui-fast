@@ -29,9 +29,9 @@ pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod gestures;
 mod global;
+mod gradient;
 #[cfg(gpui_hot_reload)]
 mod hot_reload;
-mod gradient;
 mod input;
 mod inspector;
 mod interactive;

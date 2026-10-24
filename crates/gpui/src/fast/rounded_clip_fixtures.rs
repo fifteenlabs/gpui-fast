@@ -228,11 +228,14 @@ pub(super) fn tiled_scene(
     let mut scene = gpui::Scene::default();
     scene.insert_primitive(gpui::PolychromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         grayscale: false.into(),
         opacity: 1.,
         bounds,
-        content_mask: gpui::ContentMask { bounds: mask },
+        content_mask: gpui::ContentMask {
+            bounds: mask,
+            corner_radii: Default::default(),
+        },
         corner_radii: Default::default(),
         tile: gpui::AtlasTile {
             texture_id: gpui::layer_tile_texture_id(frame.key),

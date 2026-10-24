@@ -133,7 +133,10 @@ mod tests {
     fn quad(bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>) -> Quad {
         Quad {
             bounds,
-            content_mask: ContentMask { bounds: mask },
+            content_mask: ContentMask {
+                bounds: mask,
+                corner_radii: Default::default(),
+            },
             ..Default::default()
         }
     }
@@ -161,12 +164,15 @@ mod tests {
             blur_radius: ScaledPixels(24.),
             bounds: scaled(500., 500., 100., 100.),
             corner_radii: Default::default(),
-            content_mask: ContentMask { bounds: everything },
+            content_mask: ContentMask {
+                bounds: everything,
+                corner_radii: Default::default(),
+            },
             color: Default::default(),
             element_bounds: scaled(500., 500., 100., 100.),
             element_corner_radii: Default::default(),
             inset: 0,
-            pad: 0,
+            clip: gpui::ClipId::NONE,
         });
         scene.insert_primitive(quad(scaled(10., 10., 100., 50.), everything));
         scene.insert_primitive(quad(scaled(20.5, 20.5, 10., 10.), everything));
@@ -212,11 +218,14 @@ mod tests {
         });
         scene.insert_primitive(gpui::PolychromeSprite {
             order: 0,
-            pad: 0,
+            clip: gpui::ClipId::NONE,
             grayscale: false.into(),
             opacity: 1.,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask {
+                bounds,
+                corner_radii: Default::default(),
+            },
             corner_radii: Default::default(),
             tile: gpui::AtlasTile {
                 texture_id: gpui::AtlasTextureId {

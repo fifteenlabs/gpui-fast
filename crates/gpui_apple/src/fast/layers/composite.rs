@@ -10,7 +10,9 @@ use std::{mem, ops::Range};
 
 use gpui::{AtlasTextureId, DevicePixels, Size, TileId, decode_layer_tile, size};
 
-use crate::metal_renderer::{InstanceBindings, MetalRenderer, SpriteInputIndex};
+use crate::metal_renderer::{
+    InstanceBindings, MetalRenderer, PrimitivePipeline, RenderTarget, SpriteInputIndex,
+};
 
 /// Forwarded to by `MetalRenderer::draw_polychrome_sprites`. Draws the batch
 /// `sprites` if its texture is a layer's tiles, and returns whether it was:
@@ -22,7 +24,7 @@ pub(crate) fn draw_tiles(
     texture_id: AtlasTextureId,
     sprites: &Range<usize>,
     instance_bindings: &InstanceBindings,
-    viewport_size: Size<DevicePixels>,
+    render_target: &RenderTarget,
     command_encoder: &metal::RenderCommandEncoderRef,
 ) -> bool {
     let Some((layer, _)) = decode_layer_tile(texture_id, TileId(0)) else {
@@ -37,7 +39,11 @@ pub(crate) fn draw_tiles(
         };
         if !pipeline_set {
             pipeline_set = true;
-            command_encoder.set_render_pipeline_state(&renderer.polychrome_sprites_pipeline_state);
+            // Tile sprites are never clipped by a clip path: the core keeps
+            // content that pushes one out of layers.
+            command_encoder.set_render_pipeline_state(
+                &renderer.primitive_pipelines[PrimitivePipeline::PolychromeSprites as usize],
+            );
             command_encoder.set_vertex_buffer(
                 SpriteInputIndex::Vertices as u64,
                 Some(&renderer.unit_vertices),
@@ -49,9 +55,9 @@ pub(crate) fn draw_tiles(
                 polychrome_sprites.offset as u64,
             );
             command_encoder.set_vertex_bytes(
-                SpriteInputIndex::ViewportSize as u64,
-                mem::size_of_val(&viewport_size) as u64,
-                &viewport_size as *const Size<DevicePixels> as *const _,
+                SpriteInputIndex::RenderTarget as u64,
+                mem::size_of_val(render_target) as u64,
+                render_target as *const RenderTarget as *const _,
             );
             command_encoder.set_fragment_buffer(
                 SpriteInputIndex::Sprites as u64,

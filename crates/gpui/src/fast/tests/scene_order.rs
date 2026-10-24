@@ -90,6 +90,7 @@ fn paint(scene: &mut Scene, rng: &mut StdRng) -> Vec<Painted> {
     ];
     let window_mask = ContentMask {
         bounds: bounds(0., 0., WINDOW, WINDOW),
+        corner_radii: Default::default(),
     };
     let mut reference = Reference::default();
     let mut content_mask = window_mask;
@@ -190,7 +191,7 @@ fn paint(scene: &mut Scene, rng: &mut StdRng) -> Vec<Painted> {
                     match kind {
                         Kind::Monochrome => scene.insert_primitive(MonochromeSprite {
                             order: 0,
-                            pad: 0,
+                            clip: crate::ClipId::NONE,
                             bounds: b,
                             content_mask,
                             color,
@@ -199,7 +200,7 @@ fn paint(scene: &mut Scene, rng: &mut StdRng) -> Vec<Painted> {
                         }),
                         Kind::Subpixel => scene.insert_primitive(SubpixelSprite {
                             order: 0,
-                            pad: 0,
+                            clip: crate::ClipId::NONE,
                             bounds: b,
                             content_mask,
                             color,
@@ -208,7 +209,7 @@ fn paint(scene: &mut Scene, rng: &mut StdRng) -> Vec<Painted> {
                         }),
                         Kind::Polychrome => scene.insert_primitive(PolychromeSprite {
                             order: 0,
-                            pad: 0,
+                            clip: crate::ClipId::NONE,
                             grayscale: false.into(),
                             opacity: 1.,
                             bounds: b,

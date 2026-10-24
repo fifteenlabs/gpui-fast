@@ -36,8 +36,8 @@
 use crate::window::PaintIndex;
 use crate::{
     Bounds, DevicePixels, DispatchEventResult, Hitbox, HitboxBehavior, HitboxId, MouseButton,
-    MouseExitEvent, MouseMoveEvent, Pixels, PlatformInput, PlatformWindow, Point, Scene, Window,
-    scene::PaintOperation,
+    MouseExitEvent, MouseMoveEvent, Pixels, PlatformInput, PlatformWindow, Point, ScaledPixels,
+    Scene, Window, scene::PaintOperation,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::FxHashMap;
@@ -499,62 +499,102 @@ impl Scene {
             .paint_operations
             .get(range.clone())
             .context("scene replay range ends past the scene")?;
-        let mut active_layers = Vec::new();
-        let mut active_clips = Vec::new();
+        // What is open where the range starts, outermost first: opened again
+        // before it is replayed and closed after, in the order they nest.
+        let mut open = Vec::new();
         for operation in prefix {
-            match operation {
-                PaintOperation::StartLayer(bounds) => active_layers.push(*bounds),
-                PaintOperation::EndLayer => {
-                    anyhow::ensure!(
-                        active_layers.pop().is_some(),
-                        "source scene closes a layer that is not open"
-                    );
-                }
-                PaintOperation::Primitive(_) => {}
-                PaintOperation::FastRoundedClip(clip) => {
-                    crate::fast::rounded_clip::track(*clip, &mut active_clips)?
-                }
-            }
+            track_open(operation, &mut open, "source scene")?;
         }
 
         crate::fast::layers::paint::replay_layers(self, range, previous_scene);
-        for bounds in &active_layers {
-            self.push_layer(*bounds);
-        }
-        for shape in &active_clips {
-            crate::fast::rounded_clip::record(
-                self,
-                crate::fast::rounded_clip::ClipOperation::Begin(*shape),
-            );
+        for scope in &open {
+            scope.open(self);
         }
         for operation in operations {
-            match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => {
-                    active_layers.push(*bounds);
-                    self.push_layer(*bounds);
-                }
-                PaintOperation::EndLayer => {
-                    anyhow::ensure!(
-                        active_layers.pop().is_some(),
-                        "scene replay range closes a layer that is not open"
-                    );
-                    self.pop_layer();
-                }
-                PaintOperation::FastRoundedClip(clip) => {
-                    crate::fast::rounded_clip::track(*clip, &mut active_clips)?;
-                    crate::fast::rounded_clip::record(self, *clip);
-                }
-            }
+            self.apply(operation);
+            track_open(operation, &mut open, "scene replay range")?;
         }
-        for _ in active_layers {
-            self.pop_layer();
-        }
-        for _ in active_clips {
-            crate::fast::rounded_clip::record(self, crate::fast::rounded_clip::ClipOperation::End);
+        for scope in open.iter().rev() {
+            scope.close(self);
         }
         Ok(())
     }
+}
+
+/// A scope a paint operation opens and a later one closes.
+enum OpenScope {
+    Layer(Bounds<ScaledPixels>),
+    RoundedClip(crate::fast::rounded_clip::Shape),
+    Clip(crate::ClipPath<ScaledPixels>, Bounds<ScaledPixels>),
+    Group(crate::GroupSpec),
+}
+
+impl OpenScope {
+    fn open(&self, scene: &mut Scene) {
+        match self {
+            Self::Layer(bounds) => scene.push_layer(*bounds),
+            Self::RoundedClip(shape) => crate::fast::rounded_clip::record(
+                scene,
+                crate::fast::rounded_clip::ClipOperation::Begin(*shape),
+            ),
+            Self::Clip(path, visible) => {
+                scene.push_clip(path.clone(), *visible);
+            }
+            Self::Group(spec) => {
+                scene.push_group(spec.clone());
+            }
+        }
+    }
+
+    fn close(&self, scene: &mut Scene) {
+        match self {
+            Self::Layer(_) => scene.pop_layer(),
+            Self::RoundedClip(_) => crate::fast::rounded_clip::record(
+                scene,
+                crate::fast::rounded_clip::ClipOperation::End,
+            ),
+            Self::Clip(..) => scene.pop_clip(),
+            Self::Group(_) => scene.pop_group(),
+        }
+    }
+}
+
+/// Keeps `open` to the scopes open after `operation`, failing when it closes
+/// a scope of another kind than the innermost open one.
+fn track_open(operation: &PaintOperation, open: &mut Vec<OpenScope>, source: &str) -> Result<()> {
+    let closes = |open: &mut Vec<OpenScope>, kind: &str, matches: fn(&OpenScope) -> bool| {
+        anyhow::ensure!(
+            open.pop().as_ref().is_some_and(matches),
+            "{source} closes a {kind} that is not open"
+        );
+        Ok(())
+    };
+    match operation {
+        PaintOperation::Primitive(_) => {}
+        PaintOperation::StartLayer(bounds) => open.push(OpenScope::Layer(*bounds)),
+        PaintOperation::EndLayer => {
+            closes(open, "layer", |scope| matches!(scope, OpenScope::Layer(_)))?
+        }
+        PaintOperation::FastRoundedClip(crate::fast::rounded_clip::ClipOperation::Begin(shape)) => {
+            open.push(OpenScope::RoundedClip(*shape))
+        }
+        PaintOperation::FastRoundedClip(crate::fast::rounded_clip::ClipOperation::End) => {
+            closes(open, "rounded clip", |scope| {
+                matches!(scope, OpenScope::RoundedClip(_))
+            })?
+        }
+        PaintOperation::PushClip(path, visible) => {
+            open.push(OpenScope::Clip(path.clone(), *visible))
+        }
+        PaintOperation::PopClip => closes(open, "clip path", |scope| {
+            matches!(scope, OpenScope::Clip(..))
+        })?,
+        PaintOperation::StartGroup(spec) => open.push(OpenScope::Group(spec.clone())),
+        PaintOperation::EndGroup => {
+            closes(open, "group", |scope| matches!(scope, OpenScope::Group(_)))?
+        }
+    }
+    Ok(())
 }
 
 /// Where each stretch of a frame's scene is presented: the GPUI surface
@@ -1889,7 +1929,10 @@ mod tests {
         let bounds = square(100.);
         scene.insert_primitive(Quad {
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask {
+                bounds,
+                corner_radii: Default::default(),
+            },
             ..Default::default()
         });
 
@@ -1918,6 +1961,7 @@ mod tests {
             bounds: inner_bounds,
             content_mask: ContentMask {
                 bounds: inner_bounds,
+                corner_radii: Default::default(),
             },
             ..Default::default()
         });

@@ -1478,3 +1478,39 @@ mod tests {
         }
     }
 }
+
+impl ClipPath<ScaledPixels> {
+    /// This clip path moved by `delta`.
+    pub(crate) fn translated(&self, delta: Point<ScaledPixels>) -> Self {
+        let mv = |point: &Point<ScaledPixels>| *point + delta;
+        Self {
+            segments: self
+                .segments
+                .iter()
+                .map(|segment| match segment {
+                    ClipPathSegment::MoveTo(to) => ClipPathSegment::MoveTo(mv(to)),
+                    ClipPathSegment::LineTo(to) => ClipPathSegment::LineTo(mv(to)),
+                    ClipPathSegment::QuadTo { control, to } => ClipPathSegment::QuadTo {
+                        control: mv(control),
+                        to: mv(to),
+                    },
+                    ClipPathSegment::CubicTo {
+                        control1,
+                        control2,
+                        to,
+                    } => ClipPathSegment::CubicTo {
+                        control1: mv(control1),
+                        control2: mv(control2),
+                        to: mv(to),
+                    },
+                    ClipPathSegment::Close => ClipPathSegment::Close,
+                })
+                .collect(),
+            fill_rule: self.fill_rule,
+            bounds: Bounds {
+                origin: self.bounds.origin + delta,
+                size: self.bounds.size,
+            },
+        }
+    }
+}

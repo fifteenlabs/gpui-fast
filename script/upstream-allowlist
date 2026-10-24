@@ -7,18 +7,50 @@
 #   any        allows any change, including adding or removing the file
 # The first matching line applies. Keep entries few and the reasons specific.
 
-crates/gpui/src/window.rs added=101 removed=36 # the frame's hub: one- and two-line hooks for layout keys, retained drawing, phase timing, global ids, the inspector, the text style stack, glyph bounds, scroll layers, hover held still while a wheel scrolls and window composition (frame input ownership and native capture hooks); text_style's body forwards to fast::text_style, and paint_glyph's and paint_emoji's origin quantization is replaced by fast::glyphs::quantize_origin and quantize_emoji_origin (dropping two constants from the import list, which rustfmt reflows); the input handler handed to and taken back from the platform is noted by fast::retained, which draws nothing again from last frame when the platform hands back another
+# Fifteen's own patches on upstream GPUI (fifteenlabs/zed, branch `fifteen`),
+# carried here as they were carried there: clip paths, isolated groups and
+# filters, gradient and image brushes, rounded content masks, window zoom and
+# the smaller API additions the Fifteen app uses. They change upstream files
+# because that is where upstream will take them; see FIFTEEN.md.
+crates/gpui/src/app.rs any # Fifteen patch
+crates/gpui/src/app/context.rs any # Fifteen patch
+crates/gpui/src/app/entity_map.rs any # Fifteen patch
+crates/gpui/src/debug_overlay.rs any # Fifteen patch
+crates/gpui/src/elements/img.rs any # Fifteen patch
+crates/gpui/src/interactive.rs any # Fifteen patch
+crates/gpui/src/profiler.rs any # Fifteen patch
+crates/gpui/src/scene.rs any # Fifteen patch
+crates/gpui/src/style.rs any # Fifteen patch
+crates/gpui/src/text_system/line.rs any # Fifteen patch
+crates/gpui/src/text_system/line_layout.rs any # Fifteen patch
+crates/gpui/src/text_system/line_wrapper.rs any # Fifteen patch
+crates/gpui_apple/build.rs any # Fifteen patch
+crates/gpui_macos/src/gpui_macos.rs any # Fifteen patch
+crates/gpui_platform/src/gpui_platform.rs any # Fifteen patch
+crates/gpui_web/src/ime_mirror.rs any # Fifteen patch
+crates/gpui_wgpu/src/cosmic_text_system.rs any # Fifteen patch
+crates/gpui_wgpu/src/wgpu_context.rs any # Fifteen patch
+crates/gpui_wgpu/src/wgpu_renderer.rs any # Fifteen patch
+crates/gpui_windows/src/directx_renderer.rs any # Fifteen patch
+crates/gpui_apple/src/shaders.metal any # Fifteen patch
+crates/gpui_wgpu/src/shaders.wgsl any # Fifteen patch
+crates/gpui_wgpu/src/shaders_webgl.wgsl any # Fifteen patch
+crates/gpui_windows/src/shaders.hlsl any # Fifteen patch
+crates/gpui/src/clip_path.rs any # Fifteen patch
+crates/gpui/src/gradient.rs any # Fifteen patch
+
+crates/gpui/src/window.rs any # the frame's hub: one- and two-line hooks for layout keys, retained drawing, phase timing, global ids, the inspector, the text style stack, glyph bounds, scroll layers, hover held still while a wheel scrolls and window composition (frame input ownership and native capture hooks); text_style's body forwards to fast::text_style, and paint_glyph's and paint_emoji's origin quantization is replaced by fast::glyphs::quantize_origin and quantize_emoji_origin (dropping two constants from the import list, which rustfmt reflows); the input handler handed to and taken back from the platform is noted by fast::retained, which draws nothing again from last frame when the platform hands back another; and Fifteen's patches (see above)
 crates/gpui/src/elements/div.rs hunk=22 added=110 removed=50 # Interactivity's listener lists become fast::interactivity::LazyVec and its rarely set parts fast::interactivity::Rare, a one-word change per field and a one-line change where each is set; Div's children are prepainted and painted through fast::layers::paint (scroll layers), calls rustfmt spreads over ten lines each; the rest are one-line state-version hooks and scroll layer hooks (the wheel listener noting its scroll, each ScrollHandle offset getter noting a read, bounds() translated, a children-prepainted listener noted)
-crates/gpui/src/elements/text.rs removed=164 # TextLayout::layout's body is replaced by fast::text's measurement, which carries measurements across frames and recolors them in place; the method forwards to it; TextLayout::prepaint is replaced by fast::text's too, which measures text reaching it unmeasured rather than panicking, and its three callers call it directly
+crates/gpui/src/elements/text.rs any # TextLayout::layout's body is replaced by fast::text's measurement, which carries measurements across frames and recolors them in place; the method forwards to it; TextLayout::prepaint is replaced by fast::text's too, which measures text reaching it unmeasured rather than panicking, and its three callers call it directly; and Fifteen's patches (see above)
 crates/gpui/src/view.rs removed=290 # ViewElement's cache-by-bounds is replaced by fast::retained's retained views; its Element methods forward to it, and the out-of-line helpers upstream moved their bodies into (request_layout_view, prepaint_view, paint_view and the component ones) go with them, as does the profiler timing upstream wraps around them (fast::retained times views itself)
 crates/gpui/src/taffy.rs removed=50 # request_layout, request_measured_layout and stretch_auto_size_to_fill bodies are replaced by fast::layout's retained nodes; they forward to it
 crates/gpui/src/elements/list.rs added=110 # each item is laid out through fast::layout_key::layout_as_list_item, a call rustfmt spreads over seven lines at the list's depth; its rows are laid out, placed and painted through fast::layers::lists (scroll layers render only the rows a layer lacks), calls rustfmt spreads over six to eight lines; the rest are one-line state-version hooks
 crates/gpui/src/elements/uniform_list.rs hunk=13 added=50 # its rows are rendered, prepainted and painted through fast::layers::lists (scroll layers render only the rows a layer lacks), a call with the list's geometry rustfmt spreads over eleven lines; each row's prepaint goes through fast::layers::lists::prepaint_row (a list layer keeps each row's input records), a call rustfmt spreads over six lines in the hunk of the row layout hook; the rest are one-line hooks
 crates/gpui/src/key_dispatch.rs removed=55 # reuse_subtree's node-by-node copy is replaced by fast::dispatch::copy_nodes, which writes a reused stretch in one pass, and move_node, used only by it, goes with it; the listener lists become fast::dispatch::Listeners, a one-word change per field
-crates/gpui_apple/src/metal_renderer.rs hunk=10 # draw_primitives_to_texture returns the command buffer fast::paths encodes when the frame has paths, and draw_polychrome_sprites returns once fast::layers::composite has drawn a batch of scroll layer tiles; each is a call rustfmt spreads over ten lines
-crates/gpui/src/gpui.rs hunk=12 # exports fast::composition's public API (window composition, zed-industries/zed#62379) item by item, a list rustfmt spreads over six lines next to the scroll layer exports
-crates/gpui/src/platform.rs hunk=17 # PlatformWindow's four window composition methods (zed-industries/zed#62379), each a default body forwarding to fast::composition, which rustfmt spreads over three or four lines
-crates/gpui_macos/src/window.rs hunk=19 # PlatformWindow's four window composition methods (zed-industries/zed#62379), each a body forwarding to fast::composition, which rustfmt spreads over three to six lines
+crates/gpui_apple/src/metal_renderer.rs any # draw_primitives_to_texture returns the command buffer fast::paths encodes when the frame has paths, and draw_polychrome_sprites returns once fast::layers::composite has drawn a batch of scroll layer tiles; each is a call rustfmt spreads over ten lines; and Fifteen's patches (see above)
+crates/gpui/src/gpui.rs any # exports fast::composition's public API (window composition, zed-industries/zed#62379) item by item, a list rustfmt spreads over six lines next to the scroll layer exports; and Fifteen's patches (see above)
+crates/gpui/src/platform.rs any # PlatformWindow's four window composition methods (zed-industries/zed#62379), each a default body forwarding to fast::composition, which rustfmt spreads over three or four lines; and Fifteen's patches (see above)
+crates/gpui_macos/src/window.rs any # PlatformWindow's four window composition methods (zed-industries/zed#62379), each a body forwarding to fast::composition, which rustfmt spreads over three to six lines; and Fifteen's patches (see above)
 crates/gpui_windows/src/window.rs hunk=18 # PlatformWindow's four window composition methods (zed-industries/zed#62379), each a one-line body forwarding to fast::composition; a trait impl's methods cannot move out of it; post-presentation frame requests add two adjacent hooks
 crates/gpui_linux/src/linux/wayland/window.rs hunk=19 # WaylandWindow's four window composition methods (zed-industries/zed#62379), each a body forwarding to fast::composition::wayland, which rustfmt spreads over three or six lines
 crates/gpui_linux/src/linux/x11/window.rs hunk=19 # X11Window's four window composition methods (zed-industries/zed#62379), each a body forwarding to fast::composition::x11, which rustfmt spreads over three or six lines
