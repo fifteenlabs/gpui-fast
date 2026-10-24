@@ -13,16 +13,14 @@ mod harness;
 
 use std::sync::Arc;
 
-use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
-use core_video::pixel_buffer::{
-    CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-};
 use gpui::{
     App, BorderStyle, Bounds, BoxShadow, ClipPath, Corners, Pixels, Point, RenderImage, Size,
     TextAlign, TextRun, UnderlineStyle, Window, font, px, quad, size, white,
 };
 use harness::{WHITE, at, rect, rect_path, render_frame, white_surface};
 use image::{Frame, RgbaImage};
+use objc2_core_foundation::CFRetained;
+use objc2_core_video::{CVPixelBuffer, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
 
 /// The window every test in this file renders, in logical pixels.
 const WINDOW: f32 = 200.;
@@ -277,39 +275,14 @@ fn a_bgra_surface_is_clipped_by_a_clip_path() {
 /// down `surfaces`, whose fragment stage does the YCbCr conversion and blends
 /// straight rather than premultiplied alpha. They are two pipelines with two
 /// clipped variants, and only one of them was covered.
-fn white_ycbcr_surface(side: usize) -> CVPixelBuffer {
-    let io_surface_properties = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
-    let attributes = CFDictionary::from_CFType_pairs(&[(
-        CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
-        io_surface_properties.as_CFType(),
-    )]);
-    let buffer = CVPixelBuffer::new(
+fn white_ycbcr_surface(side: usize) -> CFRetained<CVPixelBuffer> {
+    // Plane 0 is luma and plane 1 interleaved chroma: full-range white is luma
+    // 255 with both chroma channels at 128.
+    harness::pixel_buffer(
         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         side,
-        side,
-        Some(&attributes),
+        |plane| if plane == 0 { 0xff } else { 0x80 },
     )
-    .expect("failed to create a biplanar pixel buffer for the surface");
-    assert_eq!(buffer.lock_base_address(0), 0, "failed to lock the buffer");
-    // SAFETY: the buffer is locked, so each plane's base address is valid for
-    // `bytes_per_row_of_plane * height_of_plane` bytes. Plane 0 is luma and
-    // plane 1 is interleaved chroma at half resolution; full-range white is
-    // luma 255 with both chroma channels at 128.
-    unsafe {
-        for (plane, value) in [(0usize, 0xffu8), (1, 0x80)] {
-            let base = buffer.get_base_address_of_plane(plane) as *mut u8;
-            let stride = buffer.get_bytes_per_row_of_plane(plane);
-            for row in 0..buffer.get_height_of_plane(plane) {
-                std::ptr::write_bytes(base.add(row * stride), value, stride);
-            }
-        }
-    }
-    assert_eq!(
-        buffer.unlock_base_address(0),
-        0,
-        "failed to unlock the buffer"
-    );
-    buffer
 }
 
 #[test]

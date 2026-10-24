@@ -12,8 +12,8 @@ use std::mem;
 
 use crate::fast::rounded_clip::{ClipOperation, Shape};
 use crate::{
-    AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, ClipId, ClipPath, ContentMask,
-    LayerContent, LayerFrame, LayerKey, PolychromeSprite, Rgba, ScaledPixels, Scene, TileId,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, ClipId, ClipPath, ContentMask, LayerContent,
+    LayerFrame, LayerKey, PolychromeSprite, Rgba, ScaledPixels, Scene, TileId,
     scene::PaintOperation,
 };
 
@@ -26,6 +26,15 @@ const GEOMETRY_KEY: LayerKey = LayerKey(u32::MAX);
 pub(crate) fn compile(scene: &mut Scene) -> bool {
     if scene.fast_rounded_clip.scopes.is_empty() || scene.fast_rounded_clip.compiled {
         return false;
+    }
+    if scene.paint_operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PaintOperation::PushClip(..) | PaintOperation::StartGroup(_)
+        )
+    }) {
+        lower(scene);
+        return true;
     }
     let operations = mem::take(&mut scene.paint_operations);
     let layers: Vec<LayerFrame> = scene
@@ -41,8 +50,6 @@ pub(crate) fn compile(scene: &mut Scene) -> bool {
         scene
     };
     let mut stack = vec![new_scene()];
-    // Clip paths open where a rounded clip begins clip its child scene too.
-    let mut clips: Vec<(ClipPath<ScaledPixels>, Bounds<ScaledPixels>)> = Vec::new();
     let mut shapes = Vec::new();
     let mut redundant = Vec::new();
     for operation in &operations {
@@ -52,11 +59,7 @@ pub(crate) fn compile(scene: &mut Scene) -> bool {
                 redundant.push(already_active);
                 shapes.push(*shape);
                 if !already_active {
-                    let mut child = new_scene();
-                    for (path, visible) in &clips {
-                        child.push_clip(path.clone(), *visible);
-                    }
-                    stack.push(child);
+                    stack.push(new_scene());
                 }
             }
             PaintOperation::FastRoundedClip(ClipOperation::End) => {
@@ -105,18 +108,10 @@ pub(crate) fn compile(scene: &mut Scene) -> bool {
                 .insert_primitive(primitive.clone()),
             PaintOperation::StartLayer(bounds) => stack.last_mut().unwrap().push_layer(*bounds),
             PaintOperation::EndLayer => stack.last_mut().unwrap().pop_layer(),
-            PaintOperation::PushClip(path, visible) => {
-                clips.push((path.clone(), *visible));
-                stack.last_mut().unwrap().push_clip(path.clone(), *visible);
-            }
-            PaintOperation::PopClip => {
-                clips.pop();
-                stack.last_mut().unwrap().pop_clip();
-            }
-            PaintOperation::StartGroup(spec) => {
-                stack.last_mut().unwrap().push_group(spec.clone());
-            }
-            PaintOperation::EndGroup => stack.last_mut().unwrap().pop_group(),
+            PaintOperation::PushClip(..)
+            | PaintOperation::PopClip
+            | PaintOperation::StartGroup(_)
+            | PaintOperation::EndGroup => unreachable!("lowered above"),
         }
     }
     assert!(
@@ -130,6 +125,46 @@ pub(crate) fn compile(scene: &mut Scene) -> bool {
     compiled.sort_scratch = mem::take(&mut scene.sort_scratch);
     *scene = compiled;
     true
+}
+
+/// Rebuilds a scene that pushes clip paths or isolated groups with each of
+/// its rounded clips pushed as a clip path instead. A renderer draws clip
+/// paths and groups only in a frame's own passes, which the child scene of a
+/// rounded clip group is drawn outside of.
+fn lower(scene: &mut Scene) {
+    let operations = mem::take(&mut scene.paint_operations);
+    let mut lowered = Scene::default();
+    lowered.layers.frames = scene
+        .layers
+        .frames
+        .iter()
+        .filter(|frame| frame.tile_size != 0)
+        .cloned()
+        .collect();
+    for operation in &operations {
+        match operation {
+            PaintOperation::FastRoundedClip(ClipOperation::Begin(shape)) => {
+                lowered.push_clip(clip_path(shape), shape.bounds);
+            }
+            PaintOperation::FastRoundedClip(ClipOperation::End) => lowered.pop_clip(),
+            operation => lowered.apply(operation),
+        }
+    }
+    lowered.paint_operations = operations;
+    lowered.fast_rounded_clip = mem::take(&mut scene.fast_rounded_clip);
+    lowered.fast_rounded_clip.compiled = true;
+    lowered.sort_scratch = mem::take(&mut scene.sort_scratch);
+    *scene = lowered;
+}
+
+/// The outline a rounded clip clips to.
+fn clip_path(shape: &Shape) -> ClipPath<ScaledPixels> {
+    let logical = |value: ScaledPixels| crate::px(value.0);
+    ClipPath::rounded_rect(
+        shape.bounds.map(logical),
+        shape.radii.map(|radius| radius.map(logical)),
+    )
+    .scale(1.)
 }
 
 fn geometry(shape: Shape) -> LayerFrame {

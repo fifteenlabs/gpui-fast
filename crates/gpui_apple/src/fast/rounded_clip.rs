@@ -6,7 +6,7 @@
 use std::{mem, ptr::NonNull};
 
 use anyhow::{Context as _, Result};
-use gpui::{AtlasTextureId, DevicePixels, LayerFrame, PrimitiveBatch, Scene, Size};
+use gpui::{AtlasTextureId, ClipPlan, DevicePixels, LayerFrame, PrimitiveBatch, Scene, Size};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVMetalTexture;
@@ -16,8 +16,8 @@ use objc2_metal::{
 };
 
 use crate::metal_renderer::{
-    InstanceBindings, InstanceBufferWriter, MetalRenderer, new_command_encoder_for_texture,
-    write_instances,
+    InstanceBindings, InstanceBufferWriter, MetalRenderer, RenderTarget,
+    new_command_encoder_for_texture, write_instances,
 };
 
 const CLIP_TEXTURE_BASE: u32 = 0xF100_0000;
@@ -127,7 +127,7 @@ pub(crate) fn draw(
     let encoder = new_command_encoder_for_texture(
         &command_buffer,
         texture,
-        viewport,
+        RenderTarget::whole(viewport),
         Some(MTLClearColor {
             red: 0.,
             green: 0.,
@@ -166,9 +166,13 @@ pub(crate) fn draw_tile(
     let old_msaa = renderer.path_intermediate_msaa_texture.take();
     let result = (|| {
         renderer.update_path_intermediate_textures(viewport)?;
-        let bindings = write_instances(scene, writer)?;
-        let encoder =
-            new_command_encoder_for_texture(commands, texture, viewport, Some(background))?;
+        let bindings = write_instances(scene, &ClipPlan::unclipped(), writer)?;
+        let encoder = new_command_encoder_for_texture(
+            commands,
+            texture,
+            RenderTarget::whole(viewport),
+            Some(background),
+        )?;
         encode(
             renderer,
             scene,
@@ -189,6 +193,10 @@ pub(crate) fn draw_tile(
     result
 }
 
+/// Encodes `scene`'s batches, and those of the rounded clip groups in it with
+/// their clip stack bound. The core lowers the rounded clips of a scene that
+/// pushes clip paths or isolated groups to clip paths, so a scene drawn here
+/// has neither: every batch is unclipped and draws into the whole target.
 #[allow(clippy::too_many_arguments)]
 fn encode(
     renderer: &mut MetalRenderer,
@@ -203,21 +211,21 @@ fn encode(
     mut encoder: Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
     renderer.fast_layers.note_composited(scene);
+    let target = RenderTarget::whole(viewport);
     for batch in scene.batches() {
         bind(&encoder, clips, &renderer.device);
         match batch {
             PrimitiveBatch::Shadows(range) => {
-                renderer.draw_shadows(range, bindings, viewport, &encoder)
+                renderer.draw_shadows(range, false, bindings, &target, &encoder)
             }
             PrimitiveBatch::Quads(range) => {
-                renderer.draw_quads(range, bindings, viewport, &encoder)
+                renderer.draw_quads(range, false, bindings, &target, &encoder)
             }
             PrimitiveBatch::Underlines(range) => {
-                renderer.draw_underlines(range, bindings, viewport, &encoder)
+                renderer.draw_underlines(range, false, bindings, &target, &encoder)
             }
-            PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                renderer.draw_monochrome_sprites(texture_id, range, bindings, viewport, &encoder)
-            }
+            PrimitiveBatch::MonochromeSprites { texture_id, range } => renderer
+                .draw_monochrome_sprites(texture_id, range, false, bindings, &target, &encoder),
             PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                 if let Some(frame) = group(scene, texture_id) {
                     let child = frame.content.scene().context("rounded clip content")?;
@@ -242,7 +250,8 @@ fn encode(
                             ],
                             vertical: [radii.r, radii.g, radii.b, radii.a],
                         });
-                        let child_bindings = write_instances(child, writer)?;
+                        let child_bindings =
+                            write_instances(child, &ClipPlan::unclipped(), writer)?;
                         encoder = encode(
                             renderer,
                             child,
@@ -259,26 +268,29 @@ fn encode(
                         renderer.fast_layers.note_composited(scene);
                     }
                 } else {
-                    renderer
-                        .draw_polychrome_sprites(texture_id, range, bindings, viewport, &encoder);
+                    renderer.draw_polychrome_sprites(
+                        texture_id, range, false, bindings, &target, &encoder,
+                    );
                 }
             }
             PrimitiveBatch::Paths(range) => {
                 encoder.endEncoding();
                 let paths = &scene.paths[range];
-                let drawn =
-                    renderer.draw_paths_to_intermediate(paths, writer, viewport, commands)?;
-                encoder = new_command_encoder_for_texture(commands, texture, viewport, None)?;
+                let drawn = renderer.draw_paths_to_intermediate(
+                    paths, false, bindings, writer, viewport, commands,
+                )?;
+                encoder = new_command_encoder_for_texture(commands, texture, target, None)?;
                 bind(&encoder, clips, &renderer.device);
                 if drawn {
-                    renderer.draw_paths_from_intermediate(paths, writer, viewport, &encoder)?;
+                    renderer
+                        .draw_paths_from_intermediate(paths, writer, &target, viewport, &encoder)?;
                 }
             }
             PrimitiveBatch::Surfaces(range) => renderer.draw_surfaces(
                 &scene.surfaces[range.clone()],
                 range.start,
                 bindings,
-                viewport,
+                &target,
                 &encoder,
                 surface_textures,
             )?,

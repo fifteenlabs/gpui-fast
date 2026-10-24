@@ -1020,16 +1020,16 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        if let Some(command_buffer) = crate::fast::paths::draw_primitives_to_texture(
-            self,
-            scene,
-            instance_bindings,
-            writer,
-            texture,
-            viewport_size,
-            surface_textures,
-        )? {
-            return Ok(command_buffer);
+        if crate::fast::rounded_clip::has_groups(scene) {
+            return crate::fast::rounded_clip::draw(
+                self,
+                scene,
+                instance_bindings,
+                writer,
+                texture,
+                viewport_size,
+                surface_textures,
+            );
         }
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue
@@ -2077,7 +2077,7 @@ impl MetalRenderer {
             if bound_texture != Some(run.texture) {
                 let texture = run
                     .texture
-                    .map(|texture_id| self.sprite_atlas.metal_texture(texture_id));
+                    .and_then(|texture_id| self.sprite_atlas.metal_texture(texture_id));
                 // SAFETY: The brush atlas slot takes any 2D texture; Metal
                 // retains it until the pass completes.
                 unsafe {
@@ -2439,7 +2439,7 @@ impl MetalRenderer {
             texture_id,
             &sprites,
             instance_bindings,
-            viewport_size,
+            render_target,
             command_encoder,
         ) {
             return;
@@ -3061,7 +3061,7 @@ fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Rgb
 /// the unclipped pipeline because its clipped twin was never built, which is a
 /// picture with the clip path silently missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrimitivePipeline {
+pub(crate) enum PrimitivePipeline {
     PathsRasterization = 0,
     Shadows,
     Quads,
@@ -3724,7 +3724,7 @@ pub struct RenderTarget {
 impl RenderTarget {
     /// The whole window, which is what every pass drew into before groups
     /// existed and what every pass outside a group still draws into.
-    fn whole(size: Size<DevicePixels>) -> Self {
+    pub(crate) fn whole(size: Size<DevicePixels>) -> Self {
         RenderTarget {
             size,
             origin: point(DevicePixels(0), DevicePixels(0)),

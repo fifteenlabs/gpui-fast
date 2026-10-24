@@ -368,7 +368,6 @@ mod tests {
             PathVertex {
                 xy_position: point(px(1.), px(2.)),
                 st_position: point(0., 1.),
-                content_mask: Default::default(),
             };
             vertices
         ];

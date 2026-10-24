@@ -378,6 +378,7 @@ fn plan_paths(
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask: path.content_mask,
             }));
         }
 
