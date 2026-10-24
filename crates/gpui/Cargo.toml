@@ -197,6 +197,9 @@ http_client = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 reqwest_client = { workspace = true, features = ["test-support"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-core-video = { workspace = true, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 gpui_web.workspace = true
 wasm-bindgen.workspace = true

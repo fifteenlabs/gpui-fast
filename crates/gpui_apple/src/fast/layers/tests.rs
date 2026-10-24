@@ -192,7 +192,7 @@ fn a_composited_layer_equals_direct_drawing() {
 }
 
 /// A path the frame draws over a layer, outside it, as the core draws paths
-/// that nothing covers: the frame then takes `fast::paths`'s encoding.
+/// that nothing covers.
 #[test]
 fn a_path_over_a_composited_layer_equals_direct_drawing() {
     let Some(mut harness) = Harness::new() else {
@@ -296,7 +296,10 @@ fn a_repainted_tile_shows_the_new_content() {
             Hsla::from(rgba(0x00ff00ff)),
         );
         if let Some(clip) = clip {
-            square.content_mask = ContentMask { bounds: clip };
+            square.content_mask = ContentMask {
+                bounds: clip,
+                corner_radii: Default::default(),
+            };
         }
         scene.insert_primitive(square);
     }
@@ -546,7 +549,7 @@ fn tile_sprite(
     let bounds = layer.tile_bounds(tile);
     PolychromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         grayscale: false.into(),
         opacity: 1.,
         bounds: sp(
@@ -555,7 +558,10 @@ fn tile_sprite(
             TILE as f32,
             TILE as f32,
         ),
-        content_mask: ContentMask { bounds: viewport },
+        content_mask: ContentMask {
+            bounds: viewport,
+            corner_radii: Default::default(),
+        },
         corner_radii: Corners::default(),
         tile: AtlasTile {
             texture_id: layer_tile_texture_id(key),
@@ -688,6 +694,7 @@ fn add_content(
     let at = |x: f32, y: f32, w: f32, h: f32| sp(x + ox, y + oy, w, h);
     let mask = |bounds: Bounds<ScaledPixels>| ContentMask {
         bounds: bounds.intersect(&clip),
+        corner_radii: Default::default(),
     };
 
     scene.insert_primitive(Quad {
@@ -715,7 +722,7 @@ fn add_content(
         element_bounds: at(380., 420., 120., 70.),
         element_corner_radii: Corners::all(ScaledPixels(6.)),
         inset: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
     });
     scene.insert_primitive(Quad {
         bounds: at(600., 600., 300., 200.),
@@ -730,7 +737,7 @@ fn add_content(
     });
     scene.insert_primitive(Underline {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         bounds: at(50., 505., 900., 8.),
         content_mask: mask(clip),
         color: Hsla::from(rgba(0xffcc00ff)),
@@ -739,7 +746,7 @@ fn add_content(
     });
     scene.insert_primitive(Underline {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         bounds: at(60., 530., 700., 2.),
         content_mask: mask(clip),
         color: Hsla::from(rgba(0x114411ff)),
@@ -757,7 +764,7 @@ fn add_content(
     let mono = glyph_tile(harness, 1);
     scene.insert_primitive(MonochromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         bounds: at(505., 700., 16., 16.),
         content_mask: mask(clip),
         color: Hsla::from(rgba(0xffffffff)),
@@ -766,7 +773,7 @@ fn add_content(
     });
     scene.insert_primitive(PolychromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         grayscale: false.into(),
         opacity: 1.,
         bounds: at(300., 500., 20., 20.),
@@ -784,6 +791,7 @@ fn add_path(scene: &mut Scene) {
     path.line_to(point(px(480.), px(300.)));
     path.content_mask = ContentMask {
         bounds: no_mask().bounds.map(|c| px(c.0)),
+        corner_radii: Default::default(),
     };
     path.color = Hsla::from(rgba(0x8800ffcc)).into();
     scene.insert_primitive(path.scale(1.));
@@ -798,7 +806,10 @@ fn add_covered_paths(
     (ox, oy): (f32, f32),
     clip: Bounds<ScaledPixels>,
 ) {
-    let mask = ContentMask { bounds: clip };
+    let mask = ContentMask {
+        bounds: clip,
+        corner_radii: Default::default(),
+    };
     for (x, y, dx, dy) in [
         (200., 330., 1., 1.),
         (330.5, 330., -1., 1.),
@@ -811,6 +822,7 @@ fn add_covered_paths(
         path.line_to(corner);
         path.content_mask = ContentMask {
             bounds: clip.map(|c| px(c.0)),
+            corner_radii: Default::default(),
         };
         path.color = Hsla::from(rgba(0x3366ccff)).into();
         scene.insert_primitive(path.scale(1.));
@@ -826,7 +838,7 @@ fn add_covered_paths(
     });
     scene.insert_primitive(MonochromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         bounds: sp(204. + ox, 334. + oy, 16., 16.),
         content_mask: mask,
         color: Hsla::from(rgba(0xff8800ff)),
@@ -842,6 +854,7 @@ fn add_covered_paths(
     path.line_to(point(px(250. + ox), px(360. + oy)));
     path.content_mask = ContentMask {
         bounds: clip.map(|c| px(c.0)),
+        corner_radii: Default::default(),
     };
     path.color = Hsla::from(rgba(0x8800ffcc)).into();
     scene.insert_primitive(path.scale(1.));
@@ -910,6 +923,7 @@ fn sp(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
 fn no_mask() -> ContentMask<ScaledPixels> {
     ContentMask {
         bounds: sp(-10_000., -10_000., 20_000., 20_000.),
+        corner_radii: Default::default(),
     }
 }
 
@@ -942,7 +956,7 @@ impl Harness {
     /// (the tests then skip).
     fn new() -> Option<Harness> {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        match MetalRenderer::new_headless(pool) {
+        match MetalRenderer::new_headless(pool, false) {
             Ok(renderer) => Some(Harness { renderer }),
             Err(error) => {
                 eprintln!("skipped: no Metal device ({error:#})");

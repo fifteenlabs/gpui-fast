@@ -121,13 +121,7 @@ impl LayerFrame {
                         scene.insert_primitive(translate_primitive(primitive, delta));
                     }
                 }
-                PaintOperation::StartLayer(layer_bounds) => {
-                    scene.push_layer(translate_bounds(*layer_bounds, delta))
-                }
-                PaintOperation::EndLayer => scene.pop_layer(),
-                PaintOperation::FastRoundedClip(clip) => {
-                    crate::fast::rounded_clip::record(&mut scene, clip.translated(delta))
-                }
+                scope => scene.apply(&translate_operation(scope, delta)),
             }
         }
         scene.finish();
@@ -311,6 +305,32 @@ pub(crate) fn translate_primitive(primitive: &Primitive, delta: Point<ScaledPixe
     primitive
 }
 
+/// Moves `operation` by `delta`: every position it carries, so the scene it
+/// is part of draws the same pixels `delta` away.
+pub(crate) fn move_operation(operation: &mut PaintOperation, delta: Point<ScaledPixels>) {
+    match operation {
+        PaintOperation::Primitive(primitive) => move_primitive(primitive, delta),
+        PaintOperation::StartLayer(bounds) => *bounds = translate_bounds(*bounds, delta),
+        PaintOperation::EndLayer | PaintOperation::PopClip | PaintOperation::EndGroup => {}
+        PaintOperation::FastRoundedClip(clip) => *clip = clip.translated(delta),
+        PaintOperation::PushClip(path, visible) => {
+            *path = path.translated(delta);
+            *visible = translate_bounds(*visible, delta);
+        }
+        PaintOperation::StartGroup(spec) => *spec = spec.translated(delta),
+    }
+}
+
+/// `operation` moved by `delta`, as [`move_operation`] moves it.
+pub(crate) fn translate_operation(
+    operation: &PaintOperation,
+    delta: Point<ScaledPixels>,
+) -> PaintOperation {
+    let mut operation = operation.clone();
+    move_operation(&mut operation, delta);
+    operation
+}
+
 /// Moves `primitive` by `delta`, as [`translate_primitive`] does, in place.
 pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixels>) {
     let mv = |bounds: &mut Bounds<ScaledPixels>| *bounds = translate_bounds(*bounds, delta);
@@ -329,11 +349,9 @@ pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixel
             mv(&mut path.content_mask.bounds);
             for vertex in &mut path.vertices {
                 vertex.xy_position = vertex.xy_position + delta;
-                // `Window::paint_path` leaves vertices' masks empty, at the
-                // origin, and no renderer reads them: they stay so.
-                if !vertex.content_mask.bounds.is_empty() {
-                    mv(&mut vertex.content_mask.bounds);
-                }
+            }
+            if let Some(brush) = &mut path.brush {
+                brush.screen_to_brush = brush.screen_to_brush.pretranslated(delta);
             }
         }
         Primitive::Underline(underline) => {

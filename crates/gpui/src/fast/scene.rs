@@ -186,6 +186,12 @@ impl Scene {
                 crate::PaintOperation::FastRoundedClip(clip) => {
                     lines.push(format!("rounded clip {clip:?}"))
                 }
+                crate::PaintOperation::PushClip(path, visible) => {
+                    lines.push(format!("clip {path:?} {visible:?}"))
+                }
+                crate::PaintOperation::PopClip => lines.push("end clip".into()),
+                crate::PaintOperation::StartGroup(spec) => lines.push(format!("group {spec:?}")),
+                crate::PaintOperation::EndGroup => lines.push("end group".into()),
                 crate::PaintOperation::Primitive(..) => {}
             }
         }
@@ -269,9 +275,8 @@ pub(crate) fn sort_in_drawing_order(scene: &mut Scene) {
             }
         };
     }
-    let sprite_key = |order: DrawOrder, tile: &crate::AtlasTile| {
-        (order, tile.texture_id.index, tile.tile_id.0)
-    };
+    let sprite_key =
+        |order: DrawOrder, tile: &crate::AtlasTile| (order, tile.texture_id.index, tile.tile_id.0);
     sort!(shadows, sort_by_draw_order, |shadow: &Shadow| shadow.order);
     sort!(quads, sort_by_draw_order, |quad: &Quad| quad.order);
     sort!(paths, sort_by_draw_order, |path: &Path<ScaledPixels>| path
@@ -279,17 +284,22 @@ pub(crate) fn sort_in_drawing_order(scene: &mut Scene) {
     sort!(underlines, sort_by_draw_order, |underline: &Underline| {
         underline.order
     });
-    sort!(monochrome_sprites, sort_sprites, |sprite: &MonochromeSprite| {
-        sprite_key(sprite.order, &sprite.tile)
-    });
+    sort!(
+        monochrome_sprites,
+        sort_sprites,
+        |sprite: &MonochromeSprite| { sprite_key(sprite.order, &sprite.tile) }
+    );
     sort!(subpixel_sprites, sort_sprites, |sprite: &SubpixelSprite| {
         sprite_key(sprite.order, &sprite.tile)
     });
-    sort!(polychrome_sprites, sort_sprites, |sprite: &PolychromeSprite| {
-        sprite_key(sprite.order, &sprite.tile)
+    sort!(
+        polychrome_sprites,
+        sort_sprites,
+        |sprite: &PolychromeSprite| { sprite_key(sprite.order, &sprite.tile) }
+    );
+    sort!(surfaces, sort_by_draw_order, |surface: &PaintSurface| {
+        surface.order
     });
-    sort!(surfaces, sort_by_draw_order, |surface: &PaintSurface| surface
-        .order);
 }
 
 #[cfg(test)]

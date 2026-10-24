@@ -8,11 +8,13 @@
 
 use std::{mem, ops::Range, ptr};
 
-use gpui::{AtlasTextureId, DevicePixels, Size, TileId, decode_layer_tile, size};
+use gpui::{AtlasTextureId, DevicePixels, TileId, decode_layer_tile, size};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLPrimitiveType, MTLRenderCommandEncoder, MTLTexture};
 
-use crate::metal_renderer::{InstanceBindings, MetalRenderer, SpriteInputIndex};
+use crate::metal_renderer::{
+    InstanceBindings, MetalRenderer, PrimitivePipeline, RenderTarget, SpriteInputIndex,
+};
 
 /// Forwarded to by `MetalRenderer::draw_polychrome_sprites`. Draws the batch
 /// `sprites` if its texture is a layer's tiles, and returns whether it was:
@@ -24,7 +26,7 @@ pub(crate) fn draw_tiles(
     texture_id: AtlasTextureId,
     sprites: &Range<usize>,
     instance_bindings: &InstanceBindings,
-    viewport_size: Size<DevicePixels>,
+    render_target: &RenderTarget,
     command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
 ) -> bool {
     let Some((layer, _)) = decode_layer_tile(texture_id, TileId(0)) else {
@@ -39,10 +41,14 @@ pub(crate) fn draw_tiles(
         };
         if !pipeline_set {
             pipeline_set = true;
-            command_encoder.setRenderPipelineState(&renderer.polychrome_sprites_pipeline_state);
+            // Tile sprites are never clipped by a clip path: the core keeps
+            // content that pushes one out of layers.
+            command_encoder.setRenderPipelineState(
+                &renderer.primitive_pipelines[PrimitivePipeline::PolychromeSprites as usize],
+            );
             // SAFETY: Six unit vertices and the scene's sprites match the shader
             // layouts and slots. Metal retains the buffers, `writer.finish`
-            // publishes their writes, and the viewport bytes are copied.
+            // publishes their writes, and the render target bytes are copied.
             unsafe {
                 command_encoder.setVertexBuffer_offset_atIndex(
                     Some(&renderer.unit_vertices),
@@ -55,9 +61,9 @@ pub(crate) fn draw_tiles(
                     SpriteInputIndex::Sprites as usize,
                 );
                 command_encoder.setVertexBytes_length_atIndex(
-                    ptr::NonNull::from(&viewport_size).cast(),
-                    mem::size_of_val(&viewport_size),
-                    SpriteInputIndex::ViewportSize as usize,
+                    ptr::NonNull::from(render_target).cast(),
+                    mem::size_of_val(render_target),
+                    SpriteInputIndex::RenderTarget as usize,
                 );
                 command_encoder.setFragmentBuffer_offset_atIndex(
                     Some(&polychrome_sprites.buffer),

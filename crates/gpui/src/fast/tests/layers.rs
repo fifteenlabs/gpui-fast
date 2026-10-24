@@ -55,6 +55,7 @@ fn sp(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
 fn wide_mask() -> ContentMask<ScaledPixels> {
     ContentMask {
         bounds: sp(-10_000., -10_000., 20_000., 20_000.),
+        corner_radii: Default::default(),
     }
 }
 
@@ -130,6 +131,7 @@ fn a_tile_scene_leaves_out_primitives_masked_off_the_tile() {
     content.insert_primitive(Quad {
         content_mask: ContentMask {
             bounds: sp(0., 0., 512., 512.),
+            corner_radii: Default::default(),
         },
         ..quad(sp(500., 100., 40., 10.))
     });
@@ -210,7 +212,7 @@ fn content_in_parts_draws_each_tile_as_one_scene_does() {
                         element_bounds: sp(100., y + 150., 300., 40.),
                         element_corner_radii: Default::default(),
                         inset: 0,
-                        pad: 0,
+                        clip: crate::ClipId::NONE,
                     }
                     .into(),
                 ));
@@ -221,30 +223,13 @@ fn content_in_parts_draws_each_tile_as_one_scene_does() {
 
     let mut whole = Scene::default();
     for operation in rows.iter().flatten() {
-        match operation {
-            PaintOperation::Primitive(primitive) => whole.insert_primitive(primitive.clone()),
-            PaintOperation::StartLayer(bounds) => whole.push_layer(*bounds),
-            PaintOperation::EndLayer => whole.pop_layer(),
-            PaintOperation::FastRoundedClip(clip) => {
-                crate::fast::rounded_clip::record(&mut whole, *clip)
-            }
-        }
+        whole.apply(operation);
     }
     whole.finish();
     let parts = rows.iter().map(|operations| {
         let (_, reach) = part_tile_hashes(operations, 512);
         let mut scene = Scene::default();
-        scene.paint_operations = operations
-            .iter()
-            .map(|operation| match operation {
-                PaintOperation::Primitive(primitive) => {
-                    PaintOperation::Primitive(primitive.clone())
-                }
-                PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
-                PaintOperation::EndLayer => PaintOperation::EndLayer,
-                PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(*clip),
-            })
-            .collect();
+        scene.paint_operations = operations.clone();
         LayerPart {
             bounds: Some(reach.unwrap_or_default()),
             scene: Rc::new(scene),
@@ -285,6 +270,7 @@ fn translation_moves_every_position_a_primitive_carries() {
     let delta = point(ScaledPixels(7.), ScaledPixels(-3.));
     let mask = ContentMask {
         bounds: sp(0., 0., 100., 100.),
+        corner_radii: Default::default(),
     };
     let moved_mask = sp(7., -3., 100., 100.);
     let translate = |primitive: Primitive| translate_primitive(&primitive, delta);
@@ -299,7 +285,7 @@ fn translation_moves_every_position_a_primitive_carries() {
         element_bounds: sp(5., 6., 7., 8.),
         element_corner_radii: Default::default(),
         inset: 0,
-        pad: 0,
+        clip: crate::ClipId::NONE,
     };
     let Primitive::Shadow(moved) = translate(shadow.into()) else {
         unreachable!()
@@ -332,9 +318,6 @@ fn translation_moves_every_position_a_primitive_carries() {
     );
     let mut path = path.scale(1.);
     path.content_mask = mask;
-    for vertex in &mut path.vertices {
-        vertex.content_mask = mask;
-    }
     let bounds = path.bounds;
     let Primitive::Path(moved) = translate(path.into()) else {
         unreachable!()
@@ -355,18 +338,12 @@ fn translation_moves_every_position_a_primitive_carries() {
         moved
             .vertices
             .iter()
-            .all(|v| v.content_mask.bounds == moved_mask)
-    );
-    assert!(
-        moved
-            .vertices
-            .iter()
             .all(|v| v.st_position == point(0., 1.))
     );
 
     let underline = Underline {
         order: 0,
-        pad: 0,
+        clip: crate::ClipId::NONE,
         bounds: sp(1., 2., 3., 4.),
         content_mask: mask,
         color: Hsla::red(),
@@ -392,7 +369,7 @@ fn translation_moves_every_position_a_primitive_carries() {
     };
     let mono = MonochromeSprite {
         order: 0,
-        pad: 0,
+        clip: crate::ClipId::NONE,
         bounds: sp(1., 2., 3., 4.),
         content_mask: mask,
         color: Hsla::red(),
@@ -423,7 +400,7 @@ fn translation_moves_every_position_a_primitive_carries() {
 
     let subpixel = SubpixelSprite {
         order: 0,
-        pad: 0,
+        clip: crate::ClipId::NONE,
         bounds: sp(1., 2., 3., 4.),
         content_mask: mask,
         color: Hsla::red(),
@@ -439,7 +416,7 @@ fn translation_moves_every_position_a_primitive_carries() {
 
     let poly = PolychromeSprite {
         order: 0,
-        pad: 0,
+        clip: crate::ClipId::NONE,
         grayscale: false.into(),
         opacity: 1.,
         bounds: sp(1., 2., 3., 4.),
@@ -619,6 +596,7 @@ mod paint {
             bounds,
             content_mask: ContentMask {
                 bounds: sp(-10_000., -10_000., 20_000., 20_000.),
+                corner_radii: Default::default(),
             },
             background: color.into(),
             ..Default::default()
@@ -728,7 +706,10 @@ mod paint {
     fn a_primitive_moved_by_whole_tiles_hashes_like_its_old_tile() {
         // Its mask moves with it, so it draws the same pixels in its tile.
         let at = |bounds: Bounds<ScaledPixels>| Quad {
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask {
+                bounds,
+                corner_radii: Default::default(),
+            },
             ..quad(bounds, Hsla::red())
         };
         let a = tile_hashes(&scene(&[at(sp(10., 10., 20., 20.))]), 512, region());
@@ -743,11 +724,17 @@ mod paint {
         let masked = |mask: Bounds<ScaledPixels>| {
             [
                 Quad {
-                    content_mask: ContentMask { bounds: mask },
+                    content_mask: ContentMask {
+                        bounds: mask,
+                        corner_radii: Default::default(),
+                    },
                     ..quad(sp(10., 10., 20., 900.), Hsla::red())
                 },
                 Quad {
-                    content_mask: ContentMask { bounds: mask },
+                    content_mask: ContentMask {
+                        bounds: mask,
+                        corner_radii: Default::default(),
+                    },
                     ..quad(sp(600., 10., 20., 900.), Hsla::blue())
                 },
             ]
@@ -1178,6 +1165,7 @@ mod paint {
         let clipped = Quad {
             content_mask: ContentMask {
                 bounds: sp(0., 0., 1000., 200.),
+                corner_radii: Default::default(),
             },
             ..panel
         };
@@ -1666,7 +1654,7 @@ mod footprints {
             element_bounds: sp(400., 100., 100., 100.),
             element_corner_radii: Default::default(),
             inset: 0,
-            pad: 0,
+            clip: crate::ClipId::NONE,
         }
     }
 
@@ -1675,7 +1663,7 @@ mod footprints {
         // around its centre (475, 135): its corners reach x = 524.5.
         MonochromeSprite {
             order: 0,
-            pad: 0,
+            clip: crate::ClipId::NONE,
             bounds: sp(440., 100., 70., 70.),
             content_mask: wide_mask(),
             color,
@@ -1735,6 +1723,7 @@ mod footprints {
         let masked = |color| Shadow {
             content_mask: crate::ContentMask {
                 bounds: sp(0., 0., 512., 512.),
+                corner_radii: Default::default(),
             },
             ..shadow(color)
         };

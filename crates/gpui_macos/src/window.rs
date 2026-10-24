@@ -12,10 +12,10 @@ use gpui::{
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
-    PromisedFile, PromisedFiles,
+    PlatformInputHandler, PlatformWindow, Point, PromisedFile, PromisedFiles, PromptButton,
+    PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
+    WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1045,7 +1045,7 @@ impl MacWindow {
                 // corners. A popup drawing its own surfaces on a transparent
                 // background has no chrome to hide them behind, so the frame
                 // shows up as an outline around empty space.
-                style_mask = NSWindowStyleMask::NSBorderlessWindowMask;
+                style_mask = NSWindowStyleMask::Borderless;
             } else {
                 style_mask = NSWindowStyleMask::Titled | NSWindowStyleMask::FullSizeContentView;
             }
@@ -1304,7 +1304,7 @@ impl MacWindow {
                 // AppKit shadows the window's frame, not what's drawn in it, so
                 // a transparent window laying out its own floating surfaces
                 // gets a shadow around the empty space between them too.
-                let _: () = msg_send![native_window, setHasShadow: NO];
+                let _: () = msg_send![native_window, setHasShadow: Bool::NO];
             }
 
             if allows_automatic_window_tabbing

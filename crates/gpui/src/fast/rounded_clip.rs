@@ -214,19 +214,6 @@ pub(crate) fn record(scene: &mut Scene, operation: ClipOperation) {
         .push(crate::scene::PaintOperation::FastRoundedClip(operation));
 }
 
-pub(crate) fn track(operation: ClipOperation, active: &mut Vec<Shape>) -> anyhow::Result<()> {
-    match operation {
-        ClipOperation::Begin(shape) => active.push(shape),
-        ClipOperation::End => {
-            anyhow::ensure!(
-                active.pop().is_some(),
-                "source scene closes a rounded clip that is not open"
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(any(test, feature = "test-support"))]
 impl Window {
     /// The complete rendered scene, including clip scopes and scroll layers,
@@ -269,7 +256,10 @@ mod tests {
         let bounds = shape().bounds;
         Quad {
             bounds,
-            content_mask: crate::ContentMask { bounds },
+            content_mask: crate::ContentMask {
+                bounds,
+                corner_radii: Default::default(),
+            },
             ..Default::default()
         }
     }
@@ -457,6 +447,47 @@ mod tests {
             crate::fast::layers::tiles::part_tile_hashes(&scene.paint_operations, 32).0
         };
         assert_ne!(hashes(&original), hashes(&changed));
+    }
+
+    #[test]
+    fn rounded_clips_compile_to_groups_in_a_scene_without_clip_paths() {
+        let mut scene = Scene::default();
+        record(&mut scene, ClipOperation::Begin(shape()));
+        scene.insert_primitive(quad());
+        record(&mut scene, ClipOperation::End);
+        scene.finish();
+        assert!(scene.clips.is_empty());
+        assert_eq!(scene.polychrome_sprites.len(), 1);
+        assert!(scene.quads.is_empty());
+    }
+
+    #[test]
+    fn rounded_clips_lower_to_clip_paths_in_a_scene_with_clip_paths() {
+        let mut scene = Scene::default();
+        let outline = crate::ClipPath::rounded_rect(
+            Bounds::new(point(px(0.), px(0.)), size(px(32.), px(32.))),
+            Corners::all(px(4.)).map(|radius| size(*radius, *radius)),
+        )
+        .scale(1.);
+        let visible = outline.bounds();
+        scene.push_clip(outline, visible);
+        record(&mut scene, ClipOperation::Begin(shape()));
+        scene.insert_primitive(quad());
+        record(&mut scene, ClipOperation::End);
+        scene.pop_clip();
+        let recorded = scene.paint_operations.len();
+        scene.finish();
+
+        // No rounded clip group: the quad is drawn in the frame's own pass,
+        // clipped by the rounded clip as the innermost of two clip paths.
+        assert!(scene.polychrome_sprites.is_empty());
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(scene.clips.len(), 2);
+        let inner = scene.clip(scene.quads[0].clip).unwrap();
+        assert_eq!(inner.path.bounds(), shape().bounds);
+        assert!(scene.clip(inner.parent).is_some());
+        // The recorded operations stay as painted, for retained replay.
+        assert_eq!(scene.paint_operations.len(), recorded);
     }
 
     #[test]

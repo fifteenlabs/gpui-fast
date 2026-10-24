@@ -75,10 +75,14 @@ pub(crate) fn split(
     }
     // A lifted primitive cannot carry scope markers. Keep scoped paths in
     // their recorded scene and use the retained paint replay path instead.
-    if operations
-        .iter()
-        .any(|operation| matches!(operation, PaintOperation::FastRoundedClip(_)))
-    {
+    if operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PaintOperation::FastRoundedClip(_)
+                | PaintOperation::PushClip(..)
+                | PaintOperation::StartGroup(_)
+        )
+    }) {
         return None;
     }
     // Every primitive in the order the renderer draws them: by draw order,
@@ -114,12 +118,7 @@ pub(crate) fn split(
         .iter()
         .zip(&in_overlay)
         .filter(|(_, in_overlay)| !**in_overlay)
-        .map(|(operation, _)| match operation {
-            PaintOperation::Primitive(primitive) => PaintOperation::Primitive(primitive.clone()),
-            PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
-            PaintOperation::EndLayer => PaintOperation::EndLayer,
-            PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(*clip),
-        })
+        .map(|(operation, _)| operation.clone())
         .collect();
     Some((tiles, overlay))
 }
@@ -131,15 +130,8 @@ pub(crate) fn lift(content: Scene) -> (Scene, Rc<[Primitive]>) {
         return (content, Rc::from([]));
     };
     let mut rest = Scene::default();
-    for operation in tiles {
-        match operation {
-            PaintOperation::Primitive(primitive) => rest.insert_primitive(primitive),
-            PaintOperation::StartLayer(bounds) => rest.push_layer(bounds),
-            PaintOperation::EndLayer => rest.pop_layer(),
-            PaintOperation::FastRoundedClip(clip) => {
-                crate::fast::rounded_clip::record(&mut rest, clip)
-            }
-        }
+    for operation in &tiles {
+        rest.apply(operation);
     }
     rest.finish();
     (rest, overlay.into())

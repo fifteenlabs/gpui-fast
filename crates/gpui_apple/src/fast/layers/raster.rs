@@ -19,7 +19,8 @@ use std::ptr;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    DevicePixels, LayerKey, PrimitiveBatch, Rgba, Scene, TileCoord, decode_layer_tile, size,
+    ClipPlan, DevicePixels, LayerKey, PrimitiveBatch, Rgba, Scene, TileCoord, decode_layer_tile,
+    size,
 };
 use objc2::{Message as _, runtime::ProtocolObject};
 use objc2_core_foundation::CFRetained;
@@ -31,8 +32,8 @@ use objc2_metal::{
 };
 
 use crate::metal_renderer::{
-    InstanceBindings, InstanceBufferWriter, MetalRenderer, SurfaceBounds,
-    new_command_encoder_for_texture,
+    InstanceBindings, InstanceBufferWriter, MetalRenderer, RenderTarget,
+    new_command_encoder_for_texture, write_instances,
 };
 
 /// The pixel format of tiles: the drawable's and every pipeline's.
@@ -130,21 +131,23 @@ fn encode(
             )?;
             continue;
         }
-        let bindings = match write_instances(&tile_scene, &mut writer) {
+        // The core keeps content that pushes a clip path or an isolated group
+        // out of layers, so a tile clips nothing and draws in one pass.
+        let bindings = match write_instances(&tile_scene, &ClipPlan::unclipped(), &mut writer) {
             Ok(bindings) => bindings,
             Err(error) => {
                 result = Err(error);
                 break;
             }
         };
-        let viewport_size = size(
+        let render_target = RenderTarget::whole(size(
             DevicePixels(layer.tile_size as i32),
             DevicePixels(layer.tile_size as i32),
-        );
+        ));
         let command_encoder = match new_command_encoder_for_texture(
             &command_buffer,
             &texture,
-            viewport_size,
+            render_target,
             Some(clear_color(layer.background)),
         ) {
             Ok(command_encoder) => command_encoder,
@@ -157,7 +160,7 @@ fn encode(
             renderer,
             &tile_scene,
             &bindings,
-            viewport_size,
+            &render_target,
             &command_encoder,
             &mut surface_textures,
         );
@@ -206,64 +209,50 @@ fn encode(
     Ok(())
 }
 
-/// Writes a tile scene's instance data, as upstream's `write_instances` does
-/// for a frame.
-fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
-    Ok(InstanceBindings {
-        quads: writer.write(&scene.quads)?,
-        shadows: writer.write(&scene.shadows)?,
-        underlines: writer.write(&scene.underlines)?,
-        monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
-        polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
-        surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
-            bounds: surface.bounds,
-            content_mask: surface.content_mask,
-        }))?,
-    })
-}
-
 /// Draws a tile scene's batches with the renderer's pipelines, as upstream's
 /// `draw_primitives_to_texture` draws a frame without paths.
 fn draw_tile_scene(
     renderer: &mut MetalRenderer,
     scene: &Scene,
     bindings: &InstanceBindings,
-    viewport_size: gpui::Size<DevicePixels>,
+    render_target: &RenderTarget,
     command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
 ) -> Result<()> {
     for batch in scene.batches() {
         match batch {
             PrimitiveBatch::Shadows(range) => {
-                renderer.draw_shadows(range, bindings, viewport_size, command_encoder)
+                renderer.draw_shadows(range, false, bindings, render_target, command_encoder)
             }
             PrimitiveBatch::Quads(range) => {
-                renderer.draw_quads(range, bindings, viewport_size, command_encoder)
+                renderer.draw_quads(range, false, bindings, render_target, command_encoder)
             }
             PrimitiveBatch::Underlines(range) => {
-                renderer.draw_underlines(range, bindings, viewport_size, command_encoder)
+                renderer.draw_underlines(range, false, bindings, render_target, command_encoder)
             }
             PrimitiveBatch::MonochromeSprites { texture_id, range } => renderer
                 .draw_monochrome_sprites(
                     texture_id,
                     range,
+                    false,
                     bindings,
-                    viewport_size,
+                    render_target,
                     command_encoder,
                 ),
             PrimitiveBatch::PolychromeSprites { texture_id, range } => renderer
                 .draw_polychrome_sprites(
                     texture_id,
                     range,
+                    false,
                     bindings,
-                    viewport_size,
+                    render_target,
                     command_encoder,
                 ),
             PrimitiveBatch::Surfaces(range) => renderer.draw_surfaces(
                 &scene.surfaces[range.clone()],
                 range.start,
                 bindings,
-                viewport_size,
+                render_target,
                 command_encoder,
                 surface_textures,
             )?,

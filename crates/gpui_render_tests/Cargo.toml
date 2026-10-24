@@ -26,7 +26,7 @@ gpui = { workspace = true, features = ["test-support"] }
 # A surface primitive is a `CVPixelBuffer`, so a test that paints one has to be
 # able to make one. These are the same versions gpui itself takes, so the type
 # a test builds is the type `Window::paint_surface` accepts.
-core-foundation.workspace = true
-core-video.workspace = true
+objc2-core-foundation = { workspace = true, features = ["CFDictionary"] }
+objc2-core-video = { workspace = true, features = ["CVBase", "CVPixelBuffer", "CVReturn"] }
 gpui_macos = { workspace = true, features = ["font-kit"] }
 gpui_platform = { workspace = true, features = ["test-support"] }

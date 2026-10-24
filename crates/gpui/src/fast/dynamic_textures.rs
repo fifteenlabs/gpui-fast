@@ -354,11 +354,13 @@ pub(crate) fn paint(
     // texture id — the dynamic range the renderer checks first — and never
     // looks the tile up by id in the atlas, so the tile id here only needs
     // to be stable within the scene; it must never be used to reach the
-    // sprite atlas.
+    // sprite atlas. No shader reads a tile's padding, so it carries the
+    // texture's content version, which the scroll-layer tile hash covers: a
+    // refreshed texture dirties the tiles showing it.
     let tile = AtlasTile {
         texture_id: texture.id.atlas_texture_id(),
         tile_id: TileId(texture.id.0),
-        padding: 0,
+        padding: painted_version(texture.id),
         bounds: Bounds {
             origin: point(DevicePixels(0), DevicePixels(0)),
             size: texture_size,
@@ -366,7 +368,7 @@ pub(crate) fn paint(
     };
     window.next_frame.scene.insert_primitive(PolychromeSprite {
         order: 0,
-        pad: painted_version(texture.id),
+        clip: crate::ClipId::NONE,
         grayscale: false.into(),
         bounds: window.snap_bounds(bounds),
         content_mask: window.snapped_content_mask(),
@@ -844,16 +846,16 @@ mod tests {
 
     /// A scene holding the texture painted over `region`'s tiles, the way
     /// [`paint`] would build it: the version the texture carries at paint
-    /// time rides in the sprite's pad.
-    fn scene_with_texture(texture: DynamicTexture, pad: u32) -> Scene {
+    /// time rides in the tile's padding.
+    fn scene_with_texture(texture: DynamicTexture, version: u32) -> Scene {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad,
+            clip: crate::ClipId::NONE,
             tile: AtlasTile {
                 texture_id: texture.id.atlas_texture_id(),
                 tile_id: TileId(texture.id.0),
-                padding: 0,
+                padding: version,
                 bounds: Bounds {
                     origin: point(DevicePixels(0), DevicePixels(0)),
                     size: texture.size,
@@ -865,12 +867,10 @@ mod tests {
                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
                 size: size(ScaledPixels(64.), ScaledPixels(64.)),
             },
-            content_mask: ContentMask {
-                bounds: Bounds {
-                    origin: point(ScaledPixels(0.), ScaledPixels(0.)),
-                    size: size(ScaledPixels(128.), ScaledPixels(128.)),
-                },
-            },
+            content_mask: ContentMask::new(Bounds {
+                origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                size: size(ScaledPixels(128.), ScaledPixels(128.)),
+            }),
             corner_radii: Default::default(),
         });
         scene
