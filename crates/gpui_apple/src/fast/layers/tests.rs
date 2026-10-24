@@ -181,7 +181,7 @@ fn a_composited_layer_equals_direct_drawing() {
 }
 
 /// A path the frame draws over a layer, outside it, as the core draws paths
-/// that nothing covers.
+/// that nothing covers: the frame then rasterizes it in `fast::paths`'s groups.
 #[test]
 fn a_path_over_a_composited_layer_equals_direct_drawing() {
     let Some(mut harness) = Harness::new() else {

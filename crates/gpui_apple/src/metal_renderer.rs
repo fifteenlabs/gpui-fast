@@ -925,6 +925,22 @@ impl MetalRenderer {
         self.group_targets.begin_frame();
         self.filter_scratch.begin_frame();
 
+        // The first group of path batches is rasterized before the first pass
+        // begins, which saves ending that pass for it.
+        let path_batches = crate::fast::paths::plan(scene);
+        if let Some(group) = path_batches.first().and_then(|batch| batch.group.clone()) {
+            crate::fast::paths::rasterize_group(
+                self,
+                scene,
+                &path_batches[group],
+                instance_bindings,
+                writer,
+                viewport_size,
+                command_buffer,
+            )?;
+        }
+        let mut next_path_batch = 0;
+
         // The scene is walked as steps rather than as batches so that a group
         // boundary can end one render pass and begin another. A scene with no
         // groups in it is one step of one run, which is the same batches in the
@@ -1013,41 +1029,48 @@ impl MetalRenderer {
                         )
                     }
                     PrimitiveBatch::Paths(range) => {
-                        let paths = &scene.paths[range];
-                        let clipped = paths.first().is_some_and(|path| path.clip.is_clipped());
-                        command_encoder.end_encoding();
+                        if range.is_empty() {
+                            continue;
+                        }
+                        let index = next_path_batch;
+                        next_path_batch += 1;
+                        let path_batch = &path_batches[index];
+                        debug_assert_eq!(path_batch.paths, range);
 
                         // Paths are rasterized into a window-sized intermediate
-                        // whatever target they are on their way to, so this
+                        // whatever target they are on their way to, so that
                         // pass keeps the viewport it always had; only the copy
                         // out of it lands on the group.
-                        let did_draw = self.draw_paths_to_intermediate(
-                            paths,
-                            clipped,
-                            instance_bindings,
-                            writer,
-                            viewport_size,
-                            command_buffer,
-                        )?;
-
-                        command_encoder = new_command_encoder_for_texture(
-                            command_buffer,
-                            &target.texture,
-                            target.render_target,
-                            None,
-                        );
-
-                        if did_draw {
-                            if let Err(error) = self.draw_paths_from_intermediate(
-                                paths,
+                        if index > 0
+                            && let Some(group) = path_batch.group.clone()
+                        {
+                            command_encoder.end_encoding();
+                            crate::fast::paths::rasterize_group(
+                                self,
+                                scene,
+                                &path_batches[group],
+                                instance_bindings,
                                 writer,
-                                &target.render_target,
                                 viewport_size,
-                                command_encoder,
-                            ) {
-                                command_encoder.end_encoding();
-                                return Err(error);
-                            }
+                                command_buffer,
+                            )?;
+                            command_encoder = new_command_encoder_for_texture(
+                                command_buffer,
+                                &target.texture,
+                                target.render_target,
+                                None,
+                            );
+                        }
+
+                        if let Err(error) = self.draw_paths_from_intermediate(
+                            &scene.paths[range],
+                            writer,
+                            &target.render_target,
+                            viewport_size,
+                            command_encoder,
+                        ) {
+                            command_encoder.end_encoding();
+                            return Err(error);
                         }
                     }
                     PrimitiveBatch::Underlines(range) => {
@@ -1716,11 +1739,61 @@ impl MetalRenderer {
         if paths.is_empty() {
             return Ok(false);
         }
+        let command_encoder = self.new_path_rasterization_encoder(command_buffer)?;
+        let rasterized = self.rasterize_paths(
+            paths,
+            clipped,
+            instance_bindings,
+            writer,
+            viewport_size,
+            command_encoder,
+        );
+        command_encoder.end_encoding();
+        rasterized.map(|()| true)
+    }
+
+    /// Begin a pass that clears the path intermediate texture and rasterizes
+    /// into it.
+    pub(crate) fn new_path_rasterization_encoder<'a>(
+        &self,
+        command_buffer: &'a metal::CommandBufferRef,
+    ) -> Result<&'a metal::RenderCommandEncoderRef> {
         let intermediate_texture = self
             .path_intermediate_texture
             .as_ref()
             .context("missing path intermediate texture")?;
 
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+
+        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+            color_attachment.set_texture(Some(msaa_texture));
+            color_attachment.set_resolve_texture(Some(intermediate_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
+        } else {
+            color_attachment.set_texture(Some(intermediate_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        }
+
+        Ok(command_buffer.new_render_command_encoder(render_pass_descriptor))
+    }
+
+    /// Rasterize one path batch into the intermediate texture, in a pass begun
+    /// by `new_path_rasterization_encoder`.
+    pub(crate) fn rasterize_paths(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        clipped: bool,
+        instance_bindings: &InstanceBindings,
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
         let mut vertices = Vec::new();
         let mut content_masks = Vec::with_capacity(paths.len());
         // The clip id rides in the same per-path side buffer the content mask
@@ -1785,24 +1858,6 @@ impl MetalRenderer {
         }
         let brush_bindings = writer.write(&brushes)?;
 
-        let render_pass_descriptor = metal::RenderPassDescriptor::new();
-        let color_attachment = render_pass_descriptor
-            .color_attachments()
-            .object_at(0)
-            .unwrap();
-        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
-
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
-            color_attachment.set_texture(Some(msaa_texture));
-            color_attachment.set_resolve_texture(Some(intermediate_texture));
-            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
-        } else {
-            color_attachment.set_texture(Some(intermediate_texture));
-            color_attachment.set_store_action(metal::MTLStoreAction::Store);
-        }
-
-        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         let clip = self.clip_variant(clipped);
         command_encoder.set_render_pipeline_state(
             self.pipeline_for(PrimitivePipeline::PathsRasterization, clip),
@@ -1878,9 +1933,7 @@ impl MetalRenderer {
                 run.vertices.end - run.vertices.start,
             );
         }
-
-        command_encoder.end_encoding();
-        Ok(true)
+        Ok(())
     }
 
     pub(crate) fn draw_shadows(

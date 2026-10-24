@@ -40,11 +40,13 @@ own hooks to its rules.
 - Paths take the content mask snapped to device pixels, as quads do, so a scroll
   layer clips them to the snapped viewport too.
 - Metal frames always take the frame encoder that handles clip masks and group
-  targets. gpui-fast's grouping of path batches into fewer render passes is not
-  carried.
+  targets, and that encoder takes gpui-fast's grouping of path batches into
+  fewer render passes (`fast::paths`). A group may span an isolated group's
+  start or end, since paths are rasterized into the window-sized intermediate
+  whatever target they are composited onto.
 
 ## Taking a new gpui-fast
 
 Merge gpui-fast's `main` into `fifteen`, then run
 `cargo test -p gpui --features test-support`, `script/check-upstream`, and on a
-Mac `cargo test -p gpui_apple fast::layers` and `cargo test -p gpui_render_tests`.
+Mac `cargo test -p gpui_apple fast::` and `cargo test -p gpui_render_tests`.
