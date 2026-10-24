@@ -75,3 +75,55 @@ fn a_subtree_built_again_reading_the_same_takes_the_list_it_had() {
         );
     }
 }
+
+/// A view can read an entity it does not hold, as a store's view reads an
+/// entry the store holds. Taking the entry out and notifying it draws the
+/// view again, though the entry is released before the window draws, and the
+/// released entry is forgotten once the window has drawn.
+#[test]
+fn a_view_that_read_an_entity_released_since_is_built_again() {
+    use crate::{
+        AppContext as _, Context, Entity, IntoElement, Render, TestAppContext, Window, div,
+    };
+    use std::cell::RefCell;
+
+    struct Value(u32);
+    type Held = Rc<RefCell<Option<Entity<Value>>>>;
+    struct Probe {
+        held: Held,
+        seen: Rc<RefCell<Vec<Option<u32>>>>,
+    }
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let value = self.held.borrow().clone();
+            self.seen
+                .borrow_mut()
+                .push(value.map(|value| value.read(cx).0));
+            div()
+        }
+    }
+
+    let mut cx = TestAppContext::single();
+    let held: Held = Rc::default();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|cx| *held.borrow_mut() = Some(cx.new(|_| Value(1))));
+    cx.add_window({
+        let held = held.clone();
+        let seen = seen.clone();
+        move |_, _| Probe { held, seen }
+    });
+    cx.run_until_parked();
+    assert_eq!(seen.borrow().last(), Some(&Some(1)));
+
+    cx.update(|cx| {
+        let value = held.borrow_mut().take().expect("the value is held");
+        value.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    assert_eq!(seen.borrow().last(), Some(&None));
+    assert_eq!(
+        cx.update(|cx| crate::fast::dependencies::released_count(cx)),
+        0,
+        "the released value is forgotten once the window has drawn"
+    );
+}
