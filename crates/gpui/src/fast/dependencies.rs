@@ -620,6 +620,9 @@ pub(crate) struct EntityAccessLog {
     /// The entity being asked something through [`Entity::query`], whose
     /// update is not counted as a change unless it notifies.
     queried: Option<EntityId>,
+    /// Released entities a window still displayed, kept in `changed_at`
+    /// until no window does. See [`note_released`].
+    released: Vec<EntityId>,
 }
 
 impl EntityAccessLog {
@@ -733,6 +736,55 @@ pub(crate) fn note_access(entities: &EntityMap, entity_id: EntityId) {
         }
         log.push(entity_id);
     }
+}
+
+/// Records that `entity_id`, which a window displayed, has been released: a
+/// retained subtree that read it is built again, as one that read a changed
+/// entity is. Its stamp, which releasing it forgot, is kept until no window
+/// displays it any more, which is once each window that did has drawn again.
+///
+/// A view can read an entity it does not hold, as a store's view reads an
+/// entry the store holds: when the store removes the entry and notifies it,
+/// the entity is released before the window draws, and its notification
+/// would otherwise be forgotten with it.
+pub(crate) fn note_released(cx: &mut App, entity_id: EntityId) {
+    if !cx
+        .tracked_entities
+        .values()
+        .any(|tracked| tracked.contains(&entity_id))
+    {
+        return;
+    }
+    let log = &mut cx.entities.access_log;
+    log.stamp_changed(entity_id);
+    log.released.push(entity_id);
+}
+
+/// Forgets the stamps of released entities that no window displays any more,
+/// as a window records what it drew.
+pub(crate) fn forget_released(cx: &mut App) {
+    let EntityAccessLog {
+        released,
+        changed_at,
+        ..
+    } = &mut cx.entities.access_log;
+    if released.is_empty() {
+        return;
+    }
+    let tracked = &cx.tracked_entities;
+    released.retain(|entity_id| {
+        let displayed = tracked.values().any(|tracked| tracked.contains(entity_id));
+        if !displayed {
+            changed_at.remove(entity_id);
+        }
+        displayed
+    });
+}
+
+/// How many released entities are still stamped as changed.
+#[cfg(test)]
+pub(crate) fn released_count(cx: &App) -> usize {
+    cx.entities.access_log.released.len()
 }
 
 /// Records that `entity_id` is notified. A notification that follows an
