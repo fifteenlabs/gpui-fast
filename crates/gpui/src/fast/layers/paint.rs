@@ -26,7 +26,7 @@ use crate::{
             record::LayerRecord,
             scene::{
                 LayerContent, LayerFrame, LayerKey, decode_layer_tile, layer_tile_id,
-                layer_tile_texture_id, translate_primitive, visible_bounds,
+                layer_tile_texture_id, translate_operation, translate_primitive, visible_bounds,
             },
             tiles::{dirty_tiles, tile_hashes},
         },
@@ -238,6 +238,7 @@ fn begin_scrolling_children(
             // whatever clips it; the composite clips to those.
             window.content_mask_stack.push(ContentMask {
                 bounds: painted_region,
+                corner_radii: Default::default(),
             });
         }
     }
@@ -430,12 +431,12 @@ pub(crate) fn composite_at(
             let record = layer.record.take().expect("checked above");
             crate::fast::layers::policy::defer_unbaked(window, id);
             draw_into_frame(window, record.content.operations(), translation);
-            let viewports = viewports(window);
+            let viewport = window.snapped_content_mask();
             insert_overlay(
                 &mut window.next_frame.scene,
                 &record.overlay,
                 translation,
-                viewports,
+                viewport,
             );
             return;
         }
@@ -454,7 +455,7 @@ pub(crate) fn insert_layer(
     translation: Point<ScaledPixels>,
     dirtied: usize,
 ) {
-    let viewport = window.snapped_content_mask().bounds;
+    let viewport = window.snapped_content_mask();
     let Some(layer) = window.fast_layers.layers.get(id) else {
         return;
     };
@@ -463,10 +464,9 @@ pub(crate) fn insert_layer(
     };
     if layer.rows.list {
         let content = record.content.clone();
-        let viewport = viewports(window).snapped;
         let in_content = Bounds {
-            origin: viewport.origin - translation,
-            size: viewport.size,
+            origin: viewport.bounds.origin - translation,
+            size: viewport.bounds.size,
         };
         draw_into_frame(window, content.operations_over(in_content), translation);
         let stats = &mut window.layout_engine.as_mut().unwrap().retention.stats;
@@ -479,13 +479,12 @@ pub(crate) fn insert_layer(
         draw_into_frame(window, content.operations(), translation);
         return;
     }
-    let viewports = viewports(window);
     insert_tile_quads(&mut window.next_frame.scene, layer, viewport, translation);
     insert_overlay(
         &mut window.next_frame.scene,
         &record.overlay,
         translation,
-        viewports,
+        viewport,
     );
     let stats = &mut window.layout_engine.as_mut().unwrap().retention.stats;
     stats.layer_frames_composited += 1;
@@ -500,12 +499,13 @@ pub(crate) fn insert_layer(
 pub(crate) fn insert_tile_quads(
     scene: &mut Scene,
     layer: &Layer,
-    viewport: Bounds<ScaledPixels>,
+    viewport_mask: ContentMask<ScaledPixels>,
     translation: Point<ScaledPixels>,
 ) {
     let Some(record) = layer.record.as_ref() else {
         return;
     };
+    let viewport = viewport_mask.bounds;
     if viewport.is_empty() {
         return;
     }
@@ -540,14 +540,14 @@ pub(crate) fn insert_tile_quads(
             let tile = frame.tile_bounds(coord);
             scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                clip: crate::ClipId::NONE,
                 grayscale: false.into(),
                 opacity: 1.,
                 bounds: Bounds {
                     origin: tile.origin + translation,
                     size: tile.size,
                 },
-                content_mask: ContentMask { bounds: viewport },
+                content_mask: viewport_mask,
                 corner_radii: Corners::default(),
                 tile: AtlasTile {
                     texture_id,
@@ -575,29 +575,12 @@ fn insert_overlay(
     scene: &mut Scene,
     overlay: &[Primitive],
     translation: Point<ScaledPixels>,
-    viewports: Viewports,
+    viewport: ContentMask<ScaledPixels>,
 ) {
     for primitive in overlay {
         let mut primitive = translate_primitive(primitive, translation);
-        clip_primitive(&mut primitive, viewports);
+        clip_primitive(&mut primitive, &viewport);
         scene.insert_primitive(primitive);
-    }
-}
-
-/// The viewport content drawn into the frame is clipped to: the current
-/// content mask, snapped to device pixels as the frame snaps every
-/// primitive's but a path's, and on [`snap_path`]'s grid, as
-/// `Window::paint_path` takes it, for paths.
-#[derive(Clone, Copy)]
-struct Viewports {
-    snapped: Bounds<ScaledPixels>,
-    exact: Bounds<ScaledPixels>,
-}
-
-fn viewports(window: &Window) -> Viewports {
-    Viewports {
-        snapped: window.snapped_content_mask().bounds,
-        exact: snap_bounds(window.content_mask().bounds.scale(window.scale_factor())),
     }
 }
 
@@ -765,15 +748,14 @@ pub(crate) fn draw_into_frame<'a>(
     operations: impl IntoIterator<Item = &'a PaintOperation>,
     delta: Point<ScaledPixels>,
 ) {
-    let viewports = viewports(window);
-    let viewport = viewports.snapped;
+    let viewport = window.snapped_content_mask();
     let scene = &mut window.next_frame.scene;
     // A split quad's pieces are inserted together, as they were painted.
     let mut quads = crate::fast::scene::QuadRun::default();
     for operation in operations {
         if let PaintOperation::Primitive(primitive @ Primitive::Quad(_)) = operation {
             let mut primitive = translate_primitive(primitive, delta);
-            clip_primitive(&mut primitive, viewports);
+            clip_primitive(&mut primitive, &viewport);
             if let Primitive::Quad(quad) = primitive {
                 quads.push(scene, quad);
             }
@@ -783,7 +765,7 @@ pub(crate) fn draw_into_frame<'a>(
         match operation {
             PaintOperation::Primitive(primitive) => {
                 let mut primitive = translate_primitive(primitive, delta);
-                clip_primitive(&mut primitive, viewports);
+                clip_primitive(&mut primitive, &viewport);
                 scene.insert_primitive(primitive);
             }
             PaintOperation::StartLayer(bounds) => {
@@ -791,37 +773,43 @@ pub(crate) fn draw_into_frame<'a>(
                     origin: bounds.origin + delta,
                     size: bounds.size,
                 };
-                scene.push_layer(bounds.intersect(&viewport));
+                scene.push_layer(bounds.intersect(&viewport.bounds));
             }
-            PaintOperation::EndLayer => scene.pop_layer(),
-            PaintOperation::FastRoundedClip(clip) => {
-                crate::fast::rounded_clip::record(scene, clip.translated(delta))
-            }
+            scope => scene.apply(&translate_operation(scope, delta)),
         }
     }
     quads.flush(scene);
 }
 
-/// Narrows every content mask `primitive` carries to `viewports`.
-fn clip_primitive(primitive: &mut Primitive, viewports: Viewports) {
-    let mask = match primitive {
-        Primitive::Path(_) => &viewports.exact,
-        _ => &viewports.snapped,
+/// Narrows `primitive`'s content mask to `viewport`, the content mask in
+/// force where the layer is drawn, snapped to device pixels as the frame
+/// snaps every primitive's. Its rounded corners carry over as
+/// [`ContentMask::intersect`] carries them.
+fn clip_primitive(primitive: &mut Primitive, viewport: &ContentMask<ScaledPixels>) {
+    let content_mask = match primitive {
+        Primitive::Shadow(p) => &mut p.content_mask,
+        Primitive::Quad(p) => &mut p.content_mask,
+        Primitive::Path(p) => &mut p.paint.content_mask,
+        Primitive::Underline(p) => &mut p.content_mask,
+        Primitive::MonochromeSprite(p) => &mut p.content_mask,
+        Primitive::SubpixelSprite(p) => &mut p.content_mask,
+        Primitive::PolychromeSprite(p) => &mut p.content_mask,
+        Primitive::Surface(p) => &mut p.content_mask,
+        Primitive::NativeView(p) => &mut p.content_mask,
     };
-    let clip = |content_mask: &mut ContentMask<ScaledPixels>| {
-        content_mask.bounds = content_mask.bounds.intersect(mask);
-    };
-    match primitive {
-        Primitive::Shadow(p) => clip(&mut p.content_mask),
-        Primitive::Quad(p) => clip(&mut p.content_mask),
-        Primitive::Path(p) => p.clip_content_mask(mask),
-        Primitive::Underline(p) => clip(&mut p.content_mask),
-        Primitive::MonochromeSprite(p) => clip(&mut p.content_mask),
-        Primitive::SubpixelSprite(p) => clip(&mut p.content_mask),
-        Primitive::PolychromeSprite(p) => clip(&mut p.content_mask),
-        Primitive::Surface(p) => clip(&mut p.content_mask),
-        Primitive::NativeView(p) => clip(&mut p.content_mask),
+    if viewport.corner_radii == Corners::default()
+        && content_mask.corner_radii == Corners::default()
+    {
+        content_mask.bounds = content_mask.bounds.intersect(&viewport.bounds);
+        return;
     }
+    let logical = |mask: &ContentMask<ScaledPixels>| ContentMask {
+        bounds: mask.bounds.map(|value| crate::px(value.0)),
+        corner_radii: mask.corner_radii.map(|value| crate::px(value.0)),
+    };
+    *content_mask = logical(content_mask)
+        .intersect(&logical(viewport))
+        .scale(1.);
 }
 
 /// Every tile of `hashes`, sorted.
@@ -841,6 +829,7 @@ fn repaint(
 ) {
     window.content_mask_stack.push(ContentMask {
         bounds: painting.painted_region,
+        corner_radii: Default::default(),
     });
     mem::swap(&mut window.next_frame.scene, &mut painting.scene);
     let paint_start = window.paint_index();
@@ -876,10 +865,16 @@ fn repaint(
         size: region.size,
     };
     let (content, overlay) = crate::fast::layers::overlay::lift(content);
-    let has_paths = content
-        .paint_operations
-        .iter()
-        .any(|operation| matches!(operation, PaintOperation::Primitive(Primitive::Path(_))));
+    // A clip path or an isolated group is drawn by the frame's renderer with
+    // the frame's clip masks and group targets, which a tile has neither of.
+    let has_paths = content.paint_operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PaintOperation::Primitive(Primitive::Path(_))
+                | PaintOperation::PushClip(..)
+                | PaintOperation::StartGroup(_)
+        )
+    });
     let mut visible = painting.viewport.scale(scale_factor);
     visible.origin += to_content;
     let mut rendered_work = 0;
@@ -1037,19 +1032,7 @@ pub(crate) fn translation(window: &Window, scroll_offset: Point<Pixels>) -> Poin
 fn translated_scene(scene: &Scene, delta: Point<ScaledPixels>) -> Scene {
     let mut translated = Scene::default();
     for operation in &scene.paint_operations {
-        match operation {
-            PaintOperation::Primitive(primitive) => {
-                translated.insert_primitive(translate_primitive(primitive, delta))
-            }
-            PaintOperation::StartLayer(bounds) => translated.push_layer(Bounds {
-                origin: bounds.origin + delta,
-                size: bounds.size,
-            }),
-            PaintOperation::EndLayer => translated.pop_layer(),
-            PaintOperation::FastRoundedClip(clip) => {
-                crate::fast::rounded_clip::record(&mut translated, clip.translated(delta))
-            }
-        }
+        translated.apply(&translate_operation(operation, delta));
     }
     translated.finish();
     translated

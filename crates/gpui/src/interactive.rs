@@ -929,6 +929,10 @@ impl PlatformInput {
             | PlatformInput::MouseExited(MouseExitEvent { position, .. })
             | PlatformInput::Pinch(PinchEvent { position, .. })
             | PlatformInput::Touch(TouchEvent { position, .. })
+            | PlatformInput::BackGesture(BackGestureEvent {
+                start_position: position,
+                ..
+            })
             | PlatformInput::FileDrop(
                 FileDropEvent::Entered { position, .. }
                 | FileDropEvent::Pending { position }
@@ -946,9 +950,6 @@ impl PlatformInput {
             }) => {
                 *start_position = *start_position / factor;
                 *position = *position / factor;
-            }
-            PlatformInput::BackGesture(BackGestureEvent { start_position, .. }) => {
-                *start_position = *start_position / factor;
             }
             PlatformInput::Scroll(event) => {
                 event.position = event.position / factor;

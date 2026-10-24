@@ -607,6 +607,19 @@ impl Default for GroupSpec {
 }
 
 impl GroupSpec {
+    /// This group moved by `delta`, with what it covers.
+    pub(crate) fn translated(&self, delta: Point<ScaledPixels>) -> Self {
+        let mv = |bounds: Bounds<ScaledPixels>| Bounds {
+            origin: bounds.origin + delta,
+            size: bounds.size,
+        };
+        Self {
+            bounds: mv(self.bounds),
+            mask: self.mask.map(mv),
+            ..self.clone()
+        }
+    }
+
     /// Whether compositing this group is indistinguishable from drawing its
     /// primitives straight onto the target, *given* that nothing inside it
     /// overlaps anything else inside it.
@@ -896,8 +909,11 @@ impl Scene {
     /// of the group and receives none of its opacity, blending or filtering.
     /// It cannot happen through [`crate::Window::with_isolated_group`], which
     /// runs in the paint phase while `defer_draw` is prepaint-only.
-    pub fn push_group(&mut self, spec: GroupSpec) -> GroupId {
+    pub fn push_group(&mut self, mut spec: GroupSpec) -> GroupId {
         self.split_open_layers();
+        // Stamped here for the reason `insert_primitive` stamps primitives: a
+        // replayed group carries the previous frame's clip id.
+        spec.clip = self.current_clip();
         let reopen = self.open_run.clone();
         let steps_len = self.steps.len();
         let segments_len = self.segments.len();
@@ -1496,34 +1512,36 @@ impl Scene {
                 continue;
             }
             quads.flush(self); // fast
-            match operation {
-                PaintOperation::Primitive(primitive) => {
-                    // Animation ids index the scene they were inserted into.
-                    if let Primitive::MonochromeSprite(sprite) = primitive
-                        && let Some(animation) =
-                            prev_scene.animations.get(sprite.animation.0 as usize)
-                    {
-                        self.insert_animated_sprite(*sprite, *animation);
-                    } else {
-                        self.insert_primitive(primitive.clone());
-                    }
-                }
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::FastRoundedClip(fast_clip) => {
-                    crate::fast::rounded_clip::record(self, *fast_clip)
-                }
-                PaintOperation::PushClip(path, visible) => {
-                    self.push_clip(path.clone(), *visible);
-                }
-                PaintOperation::PopClip => self.pop_clip(),
-                PaintOperation::StartGroup(spec) => {
-                    self.push_group(spec.clone());
-                }
-                PaintOperation::EndGroup => self.pop_group(),
+            // Animation ids index the scene they were inserted into.
+            if let PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) = operation
+                && let Some(animation) = prev_scene.animations.get(sprite.animation.0 as usize)
+            {
+                self.insert_animated_sprite(*sprite, *animation);
+                continue;
             }
+            self.apply(operation);
         }
         quads.flush(self); // fast
+    }
+
+    /// Records one paint operation as painting it did.
+    pub(crate) fn apply(&mut self, operation: &PaintOperation) {
+        match operation {
+            PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+            PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+            PaintOperation::EndLayer => self.pop_layer(),
+            PaintOperation::FastRoundedClip(fast_clip) => {
+                crate::fast::rounded_clip::record(self, *fast_clip)
+            }
+            PaintOperation::PushClip(path, visible) => {
+                self.push_clip(path.clone(), *visible);
+            }
+            PaintOperation::PopClip => self.pop_clip(),
+            PaintOperation::StartGroup(spec) => {
+                self.push_group(spec.clone());
+            }
+            PaintOperation::EndGroup => self.pop_group(),
+        }
     }
 
     /// A range of a previous frame's operations is replayed as a unit, so a
@@ -1760,6 +1778,7 @@ impl PrimitiveKind {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
@@ -2349,6 +2368,16 @@ impl TransformationMatrix {
         Bounds::from_corners(top_left, bottom_right)
     }
 
+    /// This transformation applied to a point `delta` back from where it is
+    /// asked about: for something that maps positions on a scene, moving
+    /// what it maps by `delta` without changing what it maps it to.
+    pub fn pretranslated(mut self, delta: Point<ScaledPixels>) -> Self {
+        for (row, translation) in self.rotation_scale.iter().zip(&mut self.translation) {
+            *translation -= row[0] * delta.x.0 + row[1] * delta.y.0;
+        }
+        self
+    }
+
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
@@ -2730,11 +2759,6 @@ impl PaintedPath {
     /// The mask the path is drawn within (gpui-fast composition occluders).
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         &self.paint.content_mask
-    }
-
-    /// Narrows the mask the path is drawn within (gpui-fast layers).
-    pub(crate) fn clip_content_mask(&mut self, mask: &Bounds<ScaledPixels>) {
-        self.paint.content_mask.bounds = self.paint.content_mask.bounds.intersect(mask);
     }
 
     /// Moves the path by `delta` device pixels (gpui-fast layers).
@@ -3561,7 +3585,9 @@ mod fifteen_tests {
         };
         SubpixelSprite {
             order: 0,
+            pad: 0,
             clip: ClipId::NONE,
+            clip_pad: 0,
             bounds,
             content_mask: ContentMask::new(bounds),
             color: opaque(),
@@ -3589,8 +3615,24 @@ mod fifteen_tests {
 
     #[cfg(target_os = "macos")]
     fn surface_at(x: f32) -> PaintSurface {
-        use core_video::pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_32BGRA};
+        use objc2_core_foundation::CFRetained;
+        use objc2_core_video::{CVPixelBufferCreate, kCVPixelFormatType_32BGRA, kCVReturnSuccess};
+        use std::ptr::{self, NonNull};
 
+        let mut image_buffer = ptr::null_mut();
+        // SAFETY: The output pointer is writable and no attributes are passed.
+        let status = unsafe {
+            CVPixelBufferCreate(
+                None,
+                8,
+                8,
+                kCVPixelFormatType_32BGRA,
+                None,
+                NonNull::from(&mut image_buffer),
+            )
+        };
+        assert_eq!(status, kCVReturnSuccess, "failed to create a pixel buffer");
+        let image_buffer = NonNull::new(image_buffer).expect("CoreVideo returned no pixel buffer");
         let bounds = Bounds {
             origin: point(ScaledPixels(x), ScaledPixels(0.)),
             size: size(ScaledPixels(8.), ScaledPixels(8.)),
@@ -3600,8 +3642,8 @@ mod fifteen_tests {
             clip: ClipId::NONE,
             bounds,
             content_mask: ContentMask::new(bounds),
-            image_buffer: CVPixelBuffer::new(kCVPixelFormatType_32BGRA, 8, 8, None)
-                .expect("failed to create a pixel buffer"),
+            // SAFETY: A successful create transfers ownership of the buffer.
+            image_buffer: unsafe { CFRetained::from_raw(image_buffer) },
         }
     }
 

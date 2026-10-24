@@ -84,14 +84,10 @@ fn expand_layer(
                 clip_to(&mut moved, viewport);
                 scratch.insert_primitive(moved);
             }
-            PaintOperation::StartLayer(bounds) => scratch.push_layer(Bounds {
-                origin: bounds.origin + translation,
-                size: bounds.size,
-            }),
-            PaintOperation::EndLayer => scratch.pop_layer(),
-            PaintOperation::FastRoundedClip(clip) => {
-                crate::fast::rounded_clip::record(&mut scratch, clip.translated(translation))
-            }
+            scope => scratch.apply(&crate::fast::layers::scene::translate_operation(
+                scope,
+                translation,
+            )),
         }
     }
     scratch.finish();

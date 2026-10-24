@@ -14,7 +14,6 @@ use gpui::{
     Bounds, ClipId, ComposeMode, DevicePixels, DeviceRect, Extent, FilterOp, GroupFilter,
     GroupSpec, Hsla, MixMode, ScaledPixels, Scene, SceneFilter, Size, TextureBudget, point, size,
 };
-use objc2::Message as _;
 use objc2_foundation::NSString;
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLSize};
 

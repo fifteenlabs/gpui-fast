@@ -8,25 +8,25 @@ use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintedPath, Path,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    ScaledPixels, Scene, Shadow, SharedString, Size, SpriteAnimation, SpriteAnimationId,
-    StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BlendMode, BorderStyle, Bounds,
+    BoxShadow, BrushExtend, Capslock, ClipId, ClipPath, Context, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Gradient, GradientKey, GradientPlan, GroupSpec, Hsla,
+    ImageId, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, MAX_GRADIENT_CACHE_BYTES, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    PaintedPath, Path, PathBrush, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromisedFiles,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, ScaledPixels, Scene, SceneFilter,
+    Shadow, SharedString, Size, SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style,
+    SubpixelSprite, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
-    PromisedFiles, BlendMode, BrushExtend, ClipId, ClipPath, Gradient, GradientKey, GroupSpec,
-    MAX_GRADIENT_CACHE_BYTES, PathBrush, GradientPlan, SceneFilter, ImageId,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -6176,7 +6176,9 @@ impl Window {
             if subpixel_rendering {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
                     order: 0,
+                    pad: 0,
                     clip: ClipId::NONE,
+                    clip_pad: 0,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -11295,6 +11297,7 @@ mod tests {
             let original_opacity = window.element_opacity();
             let mask = ContentMask {
                 bounds: Bounds::from_corners(point(px(4.), px(10.)), point(px(16.), px(12.))),
+                corner_radii: Default::default(),
             };
             let style = UnderlineStyle {
                 thickness: px(2.),
@@ -11593,6 +11596,41 @@ mod tests {
         }
     }
 
+    struct UnderlineTestView(Rc<dyn Fn(&mut Window)>);
+
+    impl Render for UnderlineTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let paint = self.0.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.content_mask_stack.push(ContentMask {
+                        bounds: Bounds::from_corners(
+                            point(px(-1000.), px(-1000.)),
+                            point(px(1000.), px(1000.)),
+                        ),
+                        corner_radii: Default::default(),
+                    });
+                    paint(window);
+                    window.content_mask_stack.pop();
+                },
+            )
+            .size_full()
+        }
+    }
+
+    fn test_underline_paint_at_scales(
+        cx: &mut TestAppContext,
+        paint: impl Fn(&mut Window) + 'static,
+    ) {
+        let window = cx.add_window(move |_, _| UnderlineTestView(Rc::new(paint)));
+        for scale in [1., 1.25, 1.5, 2., 3.] {
+            cx.simulate_window_scale_factor_change(window.into(), scale);
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+    }
+
     fn paint_test_underlines(window: &mut Window, paint: impl FnOnce(&mut Window)) -> &[Underline] {
         window.next_frame.scene.clear();
         paint(window);
@@ -11604,7 +11642,7 @@ mod tests {
         assert_eq!(actual.thickness, expected.thickness);
         assert_eq!(actual.wavy, expected.wavy);
         assert_eq!(actual.color, expected.color);
-        assert_eq!(actual.pad, expected.pad);
+        assert_eq!(actual.clip, expected.clip);
     }
 
     fn underline_device_columns(underlines: &[Underline]) -> Vec<i32> {

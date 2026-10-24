@@ -23,13 +23,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
-use core_video::pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA};
 use gpui::{
     App, AppContext as _, Bounds, Context, HeadlessAppContext, IntoElement, Path, Pixels, Point,
     Render, Size, Styled, Window, canvas, point, px, size,
 };
 use image::RgbaImage;
+use objc2_core_foundation::{CFDictionary, CFRetained, CFType};
+use objc2_core_video::{
+    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
+    CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
+    CVPixelBufferGetPlaneCount, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+    CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+};
 
 /// The scale factor gpui's test window reports. Logical coordinates handed to
 /// the assertions are multiplied by this to find the pixel in the image.
@@ -162,14 +169,14 @@ fn render_frames_onto(
     paint: impl Fn(usize, Bounds<Pixels>, &mut Window, &mut App) + 'static,
 ) -> Vec<RenderedFrame> {
     let transparent = background == TRANSPARENT;
-    let text_system = Arc::new(gpui_macos::MacTextSystem::new());
+    let text_system = Arc::new(gpui_macos::AppleTextSystem::new());
     let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), move || {
-        let renderer = gpui_platform::current_headless_renderer_with_transparency(transparent);
+        let renderer = gpui_platform::current_headless_renderer_with_transparency(transparent)?;
         assert!(
             renderer.is_some(),
             "no headless renderer for this platform; these tests need a real GPU"
         );
-        renderer
+        Ok(renderer)
     });
 
     let paint: Rc<dyn Fn(usize, Bounds<Pixels>, &mut Window, &mut App)> = Rc::new(paint);
@@ -444,30 +451,66 @@ pub fn rect_path(bounds: Bounds<Pixels>) -> Path<Pixels> {
 /// a record the renderer builds by hand rather than out of the instance buffer
 /// every other kind rides in, so it is also the one whose target and whose clip
 /// id it is easiest to get wrong.
-pub fn white_surface(side: usize) -> CVPixelBuffer {
-    let io_surface_properties = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
-    let attributes = CFDictionary::from_CFType_pairs(&[(
-        CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
-        io_surface_properties.as_CFType(),
-    )]);
-    let buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, side, side, Some(&attributes))
-        .expect("failed to create a pixel buffer for the surface");
-    assert_eq!(buffer.lock_base_address(0), 0, "failed to lock the buffer");
-    // SAFETY: the buffer is locked, so its base address is valid for
-    // `bytes_per_row * height` bytes, and each row's first `side * 4` bytes are
-    // the pixels.
-    unsafe {
-        let base = buffer.get_base_address() as *mut u8;
-        let stride = buffer.get_bytes_per_row();
-        for row in 0..side {
-            std::ptr::write_bytes(base.add(row * stride), 0xff, side * 4);
-        }
-    }
-    assert_eq!(
-        buffer.unlock_base_address(0),
-        0,
-        "failed to unlock the buffer"
+pub fn white_surface(side: usize) -> CFRetained<CVPixelBuffer> {
+    pixel_buffer(kCVPixelFormatType_32BGRA, side, |_| 0xff)
+}
+
+/// A `side`×`side` pixel buffer in `format`, backed by an IOSurface so the
+/// Metal texture cache will accept it, with every byte of each plane set to
+/// `value(plane)`.
+pub fn pixel_buffer(
+    format: u32,
+    side: usize,
+    value: impl Fn(usize) -> u8,
+) -> CFRetained<CVPixelBuffer> {
+    let attributes = CFDictionary::from_slices(
+        &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+        &[&*CFDictionary::<CFType, CFType>::empty()],
     );
+    let mut buffer = std::ptr::null_mut();
+    // SAFETY: the attributes are a valid dictionary and `buffer` a valid out
+    // pointer for the duration of the call.
+    let status = unsafe {
+        CVPixelBufferCreate(
+            None,
+            side,
+            side,
+            format,
+            Some(attributes.as_opaque()),
+            std::ptr::NonNull::from(&mut buffer),
+        )
+    };
+    assert_eq!(status, kCVReturnSuccess, "failed to create a pixel buffer");
+    // SAFETY: CVPixelBufferCreate returned a +1 buffer on success.
+    let buffer = unsafe {
+        CFRetained::from_raw(std::ptr::NonNull::new(buffer).expect("a null pixel buffer"))
+    };
+    // SAFETY: the buffer is locked while it is written, so each plane's base
+    // address is valid for `bytes_per_row * height` bytes.
+    unsafe {
+        assert_eq!(
+            CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::empty()),
+            kCVReturnSuccess,
+            "failed to lock the buffer"
+        );
+        let planes = CVPixelBufferGetPlaneCount(&buffer);
+        if planes == 0 {
+            let base = CVPixelBufferGetBaseAddress(&buffer).cast::<u8>();
+            let length = CVPixelBufferGetBytesPerRow(&buffer) * CVPixelBufferGetHeight(&buffer);
+            std::slice::from_raw_parts_mut(base, length).fill(value(0));
+        }
+        for plane in 0..planes {
+            let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane).cast::<u8>();
+            let length = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane)
+                * CVPixelBufferGetHeightOfPlane(&buffer, plane);
+            std::slice::from_raw_parts_mut(base, length).fill(value(plane));
+        }
+        assert_eq!(
+            CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty()),
+            kCVReturnSuccess,
+            "failed to unlock the buffer"
+        );
+    }
     buffer
 }
 

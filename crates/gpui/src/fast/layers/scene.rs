@@ -121,13 +121,7 @@ impl LayerFrame {
                         scene.insert_primitive(translate_primitive(primitive, delta));
                     }
                 }
-                PaintOperation::StartLayer(layer_bounds) => {
-                    scene.push_layer(translate_bounds(*layer_bounds, delta))
-                }
-                PaintOperation::EndLayer => scene.pop_layer(),
-                PaintOperation::FastRoundedClip(clip) => {
-                    crate::fast::rounded_clip::record(&mut scene, clip.translated(delta))
-                }
+                scope => scene.apply(&translate_operation(scope, delta)),
             }
         }
         scene.finish();
@@ -309,6 +303,32 @@ pub(crate) fn translate_primitive(primitive: &Primitive, delta: Point<ScaledPixe
     let mut primitive = primitive.clone();
     move_primitive(&mut primitive, delta);
     primitive
+}
+
+/// Moves `operation` by `delta`: every position it carries, so the scene it
+/// is part of draws the same pixels `delta` away.
+pub(crate) fn move_operation(operation: &mut PaintOperation, delta: Point<ScaledPixels>) {
+    match operation {
+        PaintOperation::Primitive(primitive) => move_primitive(primitive, delta),
+        PaintOperation::StartLayer(bounds) => *bounds = translate_bounds(*bounds, delta),
+        PaintOperation::EndLayer | PaintOperation::PopClip | PaintOperation::EndGroup => {}
+        PaintOperation::FastRoundedClip(clip) => *clip = clip.translated(delta),
+        PaintOperation::PushClip(path, visible) => {
+            *path = path.translated(delta);
+            *visible = translate_bounds(*visible, delta);
+        }
+        PaintOperation::StartGroup(spec) => *spec = spec.translated(delta),
+    }
+}
+
+/// `operation` moved by `delta`, as [`move_operation`] moves it.
+pub(crate) fn translate_operation(
+    operation: &PaintOperation,
+    delta: Point<ScaledPixels>,
+) -> PaintOperation {
+    let mut operation = operation.clone();
+    move_operation(&mut operation, delta);
+    operation
 }
 
 /// Moves `primitive` by `delta`, as [`translate_primitive`] does, in place.

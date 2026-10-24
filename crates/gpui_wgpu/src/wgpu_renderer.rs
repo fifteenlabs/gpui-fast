@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Bounds, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
+    AtlasTextureId, Bounds, ContentMask, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
     Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
 };
 use log::warn;
@@ -2629,6 +2629,7 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+    use std::collections::HashMap;
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -2962,6 +2963,8 @@ mod tests {
         let quad = Quad {
             order: 41,
             border_style: BorderStyle::Dashed,
+            clip: gpui::ClipId::NONE,
+            pad: 0,
             bounds: Bounds {
                 origin: Point {
                     x: 1.0.into(),
@@ -2983,6 +2986,7 @@ mod tests {
                         height: 8.0.into(),
                     },
                 },
+                corner_radii: Default::default(),
             },
             background: linear_gradient(
                 11.0,
@@ -3033,6 +3037,8 @@ mod tests {
             &[
                 41,
                 1,
+                0,
+                0,
                 1.0_f32.to_bits(),
                 2.0_f32.to_bits(),
                 3.0_f32.to_bits(),
@@ -3041,6 +3047,10 @@ mod tests {
                 6.0_f32.to_bits(),
                 7.0_f32.to_bits(),
                 8.0_f32.to_bits(),
+                0,
+                0,
+                0,
+                0,
                 1,
                 1,
                 0,
