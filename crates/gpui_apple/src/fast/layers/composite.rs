@@ -59,6 +59,11 @@ pub(crate) fn draw_tiles(
                 mem::size_of_val(render_target) as u64,
                 render_target as *const RenderTarget as *const _,
             );
+            command_encoder.set_fragment_bytes(
+                SpriteInputIndex::RenderTarget as u64,
+                mem::size_of_val(render_target) as u64,
+                render_target as *const RenderTarget as *const _,
+            );
             command_encoder.set_fragment_buffer(
                 SpriteInputIndex::Sprites as u64,
                 Some(&polychrome_sprites.buffer),

@@ -1667,6 +1667,11 @@ impl MetalRenderer {
             &group.parent.render_target as *const RenderTarget as *const _,
         );
         command_encoder.set_fragment_bytes(
+            GroupCompositeInputIndex::RenderTarget as u64,
+            mem::size_of::<RenderTarget>() as u64,
+            &group.parent.render_target as *const RenderTarget as *const _,
+        );
+        command_encoder.set_fragment_bytes(
             GroupCompositeInputIndex::Composite as u64,
             mem::size_of::<GroupComposite>() as u64,
             &composite as *const GroupComposite as *const _,
@@ -1978,6 +1983,11 @@ impl MetalRenderer {
             mem::size_of_val(render_target) as u64,
             render_target as *const RenderTarget as *const _,
         );
+        command_encoder.set_fragment_bytes(
+            ShadowInputIndex::RenderTarget as u64,
+            mem::size_of_val(render_target) as u64,
+            render_target as *const RenderTarget as *const _,
+        );
 
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
@@ -2026,6 +2036,11 @@ impl MetalRenderer {
             instance_bindings.quads.offset as u64,
         );
         command_encoder.set_vertex_bytes(
+            QuadInputIndex::RenderTarget as u64,
+            mem::size_of_val(render_target) as u64,
+            render_target as *const RenderTarget as *const _,
+        );
+        command_encoder.set_fragment_bytes(
             QuadInputIndex::RenderTarget as u64,
             mem::size_of_val(render_target) as u64,
             render_target as *const RenderTarget as *const _,
@@ -2159,6 +2174,11 @@ impl MetalRenderer {
             mem::size_of_val(render_target) as u64,
             render_target as *const RenderTarget as *const _,
         );
+        command_encoder.set_fragment_bytes(
+            UnderlineInputIndex::RenderTarget as u64,
+            mem::size_of_val(render_target) as u64,
+            render_target as *const RenderTarget as *const _,
+        );
 
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
@@ -2211,6 +2231,11 @@ impl MetalRenderer {
             instance_bindings.monochrome_sprites.offset as u64,
         );
         command_encoder.set_vertex_bytes(
+            SpriteInputIndex::RenderTarget as u64,
+            mem::size_of_val(render_target) as u64,
+            render_target as *const RenderTarget as *const _,
+        );
+        command_encoder.set_fragment_bytes(
             SpriteInputIndex::RenderTarget as u64,
             mem::size_of_val(render_target) as u64,
             render_target as *const RenderTarget as *const _,
@@ -2291,6 +2316,11 @@ impl MetalRenderer {
             mem::size_of_val(render_target) as u64,
             render_target as *const RenderTarget as *const _,
         );
+        command_encoder.set_fragment_bytes(
+            SpriteInputIndex::RenderTarget as u64,
+            mem::size_of_val(render_target) as u64,
+            render_target as *const RenderTarget as *const _,
+        );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
             mem::size_of_val(&texture_size) as u64,
@@ -2345,6 +2375,11 @@ impl MetalRenderer {
             instance_bindings.surfaces.offset as u64,
         );
         command_encoder.set_vertex_bytes(
+            SurfaceInputIndex::RenderTarget as u64,
+            mem::size_of_val(render_target) as u64,
+            render_target as *const RenderTarget as *const _,
+        );
+        command_encoder.set_fragment_bytes(
             SurfaceInputIndex::RenderTarget as u64,
             mem::size_of_val(render_target) as u64,
             render_target as *const RenderTarget as *const _,
@@ -3411,9 +3446,11 @@ enum ClipMaskInputIndex {
 /// that is the space a content mask, a clip mask, a gradient and a signed
 /// distance field are all expressed in. A group is drawn into a target of its
 /// own that covers only part of the window, so the vertex stage subtracts this
-/// origin to place a primitive, and hands the untouched scene position across
-/// to the fragment stage as a varying rather than letting it read
-/// `[[position]]`, which is the framebuffer's space and not the scene's.
+/// origin to place a primitive, and the fragment stage adds it back to
+/// `[[position]]`, which is the framebuffer's space and not the scene's. A
+/// fragment reads its scene position off the pixel rather than as a varying
+/// so that a pixel's value is exact, and drawing into a layer's tile gives the
+/// same pixels as drawing into the window.
 ///
 /// `size` is the viewport, not the texture: a group target is pooled and may be
 /// larger than the group in it.
