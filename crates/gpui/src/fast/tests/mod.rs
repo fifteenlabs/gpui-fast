@@ -19,6 +19,7 @@ mod path_cache;
 mod retained;
 mod retained_bench;
 mod scene_order;
+mod scroll_geometry;
 mod scroll_to_bottom;
 mod splice;
 mod splice_late_layout;
