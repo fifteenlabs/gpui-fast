@@ -2518,6 +2518,7 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
+                crate::fast::scroll_geometry::laid_out(window, &scroll_handle_state);
             }
 
             *scroll_offset
@@ -4265,13 +4266,14 @@ impl ScrollAnchor {
 pub(crate) struct ScrollHandleState {
     pub(crate) offset: Rc<RefCell<Point<Pixels>>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
-    bounds: Bounds<Pixels>,
+    pub(crate) bounds: Bounds<Pixels>,
     pub(crate) max_offset: Point<Pixels>,
-    child_bounds: Vec<Bounds<Pixels>>,
+    pub(crate) child_bounds: Vec<Bounds<Pixels>>,
     pub(crate) scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
     pub(crate) version: crate::fast::dependencies::StateVersion,
+    pub(crate) geometry: crate::fast::scroll_geometry::ScrollGeometry,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4313,14 +4315,14 @@ impl ScrollHandle {
 
     /// Get the maximum scroll offset.
     pub fn max_offset(&self) -> Point<Pixels> {
-        crate::fast::layers::invalidate::note_offset_read(&self.0.borrow().version);
+        crate::fast::scroll_geometry::note_read(&self.0.borrow());
         self.0.borrow().max_offset
     }
 
     /// Get the top child that's scrolled into view.
     pub fn top_item(&self) -> usize {
         let state = self.0.borrow();
-        crate::fast::layers::invalidate::note_offset_read(&state.version);
+        crate::fast::scroll_geometry::note_read(&state);
         let top = state.bounds.top() - state.offset.borrow().y;
 
         match state.child_bounds.binary_search_by(|bounds| {
@@ -4340,7 +4342,7 @@ impl ScrollHandle {
     /// Get the bottom child that's scrolled into view.
     pub fn bottom_item(&self) -> usize {
         let state = self.0.borrow();
-        crate::fast::layers::invalidate::note_offset_read(&state.version);
+        crate::fast::scroll_geometry::note_read(&state);
         let bottom = state.bounds.bottom() - state.offset.borrow().y;
 
         match state.child_bounds.binary_search_by(|bounds| {
@@ -4359,12 +4361,12 @@ impl ScrollHandle {
 
     /// Return the bounds into which this child is painted
     pub fn bounds(&self) -> Bounds<Pixels> {
-        crate::fast::layers::input::moved(&self.0, Some(self.0.borrow().bounds)).unwrap_or_default()
+        crate::fast::scroll_geometry::bounds(&self.0, self.0.borrow().bounds)
     }
 
     /// Get the bounds for a specific child.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
-        crate::fast::layers::invalidate::note_offset_read(&self.0.borrow().version);
+        crate::fast::scroll_geometry::note_read(&self.0.borrow());
         crate::fast::layers::input::moved(&self.0, self.0.borrow().child_bounds.get(ix).cloned())
     }
 
@@ -4491,6 +4493,7 @@ impl ScrollHandle {
 
     /// Get the count of children for scrollable item.
     pub fn children_count(&self) -> usize {
+        crate::fast::scroll_geometry::note_read(&self.0.borrow());
         self.0.borrow().child_bounds.len()
     }
 }
