@@ -6,6 +6,7 @@ mod dependencies;
 mod dispatch;
 mod dynamic_textures;
 mod global_id;
+mod image_drops;
 mod interactive_text;
 mod layers;
 mod layers_lists;
