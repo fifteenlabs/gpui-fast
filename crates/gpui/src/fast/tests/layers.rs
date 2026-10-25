@@ -3940,6 +3940,76 @@ mod input {
             );
         }
     }
+
+    /// Rows that note their bounds as they are prepainted and, as a hover
+    /// listener does to place a tooltip, read them back when hovered.
+    struct HoverPage {
+        hovered: Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>,
+    }
+
+    impl Render for HoverPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let rows = (0..ROWS).map(|index| {
+                let prepainted = Rc::new(Cell::new(Bounds::default()));
+                let hovered = self.hovered.clone();
+                div()
+                    .id(("row", index))
+                    .w(px(100.))
+                    .h(px(ROW_HEIGHT))
+                    .bg(rgb(0x100000 + index as u32 * 0x10))
+                    .on_hover({
+                        let prepainted = prepainted.clone();
+                        move |is_hovered, _, _| {
+                            if *is_hovered {
+                                hovered.borrow_mut().push((index, prepainted.get()));
+                            }
+                        }
+                    })
+                    .child(
+                        canvas(move |bounds, _, _| prepainted.set(bounds), |_, _, _, _| {})
+                            .size_full(),
+                    )
+            });
+            div().size_full().bg(rgb(0xffffff)).child(
+                div()
+                    .id("scroller")
+                    .overflow_y_scroll()
+                    .w(px(200.))
+                    .h(px(100.))
+                    .children(rows),
+            )
+        }
+    }
+
+    #[crate::test]
+    fn bounds_noted_in_prepaint_are_current_when_hovered_after_composited_scrolls(
+        cx: &mut TestAppContext,
+    ) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        let hovered = Rc::new(RefCell::new(Vec::new()));
+        let page = cx.add_window({
+            let hovered = hovered.clone();
+            move |_, _| HoverPage { hovered }
+        });
+        let window: AnyWindowHandle = page.into();
+        draw(cx, window);
+        draw(cx, window);
+        assert_eq!(
+            scroll_five_times(cx, window),
+            vec![Some(Decision::Composite); 3]
+        );
+        dispatch(cx, window, [mouse_move(point(px(20.), px(50.)), false)]);
+        // Row 7 lies at 140 px in the content, at 40 px once scrolled by -100.
+        assert_eq!(
+            hovered.borrow().last(),
+            Some(&(
+                7,
+                Bounds::new(point(px(0.), px(40.)), crate::size(px(100.), px(20.)))
+            ))
+        );
+    }
 }
 
 /// Tests of the streams working together, found by measuring and verifying
