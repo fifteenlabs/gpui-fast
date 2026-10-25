@@ -55,22 +55,43 @@ pub(crate) fn drop_image(window: &mut Window, image: &RenderImage) {
 /// Whether anything the window draws, or may draw again without painting it,
 /// shows a frame of `image`.
 pub(crate) fn image_drawn(window: &Window, image: &RenderImage) -> bool {
-    let tiles: Vec<AtlasTile> = (0..image.frame_count())
-        .filter_map(|frame_index| {
-            tile_of(
-                window,
-                &AtlasKey::from(RenderImageParams {
-                    image_id: image.id,
-                    frame_index,
-                }),
-            )
-        })
-        .collect();
-    if tiles.is_empty() {
-        return false;
+    images_drawn([window].into_iter(), &[image])[0]
+}
+
+/// Which of `images` anything one of `windows` draws, or may draw again
+/// without painting it, shows a frame of.
+pub(crate) fn images_drawn<'a>(
+    windows: impl Iterator<Item = &'a Window>,
+    images: &[&RenderImage],
+) -> Vec<bool> {
+    let mut shown = vec![false; images.len()];
+    for window in windows {
+        let tiles: Vec<Vec<(AtlasTextureId, u32)>> = images
+            .iter()
+            .map(|image| {
+                (0..image.frame_count())
+                    .filter_map(|frame_index| {
+                        tile_of(
+                            window,
+                            &AtlasKey::from(RenderImageParams {
+                                image_id: image.id,
+                                frame_index,
+                            }),
+                        )
+                    })
+                    .map(|tile| id_of(&tile))
+                    .collect()
+            })
+            .collect();
+        if tiles.iter().all(Vec::is_empty) {
+            continue;
+        }
+        let drawn = drawn_tiles(window);
+        for (shown, tiles) in shown.iter_mut().zip(&tiles) {
+            *shown |= tiles.iter().any(|tile| drawn.contains(tile));
+        }
     }
-    let drawn = drawn_tiles(window);
-    tiles.iter().any(|tile| drawn.contains(&id_of(tile)))
+    shown
 }
 
 /// Gives back the tiles kept for dropped images that nothing draws any more,

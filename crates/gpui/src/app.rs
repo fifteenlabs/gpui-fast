@@ -3201,6 +3201,18 @@ impl App {
         }
     }
 
+    /// Which of `images` a window draws, or keeps something that draws to
+    /// draw again without painting it: an image cache should not evict them.
+    /// `current_window` is the window being updated, if any.
+    pub fn images_drawn(
+        &self,
+        images: &[&RenderImage],
+        current_window: Option<&Window>,
+    ) -> Vec<bool> {
+        let windows = self.windows.values().flatten().map(|window| &**window);
+        crate::fast::image_drops::images_drawn(windows.chain(current_window), images)
+    }
+
     /// Sets the renderer for the inspector.
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub fn set_inspector_renderer(&mut self, f: crate::InspectorRenderer) {
