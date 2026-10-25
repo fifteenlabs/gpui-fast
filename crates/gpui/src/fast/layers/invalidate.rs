@@ -419,6 +419,11 @@ pub(crate) fn list_offset_set(version: &StateVersion) {
     }
 }
 
+/// Whether a recording of offset reads is open.
+pub(crate) fn recording_offset_reads() -> bool {
+    COMPILED && OFFSET_READS.with_borrow(|log| log.recordings > 0)
+}
+
 /// Records, for any recording that is open, that the offset of the scroll
 /// state `version` counts changes of was read.
 #[inline]
