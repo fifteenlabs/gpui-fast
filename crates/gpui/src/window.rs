@@ -291,6 +291,10 @@ impl WindowInvalidator {
         self.inner.borrow().draw_phase == DrawPhase::None
     }
 
+    pub fn in_focus_phase(&self) -> bool {
+        self.inner.borrow().draw_phase == DrawPhase::Focus
+    }
+
     #[track_caller]
     pub fn debug_assert_paint(&self) {
         debug_assert!(
@@ -1383,6 +1387,9 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// Set when the window's own state changed while it drew, for the frame
+    /// after to refresh. See [`Window::refresh_for_state`].
+    refresh_after_draw: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2312,6 +2319,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            refresh_after_draw: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -2569,6 +2577,22 @@ impl Window {
         }
     }
 
+    /// Refreshes for a change to the window's own state, such as its focus or
+    /// size, that every view may read without recording it.
+    ///
+    /// [`Window::refresh`] does nothing while the window draws, as the frame
+    /// being drawn renders every view anyway. A retained view drawn before the
+    /// change is not rendered again, so a change made from a render, prepaint
+    /// or paint refreshes the frame after. A change made by a focus listener
+    /// is left to the check at the end of [`Window::draw`].
+    fn refresh_for_state(&mut self) {
+        if self.invalidator.not_drawing() {
+            self.refresh();
+        } else if !self.invalidator.in_focus_phase() {
+            self.refresh_after_draw = true;
+        }
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
@@ -2601,7 +2625,7 @@ impl Window {
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
 
-        self.refresh();
+        self.refresh_for_state();
     }
 
     /// Remove focus from all elements within this context's window.
@@ -2616,7 +2640,7 @@ impl Window {
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
         self.focus = None;
-        self.refresh();
+        self.refresh_for_state();
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
@@ -3095,7 +3119,7 @@ impl Window {
         size *= self.zoom;
         self.platform_window.resize(size);
         self.sync_viewport();
-        self.refresh();
+        self.refresh_for_state();
     }
 
     /// Returns whether or not the window is currently fullscreen
@@ -3111,7 +3135,11 @@ impl Window {
     }
 
     pub(crate) fn appearance_changed(&mut self, cx: &mut App) {
-        self.appearance = self.platform_window.appearance();
+        let appearance = self.platform_window.appearance();
+        if appearance != self.appearance {
+            self.appearance = appearance;
+            self.refresh();
+        }
 
         self.appearance_observers
             .clone()
@@ -3359,7 +3387,7 @@ impl Window {
         }
         self.zoom = zoom;
         self.sync_viewport();
-        self.refresh();
+        self.refresh_for_state();
     }
 
     /// Take the layout viewport from the window's actual size.
@@ -3860,8 +3888,9 @@ impl Window {
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
-        // resulting focus events.
-        if self.focus != focus_before_listeners {
+        // resulting focus events. A change to the window's state made earlier in
+        // the draw asks for the same (`Window::refresh_for_state`).
+        if self.focus != focus_before_listeners || mem::take(&mut self.refresh_after_draw) {
             self.refresh();
         }
         self.needs_present.set(true);
