@@ -1,4 +1,12 @@
 //! What a retained subtree read while it was built — entities, globals and versioned state — and how the app records it.
+//!
+//! A global is read through `global` and `try_global`. Taking one mutably,
+//! through `global_mut`, `default_global` or `update_global`, is a write and
+//! not a read: stores and caches take theirs mutably on every read of an
+//! entry, so counting that as a read would have every view reading any entry
+//! of a store built again whenever any other view read one. What a view
+//! takes from a global mutably and shows has to be an entity, which it then
+//! reads, or be read through `global`.
 
 use std::{
     any::TypeId,
