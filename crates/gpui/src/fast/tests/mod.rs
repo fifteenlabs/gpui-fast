@@ -5,6 +5,7 @@ mod cached_layout;
 mod dependencies;
 mod dispatch;
 mod dynamic_textures;
+mod focus_queries;
 mod global_id;
 mod image_drops;
 mod interactive_text;
