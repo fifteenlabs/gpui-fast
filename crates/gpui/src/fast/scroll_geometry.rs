@@ -77,3 +77,13 @@ pub(crate) fn bounds(
     state.borrow().geometry.note_read();
     crate::fast::layers::input::moved(state, Some(bounds)).unwrap_or_default()
 }
+
+impl crate::ScrollHandle {
+    /// Marks the scroll state the handle shares as changed, for the view
+    /// whose element tracks the handle to be built again. A list that keeps
+    /// the handle and scrolls to an item as it is laid out asks this of it:
+    /// its view is not laid out again otherwise.
+    pub fn mark_changed(&self) {
+        self.0.borrow().version.bump();
+    }
+}
