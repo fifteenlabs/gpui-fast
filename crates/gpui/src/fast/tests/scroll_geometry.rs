@@ -192,3 +192,69 @@ fn scroll_geometry_nothing_read_asks_for_no_frame() {
         .unwrap();
     assert!(!dirty, "a change nothing read asks for no frame");
 }
+
+/// Shows a scroll container tracking a handle, counting its renders.
+struct Tracks {
+    handle: ScrollHandle,
+    renders: Rc<RefCell<usize>>,
+}
+impl Render for Tracks {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        *self.renders.borrow_mut() += 1;
+        div()
+            .id("tracked")
+            .overflow_y_scroll()
+            .track_scroll(&self.handle)
+            .h(px(50.))
+            .children((0..5).map(|_| div().h(px(20.))))
+    }
+}
+
+struct TracksPage {
+    tracks: Entity<Tracks>,
+    counter: Entity<Counter>,
+}
+impl Render for TracksPage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().child(self.tracks.clone()).child(self.counter.clone())
+    }
+}
+
+/// A handle marked changed builds the view whose element tracks it again
+/// with the next frame.
+#[test]
+fn a_handle_marked_changed_builds_the_view_tracking_it_again() {
+    let mut cx = TestAppContext::single();
+    let handle = ScrollHandle::new();
+    let renders = Rc::new(RefCell::new(0));
+    let tracks = cx.new(|_| Tracks {
+        handle: handle.clone(),
+        renders: renders.clone(),
+    });
+    let counter = cx.new(|_| Counter(0));
+    cx.add_window({
+        let counter = counter.clone();
+        move |_, _| TracksPage { tracks, counter }
+    });
+    cx.run_until_parked();
+    let notify_counter = |cx: &mut TestAppContext| {
+        cx.update(|cx| counter.update(cx, |_, cx| cx.notify()));
+        cx.run_until_parked();
+    };
+    notify_counter(&mut cx);
+    let before = *renders.borrow();
+
+    handle.mark_changed();
+    notify_counter(&mut cx);
+    assert_eq!(
+        *renders.borrow(),
+        before + 1,
+        "the view tracking it is built again"
+    );
+    notify_counter(&mut cx);
+    assert_eq!(
+        *renders.borrow(),
+        before + 1,
+        "and then drawn from last frame"
+    );
+}
