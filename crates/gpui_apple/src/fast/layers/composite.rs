@@ -65,6 +65,11 @@ pub(crate) fn draw_tiles(
                     mem::size_of_val(render_target),
                     SpriteInputIndex::RenderTarget as usize,
                 );
+                command_encoder.setFragmentBytes_length_atIndex(
+                    ptr::NonNull::from(render_target).cast(),
+                    mem::size_of_val(render_target),
+                    SpriteInputIndex::RenderTarget as usize,
+                );
                 command_encoder.setFragmentBuffer_offset_atIndex(
                     Some(&polychrome_sprites.buffer),
                     polychrome_sprites.offset,

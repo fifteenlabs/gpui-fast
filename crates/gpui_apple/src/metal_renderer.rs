@@ -1854,6 +1854,11 @@ impl MetalRenderer {
                 GroupCompositeInputIndex::RenderTarget as usize,
             );
             command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(&group.parent.render_target).cast(),
+                mem::size_of::<RenderTarget>(),
+                GroupCompositeInputIndex::RenderTarget as usize,
+            );
+            command_encoder.setFragmentBytes_length_atIndex(
                 ptr::NonNull::from(&composite).cast(),
                 mem::size_of::<GroupComposite>(),
                 GroupCompositeInputIndex::Composite as usize,
@@ -2199,6 +2204,11 @@ impl MetalRenderer {
                 mem::size_of_val(render_target),
                 ShadowInputIndex::RenderTarget as usize,
             );
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(render_target).cast(),
+                mem::size_of_val(render_target),
+                ShadowInputIndex::RenderTarget as usize,
+            );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
@@ -2249,6 +2259,11 @@ impl MetalRenderer {
                 QuadInputIndex::Quads as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(render_target).cast(),
+                mem::size_of_val(render_target),
+                QuadInputIndex::RenderTarget as usize,
+            );
+            command_encoder.setFragmentBytes_length_atIndex(
                 ptr::NonNull::from(render_target).cast(),
                 mem::size_of_val(render_target),
                 QuadInputIndex::RenderTarget as usize,
@@ -2392,6 +2407,11 @@ impl MetalRenderer {
                 mem::size_of_val(render_target),
                 UnderlineInputIndex::RenderTarget as usize,
             );
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(render_target).cast(),
+                mem::size_of_val(render_target),
+                UnderlineInputIndex::RenderTarget as usize,
+            );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
@@ -2448,6 +2468,11 @@ impl MetalRenderer {
                 SpriteInputIndex::Sprites as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(render_target).cast(),
+                mem::size_of_val(render_target),
+                SpriteInputIndex::RenderTarget as usize,
+            );
+            command_encoder.setFragmentBytes_length_atIndex(
                 ptr::NonNull::from(render_target).cast(),
                 mem::size_of_val(render_target),
                 SpriteInputIndex::RenderTarget as usize,
@@ -2535,6 +2560,11 @@ impl MetalRenderer {
                 mem::size_of_val(render_target),
                 SpriteInputIndex::RenderTarget as usize,
             );
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(render_target).cast(),
+                mem::size_of_val(render_target),
+                SpriteInputIndex::RenderTarget as usize,
+            );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&texture_size).cast(),
                 mem::size_of_val(&texture_size),
@@ -2596,6 +2626,11 @@ impl MetalRenderer {
                 SurfaceInputIndex::Surfaces as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(render_target).cast(),
+                mem::size_of_val(render_target),
+                SurfaceInputIndex::RenderTarget as usize,
+            );
+            command_encoder.setFragmentBytes_length_atIndex(
                 ptr::NonNull::from(render_target).cast(),
                 mem::size_of_val(render_target),
                 SurfaceInputIndex::RenderTarget as usize,
@@ -3759,9 +3794,11 @@ enum ClipMaskInputIndex {
 /// that is the space a content mask, a clip mask, a gradient and a signed
 /// distance field are all expressed in. A group is drawn into a target of its
 /// own that covers only part of the window, so the vertex stage subtracts this
-/// origin to place a primitive, and hands the untouched scene position across
-/// to the fragment stage as a varying rather than letting it read
-/// `[[position]]`, which is the framebuffer's space and not the scene's.
+/// origin to place a primitive, and the fragment stage adds it back to
+/// `[[position]]`, which is the framebuffer's space and not the scene's. A
+/// fragment reads its scene position off the pixel rather than as a varying
+/// so that a pixel's value is exact, and drawing into a layer's tile gives the
+/// same pixels as drawing into the window.
 ///
 /// `size` is the viewport, not the texture: a group target is pooled and may be
 /// larger than the group in it.
