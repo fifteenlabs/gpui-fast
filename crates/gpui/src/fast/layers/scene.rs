@@ -184,7 +184,6 @@ impl LayerContent {
     }
 
     /// The scenes of the content's parts, in order.
-    #[cfg(test)]
     pub(crate) fn part_scenes(&self) -> impl Iterator<Item = &Rc<Scene>> {
         self.parts.iter().map(|part| &part.scene)
     }
