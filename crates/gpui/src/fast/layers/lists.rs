@@ -132,6 +132,24 @@ impl LayerRows {
         self.frame = None;
     }
 
+    /// Calls `f` with the scene of every row the layer holds.
+    pub(crate) fn for_each_scene(&self, f: &mut dyn FnMut(&Scene)) {
+        for row in self.rows.values() {
+            f(&row.part.scene);
+            if let Some(whole) = &row.whole {
+                f(whole);
+            }
+        }
+    }
+
+    /// Calls `f` with every primitive the rows the layer holds draw over its
+    /// tiles.
+    pub(crate) fn for_each_overlay_primitive(&self, f: &mut dyn FnMut(&Primitive)) {
+        for row in self.rows.values() {
+            row.overlay.iter().for_each(&mut *f);
+        }
+    }
+
     fn clear(&mut self) {
         self.rows.clear();
         self.added_since_repaint = 0;

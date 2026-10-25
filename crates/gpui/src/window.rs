@@ -1293,6 +1293,7 @@ pub struct Window {
     /// through [`PlatformAtlas::remove`], so this is a working set rather than
     /// a ceiling the window runs into once and never comes back from.
     gradient_ramps: FxHashMap<GradientKey, GradientRamp>,
+    pub(crate) deferred_image_drops: crate::fast::image_drops::DeferredImageDrops,
     /// What [`Window::gradient_ramps`] is holding in the atlas right now,
     /// against [`MAX_GRADIENT_CACHE_BYTES`].
     gradient_ramp_bytes: usize,
@@ -2245,6 +2246,7 @@ impl Window {
             is_minimizable,
             sprite_atlas,
             gradient_ramps: FxHashMap::default(),
+            deferred_image_drops: Default::default(),
             gradient_ramp_bytes: 0,
             gradient_clock: 0,
             gradient_ceiling_warned: false,
@@ -3805,6 +3807,7 @@ impl Window {
         self.text_system().finish_frame();
         crate::fast::global_id::GlobalIdCache::finish_frame(&mut self.global_ids);
         crate::fast::retained::finish_retained_frame(self);
+        crate::fast::image_drops::finish_frame(self);
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -6000,18 +6003,17 @@ impl Window {
         });
     }
 
-    /// Removes an image from the sprite atlas.
+    /// Removes an image from the sprite atlas, once nothing the window keeps
+    /// to draw again still shows it.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
-        for frame_index in 0..data.frame_count() {
-            let params = RenderImageParams {
-                image_id: data.id,
-                frame_index,
-            };
-
-            self.sprite_atlas.remove(&params.clone().into());
-        }
-
+        crate::fast::image_drops::drop_image(self, &data);
         Ok(())
+    }
+
+    /// Whether the window draws `image`, or keeps something that draws it to
+    /// draw again without painting it: an image cache should not evict it.
+    pub fn image_drawn(&self, image: &RenderImage) -> bool {
+        crate::fast::image_drops::image_drawn(self, image)
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.

@@ -132,6 +132,29 @@ pub(crate) fn active(window: &Window, cx: &App) -> bool {
         && !window.is_inspector_picking(cx)
 }
 
+/// Calls `f` with every scene the window's layers keep to draw from again
+/// without painting it: each layer's recorded content and the rows its list
+/// holds.
+pub(crate) fn for_each_kept_scene(window: &Window, f: &mut dyn FnMut(&crate::Scene)) {
+    for layer in window.fast_layers.layers.values() {
+        if let Some(record) = &layer.record {
+            record.content.part_scenes().for_each(|scene| f(scene));
+        }
+        layer.rows.for_each_scene(f);
+    }
+}
+
+/// Calls `f` with every primitive the window's list layers keep to draw over
+/// their tiles.
+pub(crate) fn for_each_kept_primitive(
+    window: &Window,
+    f: &mut dyn FnMut(&crate::scene::Primitive),
+) {
+    for layer in window.fast_layers.layers.values() {
+        layer.rows.for_each_overlay_primitive(f);
+    }
+}
+
 /// Ends the frame being drawn: the scrolls before it are taken in, and the
 /// layers not composited for long, or painted for another window size or
 /// scale factor, are dropped.
