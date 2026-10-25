@@ -4,6 +4,7 @@ mod a11y;
 mod cached_layout;
 mod dependencies;
 mod dispatch;
+mod focus_queries;
 mod global_id;
 mod image_drops;
 mod layers;

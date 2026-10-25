@@ -549,10 +549,7 @@ impl FocusId {
 
     /// Obtains whether this handle contains the given handle in the most recently rendered frame.
     pub(crate) fn contains(&self, other: Self, window: &Window) -> bool {
-        window
-            .rendered_frame
-            .dispatch_tree
-            .focus_contains(*self, other)
+        crate::fast::focus_queries::contains(window, *self, other)
     }
 }
 
@@ -1334,6 +1331,7 @@ pub struct Window {
     pub(crate) fast_layers: crate::fast::layers::WindowLayers,
     pub(crate) fast_composition: crate::fast::composition::WindowCompositionHandle,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
+    pub(crate) focus_queries: crate::fast::focus_queries::FocusQueries,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
@@ -2274,6 +2272,7 @@ impl Window {
             fast_layers: crate::fast::layers::WindowLayers::default(),
             fast_composition: crate::fast::composition::WindowCompositionHandle::default(),
             rendered_entity_stack: Vec::new(),
+            focus_queries: Default::default(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
@@ -3885,6 +3884,7 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        crate::fast::focus_queries::finish_frame(self, cx);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
