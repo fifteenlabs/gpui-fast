@@ -6,6 +6,7 @@ mod dependencies;
 mod dispatch;
 mod dynamic_textures;
 mod em_metrics;
+mod focus_queries;
 mod global_id;
 mod image_drops;
 mod interactive_text;
