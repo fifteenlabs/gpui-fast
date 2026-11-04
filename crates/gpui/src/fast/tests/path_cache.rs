@@ -63,6 +63,13 @@ fn a_different_shape_or_stroke_is_tessellated_again() {
     assert!(wide.bounds.size.height > thin.bounds.size.height);
 }
 
+/// How many holes a window-sized ground has: enough that 400 frames of new
+/// shapes build more than twice what may be kept, and 100 shapes between half
+/// and all of it. Fifteen's paths carry their content mask per path rather than
+/// per vertex, so a vertex here weighs half what it does upstream and a ground
+/// needs more holes to weigh the same.
+const HOLES: usize = 360;
+
 /// A window-sized ground with `holes` square holes, which move with `frame`
 /// so that no two frames are the same shape.
 fn ground(frame: usize, holes: usize) -> PathBuilder {
@@ -89,7 +96,7 @@ fn ground(frame: usize, holes: usize) -> PathBuilder {
 #[test]
 fn unique_window_sized_paths_are_kept_within_a_bounded_number_of_bytes() {
     for frame in 0..400 {
-        ground(frame, 200).build().unwrap();
+        ground(frame, HOLES).build().unwrap();
         assert!(path_cache_stats().held_bytes <= crate::fast::path_cache::MOST_HELD_BYTES);
     }
     let stats = path_cache_stats();
@@ -110,13 +117,13 @@ fn unique_window_sized_paths_are_kept_within_a_bounded_number_of_bytes() {
 /// triangles.
 #[test]
 fn shapes_built_again_after_being_let_go_are_tessellated_again_the_same() {
-    let first = ground(0, 200).build().unwrap();
+    let first = ground(0, HOLES).build().unwrap();
     for frame in 1..400 {
-        ground(frame, 200).build().unwrap();
+        ground(frame, HOLES).build().unwrap();
     }
     let before = path_cache_stats();
     assert!(before.evictions > 0, "nothing was let go of");
-    let again = ground(0, 200).build().unwrap();
+    let again = ground(0, HOLES).build().unwrap();
     let after = path_cache_stats();
     assert_eq!(
         after.misses,
@@ -137,7 +144,7 @@ fn a_set_of_window_sized_paths_between_half_and_all_the_bytes_is_drawn_from_kept
     let most = crate::fast::path_cache::MOST_HELD_BYTES as u64;
     for frame in 0..5 {
         for shape in 0..100 {
-            ground(shape, 200).build().unwrap();
+            ground(shape, HOLES).build().unwrap();
         }
         let stats = path_cache_stats();
         assert_eq!(stats.misses, 100, "after frame {frame}");
