@@ -14,16 +14,35 @@ upstream GPUI before the app moved to gpui-fast.
   un-isolated and say so once.
 - **Window behaviour**: a window zoom that scales every length, opting out of
   the window shadow, adopting programmatic resizes, popup windows without
-  chrome, BGRA pixel-buffer surfaces.
+  chrome.
 - **Smaller API additions**: animated PNGs in `img`, promised files on drop,
   redraw attribution and live handle counts, `draw_in_progress`, text that hugs
   its rows and reserves room for a trailing element, a content type on text
-  input, `/` as a word character when wrapping, and the wgpu font and backend
-  options the Android and web builds use.
+  input, no break after `/` when wrapping (a filter on upstream's UAX #14
+  break opportunities), a transparent headless renderer
+  (`current_headless_renderer_with_transparency`), and the wgpu font and
+  backend options the Android and web builds use.
+- **Retained-renderer reactivity**: a retained view is drawn again when an
+  entity it read is released, when the window's focus, size or appearance
+  changes while it draws, when scroll geometry it read changes or a scroll
+  handle is marked changed, and when a focus containment question it asked
+  has a different answer in the frame drawn; an image cache is told which of
+  its images a window still draws, and a dropped image's tiles live while
+  something draws them. Upstream's cached-view fixes, which gpui-fast carries
+  into `fast::retained` (reads in paint and in deferred draws, #65952;
+  inherited opacity, #65951), cover none of these.
 
 The changed upstream files are listed at the top of
 `script/upstream-allowlist`, so `script/check-upstream` still holds gpui-fast's
 own hooks to its rules.
+
+## What the branch no longer carries
+
+- **BGRA pixel-buffer surfaces**, dropped for gpui-fast's dynamic textures
+  (`Window::create_dynamic_texture`, `update_dynamic_texture`,
+  `paint_dynamic_texture`, `remove_dynamic_texture`). A surface is
+  upstream's again: a biplanar full-range YCbCr frame. Dynamic textures copy a
+  frame's bytes rather than sampling an IOSurface in place.
 
 ## How the patches meet gpui-fast
 
@@ -39,12 +58,36 @@ own hooks to its rules.
   brush transforms with it; tiles hash clip and group markers.
 - Paths take the content mask snapped to device pixels, as quads do, so a scroll
   layer clips them to the snapped viewport too.
-- Metal frames always take the frame encoder that handles clip masks and group
-  targets. gpui-fast's grouping of path batches into fewer render passes is not
-  carried.
+- Paths are upstream's tiled analytic-coverage paths (`PaintedPath`). A
+  path's clip id rides in its `PathPaint`, and its brush in a per-path side
+  buffer the Metal path tile shader reads (`PathBrushRecord`); a rounded
+  content mask is evaluated per fragment, so such a path, quad or sprite never
+  takes the shaders' solid fast path or the opaque depth pass.
+- A layer's primitives reach the per-kind arrays only when the outermost layer
+  closes; a group boundary inside a layer cuts the open layers there
+  (`Scene::split_open_layers`), so a group's primitives stay one contiguous
+  run.
+- Native views are a ninth per-kind run (`Segment::native_views`).
+- `SubpixelSprite` is laid out word for word as `MonochromeSprite`, whose
+  `animation` slot it pads, because DirectX draws subpixel sprites with the
+  monochrome sprite shaders.
+- The Metal renderer is upstream's objc2-metal one, and the patches use its
+  idioms: pipelines, textures and encoders are created fallibly, and a
+  frame's CoreVideo textures live until its completion handler runs.
+- A dynamic texture's content version rides in its sprite's
+  `AtlasTile::padding`, which no shader reads and the scroll-layer tile hash
+  covers, because `PolychromeSprite::pad` is the clip id here.
+- A Metal frame that pushes no clip path and no group is drawn exactly as
+  upstream draws it, depth-buffered opaque pass included. One that does is
+  drawn by `vector/frame.rs`, pass by pass, back to front with no depth culling,
+  because a depth buffer does not survive the frame being cut into group
+  passes. Its clip masks (`vector/clips.rs`) and group targets and filters
+  (`vector/groups.rs`) live beside the renderer rather than inside it, and every
+  shader takes a `RenderTarget` (origin and size) where upstream takes the
+  viewport size.
 
 ## Taking a new gpui-fast
 
-Merge gpui-fast's `main` into `fifteen`, then run
+Rebase `fifteen` onto gpui-fast's `main`, then run
 `cargo test -p gpui --features test-support`, `script/check-upstream`, and on a
 Mac `cargo test -p gpui_apple fast::layers` and `cargo test -p gpui_render_tests`.
