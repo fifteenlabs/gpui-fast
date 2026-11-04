@@ -1126,7 +1126,7 @@ mod tests {
         let mut wrapper = build_wrapper();
         for (text, fitting_prefix, expected_index) in [
             ("aaa required!", "aaa required", 4),
-            ("aaa foo/bar", "aaa foo/", 8),
+            ("aaa foo/bar", "aaa foo/", 4),
             ("aaa (hello)", "aaa (hello", 4),
             ("aaa αβγδε", "aaa αβγδ", 4),
             ("aaa a\u{a0}b", "aaa a\u{a0}", 4),
