@@ -1096,31 +1096,6 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return color;
 }
 
-fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
-    constant RenderTarget *render_target
-    [[buffer(SurfaceInputIndex_RenderTarget)]],
-                                      texture2d<float> bgra_texture
-                                      [[texture(SurfaceInputIndex_YTexture)]],
-                                      constant ClipMask *clip_masks
-                                      [[buffer(SurfaceInputIndex_ClipMasks),
-                                        function_constant(CLIPPED)]],
-                                      texture2d<float> clip_atlas
-                                      [[texture(SurfaceInputIndex_ClipAtlas),
-                                        function_constant(CLIPPED)]]) {
-  float2 scene_position = fragment_scene_position(input.position, render_target);
-  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  // Unlike `surfaces` above, the `bgra_surfaces` pipeline blends premultiplied
-  // alpha, so the mask scales the whole colour. Masking the alpha alone would
-  // leave the colour un-darkened and fringe the cut edge.
-  float alpha = packed_content_mask_alpha(scene_position, input.mask_bounds,
-                                          input.mask_corner_radii);
-  if (CLIPPED) {
-    alpha *= clip_mask_alpha(scene_position, input.clip_id, clip_masks,
-                             clip_atlas);
-  }
-  return bgra_texture.sample(texture_sampler, input.texture_position) * alpha;
-}
-
 // The two halves of stencil-and-cover, which is how a clip path becomes a tile
 // of the coverage atlas.
 //
