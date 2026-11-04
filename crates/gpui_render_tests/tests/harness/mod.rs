@@ -35,7 +35,7 @@ use objc2_core_video::{
     CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
     CVPixelBufferGetPlaneCount, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
     CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
-    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
 };
 
 /// The scale factor gpui's test window reports. Logical coordinates handed to
@@ -444,15 +444,21 @@ pub fn rect_path(bounds: Bounds<Pixels>) -> Path<Pixels> {
     path
 }
 
-/// An opaque white BGRA pixel buffer, backed by an IOSurface so the Metal
-/// texture cache will accept it.
+/// An opaque white biplanar YCbCr pixel buffer, backed by an IOSurface so the
+/// Metal texture cache will accept it: the one format a surface may be.
 ///
 /// A surface is the one primitive that is drawn one instance at a time, out of
 /// a record the renderer builds by hand rather than out of the instance buffer
 /// every other kind rides in, so it is also the one whose target and whose clip
 /// id it is easiest to get wrong.
 pub fn white_surface(side: usize) -> CFRetained<CVPixelBuffer> {
-    pixel_buffer(kCVPixelFormatType_32BGRA, side, |_| 0xff)
+    // Plane 0 is luma and plane 1 interleaved chroma: full-range white is luma
+    // 255 with both chroma channels at 128.
+    pixel_buffer(
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        side,
+        |plane| if plane == 0 { 0xff } else { 0x80 },
+    )
 }
 
 /// A `side`×`side` pixel buffer in `format`, backed by an IOSurface so the

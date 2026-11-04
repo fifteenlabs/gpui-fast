@@ -19,8 +19,6 @@ use gpui::{
 };
 use harness::{WHITE, at, rect, rect_path, render_frame, white_surface};
 use image::{Frame, RgbaImage};
-use objc2_core_foundation::CFRetained;
-use objc2_core_video::{CVPixelBuffer, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
 
 /// The window every test in this file renders, in logical pixels.
 const WINDOW: f32 = 200.;
@@ -261,33 +259,10 @@ fn glyphs_are_clipped_by_a_clip_path() {
 }
 
 #[test]
-fn a_bgra_surface_is_clipped_by_a_clip_path() {
+fn a_surface_is_clipped_by_a_clip_path() {
     // A surface is drawn one instance at a time out of a record the renderer
     // builds itself, so its clip id travels by a route no other primitive uses.
-    assert_clipped("a BGRA surface", &KEPT, &CUT, |bounds, window, _| {
+    assert_clipped("a surface", &KEPT, &CUT, |bounds, window, _| {
         window.paint_surface(bounds, white_surface(64));
-    });
-}
-
-/// An opaque white biplanar YCbCr pixel buffer, backed by an IOSurface.
-///
-/// The BGRA surface above goes down the `bgra_surfaces` pipeline; this one goes
-/// down `surfaces`, whose fragment stage does the YCbCr conversion and blends
-/// straight rather than premultiplied alpha. They are two pipelines with two
-/// clipped variants, and only one of them was covered.
-fn white_ycbcr_surface(side: usize) -> CFRetained<CVPixelBuffer> {
-    // Plane 0 is luma and plane 1 interleaved chroma: full-range white is luma
-    // 255 with both chroma channels at 128.
-    harness::pixel_buffer(
-        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-        side,
-        |plane| if plane == 0 { 0xff } else { 0x80 },
-    )
-}
-
-#[test]
-fn a_ycbcr_surface_is_clipped_by_a_clip_path() {
-    assert_clipped("a YCbCr surface", &KEPT, &CUT, |bounds, window, _| {
-        window.paint_surface(bounds, white_ycbcr_surface(64));
     });
 }
