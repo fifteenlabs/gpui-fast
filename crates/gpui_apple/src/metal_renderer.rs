@@ -16,8 +16,7 @@ use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBufferGetHeight,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_32BGRA,
-    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
 };
 use objc2_foundation::{NSRange, NSString};
 #[cfg(target_os = "macos")]
@@ -2604,6 +2603,8 @@ impl MetalRenderer {
         // A batch is homogeneous in whether it is clipped, so the whole run
         // agrees with its first element.
         let clip = self.clip_variant(first_surface_record.clip.is_clipped());
+        command_encoder
+            .setRenderPipelineState(self.pipeline_for(PrimitivePipeline::Surfaces, clip));
         self.bind_clip_mask(
             clip,
             command_encoder,
@@ -2644,122 +2645,67 @@ impl MetalRenderer {
                 DevicePixels::from(CVPixelBufferGetHeight(image_buffer) as i32),
             );
 
-            let plane_texture =
-                |plane, format, width, height| -> Result<CFRetained<CVMetalTexture>> {
-                    let mut texture = ptr::null_mut();
-                    // SAFETY: The plane and its dimensions come from this buffer's own format, and the output pointer is writable.
-                    let status = unsafe {
-                        CVMetalTextureCache::create_texture_from_image(
-                            None,
-                            &self.core_video_texture_cache,
-                            image_buffer,
-                            None,
-                            format,
-                            width,
-                            height,
-                            plane,
-                            ptr::NonNull::from(&mut texture),
-                        )
-                    };
-                    anyhow::ensure!(
-                        status == kCVReturnSuccess,
-                        "creating CoreVideo Metal texture for plane {plane}: status {status}"
-                    );
-                    let texture =
-                        ptr::NonNull::new(texture).context("retrieving CoreVideo Metal texture")?;
-                    // SAFETY: The successful create call transfers ownership of this non-null texture.
-                    Ok(unsafe { CFRetained::from_raw(texture) })
+            let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
+            anyhow::ensure!(
+                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                "unsupported surface pixel format: {pixel_format:#x}"
+            );
+
+            let plane_texture = |plane, format| -> Result<CFRetained<CVMetalTexture>> {
+                let width = CVPixelBufferGetWidthOfPlane(image_buffer, plane);
+                let height = CVPixelBufferGetHeightOfPlane(image_buffer, plane);
+                let mut texture = ptr::null_mut();
+                // SAFETY: The buffer has two planes matching these formats and dimensions, and the output pointer is writable.
+                let status = unsafe {
+                    CVMetalTextureCache::create_texture_from_image(
+                        None,
+                        &self.core_video_texture_cache,
+                        image_buffer,
+                        None,
+                        format,
+                        width,
+                        height,
+                        plane,
+                        ptr::NonNull::from(&mut texture),
+                    )
                 };
+                anyhow::ensure!(
+                    status == kCVReturnSuccess,
+                    "creating CoreVideo Metal texture for plane {plane}: status {status}"
+                );
+                let texture =
+                    ptr::NonNull::new(texture).context("retrieving CoreVideo Metal texture")?;
+                // SAFETY: The successful create call transfers ownership of this non-null texture.
+                Ok(unsafe { CFRetained::from_raw(texture) })
+            };
+            let y_texture = plane_texture(0, MTLPixelFormat::R8Unorm)?;
+            let cb_cr_texture = plane_texture(1, MTLPixelFormat::RG8Unorm)?;
+            let y_metal_texture =
+                CVMetalTextureGetTexture(&y_texture).context("retrieving luma Metal texture")?;
+            let cb_cr_metal_texture = CVMetalTextureGetTexture(&cb_cr_texture)
+                .context("retrieving chroma Metal texture")?;
 
-            match CVPixelBufferGetPixelFormatType(image_buffer) {
-                format if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
-                    command_encoder.setRenderPipelineState(
-                        self.pipeline_for(PrimitivePipeline::Surfaces, clip),
-                    );
-                    let y_texture = plane_texture(
-                        0,
-                        MTLPixelFormat::R8Unorm,
-                        CVPixelBufferGetWidthOfPlane(image_buffer, 0),
-                        CVPixelBufferGetHeightOfPlane(image_buffer, 0),
-                    )?;
-                    let cb_cr_texture = plane_texture(
-                        1,
-                        MTLPixelFormat::RG8Unorm,
-                        CVPixelBufferGetWidthOfPlane(image_buffer, 1),
-                        CVPixelBufferGetHeightOfPlane(image_buffer, 1),
-                    )?;
-                    let y_metal_texture = CVMetalTextureGetTexture(&y_texture)
-                        .context("retrieving luma Metal texture")?;
-                    let cb_cr_metal_texture = CVMetalTextureGetTexture(&cb_cr_texture)
-                        .context("retrieving chroma Metal texture")?;
-                    // SAFETY: Both planes match their shader texture slots. The
-                    // frame completion handler retains the CoreVideo wrappers
-                    // until GPU reads finish.
-                    unsafe {
-                        command_encoder.setFragmentTexture_atIndex(
-                            Some(&y_metal_texture),
-                            SurfaceInputIndex::YTexture as usize,
-                        );
-                        command_encoder.setFragmentTexture_atIndex(
-                            Some(&cb_cr_metal_texture),
-                            SurfaceInputIndex::CbCrTexture as usize,
-                        );
-                    }
-                    surface_textures.extend([y_texture, cb_cr_texture]);
-                }
-                format if format == kCVPixelFormatType_32BGRA => {
-                    command_encoder.setRenderPipelineState(
-                        self.pipeline_for(PrimitivePipeline::BgraSurfaces, clip),
-                    );
-                    // Unlike the video path above (whose AVFoundation buffers
-                    // are always cache-compatible), BGRA buffers come from
-                    // app code — skip the draw instead of failing the frame if
-                    // the texture cache rejects one.
-                    let bgra_texture = match plane_texture(
-                        0,
-                        MTLPixelFormat::BGRA8Unorm,
-                        CVPixelBufferGetWidth(image_buffer),
-                        CVPixelBufferGetHeight(image_buffer),
-                    ) {
-                        Ok(texture) => texture,
-                        Err(error) => {
-                            log::error!(
-                                "failed to create Metal texture for BGRA surface: {error:#}; \
-                                 skipping draw"
-                            );
-                            continue;
-                        }
-                    };
-                    let Some(bgra_metal_texture) = CVMetalTextureGetTexture(&bgra_texture) else {
-                        log::error!("CoreVideo returned no Metal texture for a BGRA surface");
-                        continue;
-                    };
-                    // SAFETY: The texture matches the shader's first texture
-                    // slot. The frame completion handler retains the CoreVideo
-                    // wrapper until GPU reads finish.
-                    unsafe {
-                        command_encoder.setFragmentTexture_atIndex(
-                            Some(&bgra_metal_texture),
-                            SurfaceInputIndex::YTexture as usize,
-                        );
-                    }
-                    surface_textures.push(bgra_texture);
-                }
-                format => {
-                    log::error!("unsupported surface pixel format: {format:#x}; skipping draw");
-                    continue;
-                }
-            }
-
-            // SAFETY: The size is copied from a live value, and six unit
-            // vertices draw one instance within the uploaded scene's surface
-            // range.
+            // SAFETY: The size is copied from a live value, and both planes match their shader texture slots.
+            // The frame completion handler retains the CoreVideo wrappers until GPU reads finish.
             unsafe {
                 command_encoder.setVertexBytes_length_atIndex(
                     ptr::NonNull::from(&texture_size).cast(),
                     mem::size_of_val(&texture_size),
                     SurfaceInputIndex::TextureSize as usize,
                 );
+                command_encoder.setFragmentTexture_atIndex(
+                    Some(&y_metal_texture),
+                    SurfaceInputIndex::YTexture as usize,
+                );
+                command_encoder.setFragmentTexture_atIndex(
+                    Some(&cb_cr_metal_texture),
+                    SurfaceInputIndex::CbCrTexture as usize,
+                );
+            }
+            surface_textures.extend([y_texture, cb_cr_texture]);
+
+            // SAFETY: Six unit vertices draw one instance within the uploaded scene's surface range.
+            unsafe {
                 command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                     MTLPrimitiveType::Triangle,
                     0,
@@ -3157,7 +3103,6 @@ pub(crate) enum PrimitivePipeline {
     MonochromeSprites,
     PolychromeSprites,
     Surfaces,
-    BgraSurfaces,
 }
 
 /// Which blend and attachment shape a pipeline is built with.
@@ -3165,8 +3110,6 @@ pub(crate) enum PrimitivePipeline {
 enum PipelineShape {
     /// gpui's usual straight-alpha source-over.
     StraightAlpha,
-    /// Source factor `One`, for a fragment that is already premultiplied.
-    Premultiplied,
     /// Multisampled, drawn into the path intermediate.
     Multisampled,
 }
@@ -3175,7 +3118,7 @@ enum PipelineShape {
 /// Metal's debugger shows, the vertex function, the fragment function, and how
 /// it blends. A clipped pipeline is the same three names with `_clipped`
 /// appended to the label and the `CLIPPED` function constant set.
-const PRIMITIVE_PIPELINES: [(&str, &str, &str, PipelineShape); 8] = [
+const PRIMITIVE_PIPELINES: [(&str, &str, &str, PipelineShape); 7] = [
     (
         "paths_rasterization",
         "path_rasterization_vertex",
@@ -3218,19 +3161,8 @@ const PRIMITIVE_PIPELINES: [(&str, &str, &str, PipelineShape); 8] = [
         "surface_fragment",
         PipelineShape::StraightAlpha,
     ),
-    // BGRA surfaces carry premultiplied alpha (they come from GPU renderers
-    // like vello, and CoreGraphics can only produce premultiplied BGRA), so
-    // they blend with source factor One rather than gpui's usual straight-alpha
-    // SourceAlpha factor.
-    (
-        "bgra_surfaces",
-        "surface_vertex",
-        "surface_bgra_fragment",
-        PipelineShape::Premultiplied,
-    ),
 ];
 
-/// Builds every [`PrimitivePipeline`], either unclipped or clipped.
 /// Builds every [`PrimitivePipeline`], either unclipped or clipped.
 fn build_primitive_pipelines(
     device: &ProtocolObject<dyn MTLDevice>,
@@ -3254,15 +3186,6 @@ fn build_primitive_pipelines(
                     fragment_fn,
                     MTLPixelFormat::BGRA8Unorm,
                     PATH_SAMPLE_COUNT,
-                    clipped,
-                ),
-                PipelineShape::Premultiplied => build_path_sprite_pipeline_state(
-                    device,
-                    library,
-                    &label,
-                    vertex_fn,
-                    fragment_fn,
-                    MTLPixelFormat::BGRA8Unorm,
                     clipped,
                 ),
                 PipelineShape::StraightAlpha => build_pipeline_state(
@@ -4559,9 +4482,9 @@ mod tests {
 /// building them up front would double this renderer's pipeline compilation at
 /// startup for a feature nothing in gpui's own UI uses.
 ///
-/// The bill for that is fourteen pipeline states compiled on the render thread
+/// The bill for that is nine pipeline states compiled on the render thread
 /// during the first frame that clips anything - two mask pipelines and a
-/// clipped variant of each of the twelve drawing ones - which on a cold shader
+/// clipped variant of each of the seven drawing ones - which on a cold shader
 /// cache is a hitch the user sees once. Moving it off the critical path means
 /// building them on another thread and handing them over, which is a change to
 /// how this renderer owns its state rather than a change to this function.
