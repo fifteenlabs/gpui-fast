@@ -1582,7 +1582,7 @@ extern "C-unwind" fn handle_dock_menu(
     }
 }
 
-unsafe fn ns_url_to_path(url: *mut AnyObject) -> Result<PathBuf> {
+pub(crate) unsafe fn ns_url_to_path(url: *mut AnyObject) -> Result<PathBuf> {
     let path: *const c_char = unsafe { msg_send![url, fileSystemRepresentation] };
     anyhow::ensure!(!path.is_null(), "url is not a file path: {}", unsafe {
         let string: *mut NSString = msg_send![url, absoluteString];

@@ -518,7 +518,7 @@ impl Element for UniformList {
 
                     let fast_indices =
                         crate::fast::layers::lists::row_indices(&fast_rows, visible_range.clone());
-                    let content_mask = ContentMask { bounds };
+                    let content_mask = ContentMask::new(bounds);
                     window.with_content_mask(Some(content_mask), |window| {
                         for (mut item, ix) in items.into_iter().zip(fast_indices) {
                             let item_top = item_height_f64 * ix as f64 - scroll_top;
