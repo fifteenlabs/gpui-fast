@@ -543,12 +543,13 @@ impl LineWrapper {
 
     /// The byte offsets in `text` at which a line break is allowed.
     ///
-    /// Never right after a `/`, so URLs and paths fill the line and break at
-    /// the pixel boundary instead of at every path segment (like Telegram).
+    /// Never right after a `/` or `-`, so URLs, paths and hyphenated words
+    /// fill the line and break at the pixel boundary instead of at every
+    /// segment (like Telegram).
     pub(crate) fn break_indices(text: &str) -> impl Iterator<Item = usize> {
         icu_segmenter::LineSegmenter::new_for_non_complex_scripts(Default::default())
             .segment_str(text)
-            .filter(move |&ix| !text[..ix].ends_with('/'))
+            .filter(move |&ix| !text[..ix].ends_with(['/', '-']))
     }
 
     #[inline(always)]
@@ -858,6 +859,11 @@ mod tests {
         let breaks: Vec<usize> = LineWrapper::break_indices(text).collect();
         assert!(breaks.contains(&4), "{breaks:?}");
         assert!(!breaks.contains(&(text.find('/').unwrap() + 1)), "{breaks:?}");
+        assert!(!breaks.contains(&(text.find('-').unwrap() + 1)), "{breaks:?}");
+
+        let url = "https://github.com/zed-industries/zed-fast?x=1&y=2";
+        let breaks: Vec<usize> = LineWrapper::break_indices(url).collect();
+        assert!(breaks.iter().all(|&ix| !url[..ix].ends_with(['/', '-'])), "{breaks:?}");
     }
 
     #[test]

@@ -1087,7 +1087,14 @@ impl MetalRenderer {
         for step in scene.steps() {
             let run = match step {
                 SceneStep::PushGroup(spec) => {
-                    match self.open_group(spec, &target, viewport_size, open_groups.len())? {
+                    let opened = match self.open_group(spec, &target, viewport_size, open_groups.len()) {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            command_encoder.endEncoding();
+                            return Err(error);
+                        }
+                    };
+                    match opened {
                         Some(group) => {
                             command_encoder.endEncoding();
                             target = group.target.clone();
@@ -1109,9 +1116,10 @@ impl MetalRenderer {
                     continue;
                 }
                 SceneStep::PopGroup => {
-                    let group = open_groups
-                        .pop()
-                        .context("a scene popped a group it never pushed")?;
+                    let Some(group) = open_groups.pop() else {
+                        command_encoder.endEncoding();
+                        anyhow::bail!("a scene popped a group it never pushed");
+                    };
                     let Some(group) = group else {
                         continue;
                     };
@@ -2646,10 +2654,10 @@ impl MetalRenderer {
             );
 
             let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
-            anyhow::ensure!(
-                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                "unsupported surface pixel format: {pixel_format:#x}"
-            );
+            if pixel_format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                log::error!("unsupported surface pixel format {pixel_format:#x}; skipping draw");
+                continue;
+            }
 
             let plane_texture = |plane, format| -> Result<CFRetained<CVMetalTexture>> {
                 let width = CVPixelBufferGetWidthOfPlane(image_buffer, plane);
