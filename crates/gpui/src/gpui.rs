@@ -32,6 +32,7 @@ mod asset_cache;
 mod assets;
 #[path = "fast/bounds_tree.rs"]
 mod bounds_tree;
+mod clip_path;
 mod color;
 mod element;
 mod elements;
@@ -45,6 +46,7 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+mod gradient;
 mod path_builder;
 mod platform;
 mod platform_scheduler;
@@ -74,6 +76,7 @@ mod hot_reload;
     test,
     target_os = "windows",
     target_os = "linux",
+    target_os = "android",
     target_family = "wasm",
     feature = "test-support",
     feature = "bench-support"
@@ -120,6 +123,7 @@ pub use anyhow::Result;
 pub use app::*;
 pub use asset_cache::*;
 pub use assets::*;
+pub use clip_path::*;
 pub use color::*;
 pub use element::*;
 pub use elements::*;
@@ -150,6 +154,7 @@ pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
 pub use keymap::*;
+pub use gradient::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;

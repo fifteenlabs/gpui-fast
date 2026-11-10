@@ -229,42 +229,67 @@ impl Scene {
 /// numbers from zero, would interleave them.
 #[inline]
 pub(crate) fn sort_in_drawing_order(scene: &mut Scene) {
-    crate::fast::rounded_clip_scene::compile(scene);
+    if crate::fast::rounded_clip_scene::compile(scene) {
+        scene.close_run();
+    }
+    // A scene the isolated groups cut into runs is drawn run by run, so each
+    // run is put in order on its own; a scene with no groups is one run over
+    // everything, sorted in place.
+    let whole = scene.segments.len() <= 1;
+    let segments = if whole {
+        Vec::new()
+    } else {
+        scene.segments.clone()
+    };
     let scratch = &mut scene.sort_scratch;
     macro_rules! sort {
-        ($field:ident, $order:expr) => {
-            sort_by_draw_order(
-                &mut scene.$field,
-                &mut scratch.permutation,
-                &mut scratch.$field,
-                $order,
-            )
+        ($field:ident, $sorter:ident, $order:expr) => {
+            if whole {
+                $sorter(
+                    &mut scene.$field,
+                    &mut scratch.permutation,
+                    &mut scratch.$field,
+                    $order,
+                );
+            } else {
+                for segment in &segments {
+                    let range = segment.$field.clone();
+                    if range.len() < 2 {
+                        continue;
+                    }
+                    let mut run = scene.$field[range.clone()].to_vec();
+                    $sorter(
+                        &mut run,
+                        &mut scratch.permutation,
+                        &mut scratch.$field,
+                        $order,
+                    );
+                    scene.$field[range].clone_from_slice(&run);
+                }
+            }
         };
     }
-    macro_rules! sort_sprites {
-        ($field:ident) => {
-            sort_sprites(
-                &mut scene.$field,
-                &mut scratch.permutation,
-                &mut scratch.$field,
-                |sprite| {
-                    (
-                        sprite.order,
-                        sprite.tile.texture_id.index,
-                        sprite.tile.tile_id.0,
-                    )
-                },
-            )
-        };
-    }
-    sort!(shadows, |shadow: &Shadow| shadow.order);
-    sort!(quads, |quad: &Quad| quad.order);
-    sort!(paths, |path: &Path<ScaledPixels>| path.order);
-    sort!(underlines, |underline: &Underline| underline.order);
-    sort_sprites!(monochrome_sprites);
-    sort_sprites!(subpixel_sprites);
-    sort_sprites!(polychrome_sprites);
-    sort!(surfaces, |surface: &PaintSurface| surface.order);
+    let sprite_key = |order: DrawOrder, tile: &crate::AtlasTile| {
+        (order, tile.texture_id.index, tile.tile_id.0)
+    };
+    sort!(shadows, sort_by_draw_order, |shadow: &Shadow| shadow.order);
+    sort!(quads, sort_by_draw_order, |quad: &Quad| quad.order);
+    sort!(paths, sort_by_draw_order, |path: &Path<ScaledPixels>| path
+        .order);
+    sort!(underlines, sort_by_draw_order, |underline: &Underline| {
+        underline.order
+    });
+    sort!(monochrome_sprites, sort_sprites, |sprite: &MonochromeSprite| {
+        sprite_key(sprite.order, &sprite.tile)
+    });
+    sort!(subpixel_sprites, sort_sprites, |sprite: &SubpixelSprite| {
+        sprite_key(sprite.order, &sprite.tile)
+    });
+    sort!(polychrome_sprites, sort_sprites, |sprite: &PolychromeSprite| {
+        sprite_key(sprite.order, &sprite.tile)
+    });
+    sort!(surfaces, sort_by_draw_order, |surface: &PaintSurface| surface
+        .order);
 }
 
 #[cfg(test)]

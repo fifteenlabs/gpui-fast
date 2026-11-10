@@ -542,9 +542,13 @@ impl LineWrapper {
     }
 
     /// The byte offsets in `text` at which a line break is allowed.
+    ///
+    /// Never right after a `/`, so URLs and paths fill the line and break at
+    /// the pixel boundary instead of at every path segment (like Telegram).
     pub(crate) fn break_indices(text: &str) -> impl Iterator<Item = usize> {
         icu_segmenter::LineSegmenter::new_for_non_complex_scripts(Default::default())
             .segment_str(text)
+            .filter(move |&ix| !text[..ix].ends_with('/'))
     }
 
     #[inline(always)]
@@ -846,6 +850,14 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn test_no_break_after_slash() {
+        let text = "see zed-industries/zed now";
+        let breaks: Vec<usize> = LineWrapper::break_indices(text).collect();
+        assert!(breaks.contains(&4), "{breaks:?}");
+        assert!(!breaks.contains(&(text.find('/').unwrap() + 1)), "{breaks:?}");
     }
 
     #[test]

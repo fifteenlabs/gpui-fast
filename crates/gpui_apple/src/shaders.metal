@@ -3,6 +3,17 @@
 
 using namespace metal;
 
+// Whether the pipeline this function was specialized into draws clipped
+// primitives.
+//
+// Two variants of every clippable pipeline are compiled out of this one source.
+// The unclipped one carries no clip varying, no clip binding and no branch,
+// because `if (CLIPPED)` and every argument marked with this constant are
+// folded away at specialization time. That is what keeps an arbitrary-path
+// clip - which nothing in gpui's own UI uses - free for a frame that never
+// asks for one. See `ClipId` and `MetalRenderer::clip_resources`.
+constant bool CLIPPED [[function_constant(0)]];
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -10,12 +21,23 @@ float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           constant Size_DevicePixels *viewport_size);
-float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size);
+float2 to_scene_position(float2 unit_vertex, Bounds_ScaledPixels bounds);
+float2 to_scene_position_transformed(float2 unit_vertex,
+                                     Bounds_ScaledPixels bounds,
+                                     TransformationMatrix transformation);
+float4 to_target_position(float2 scene_position,
+                          constant RenderTarget *render_target);
+float4 apply_color_matrices(float4 premultiplied, constant GroupFilter *filter);
+float4 filter_read(texture2d<float> source, int2 texel,
+                   constant FilterPass *pass);
+float filter_sample_alpha(texture2d<float> source, float2 at,
+                          constant FilterPass *pass);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
+uint extend_texel(int texel, uint extent, BrushExtend extend);
+float4 sample_path_brush(PathBrush brush, float2 position,
+                         texture2d<float> atlas);
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -28,6 +50,14 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
+float content_mask_alpha(float2 point, ContentMask_ScaledPixels mask);
+float packed_content_mask_alpha(float2 point, float4 mask_bounds,
+                                float4 mask_corner_radii);
+float clip_mask_alpha(float2 point, uint clip_id,
+                      constant ClipMask *clip_masks,
+                      texture2d<float> clip_atlas);
+float4 pack_bounds(Bounds_ScaledPixels bounds);
+float4 pack_corner_radii(Corners_ScaledPixels corner_radii);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -47,6 +77,7 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla co
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];
+  float2 scene_position;
   float4 border_color [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
@@ -57,6 +88,7 @@ struct QuadVertexOutput {
 struct QuadFragmentInput {
   uint quad_id [[flat]];
   float4 position [[position]];
+  float2 scene_position;
   float4 border_color [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
@@ -69,12 +101,12 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     [[buffer(QuadInputIndex_Vertices)]],
                                     constant Quad *quads
                                     [[buffer(QuadInputIndex_Quads)]],
-                                    constant Size_DevicePixels *viewport_size
-                                    [[buffer(QuadInputIndex_ViewportSize)]]) {
+                                    constant RenderTarget *render_target
+                                    [[buffer(QuadInputIndex_RenderTarget)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Quad quad = quads[quad_id];
-  float4 device_position =
-      to_device_position(unit_vertex, quad.bounds, viewport_size);
+  float2 scene_position = to_scene_position(unit_vertex, quad.bounds);
+  float4 device_position = to_target_position(scene_position, render_target);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
                                                  quad.content_mask.bounds);
   float4 border_color = hsla_to_rgba(quad.border_color);
@@ -90,6 +122,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   return QuadVertexOutput{
       quad_id,
       device_position,
+      scene_position,
       border_color,
       gradient.solid,
       gradient.color0,
@@ -99,9 +132,20 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+                              [[buffer(QuadInputIndex_Quads)]],
+                              constant ClipMask *clip_masks
+                              [[buffer(QuadInputIndex_ClipMasks),
+                                function_constant(CLIPPED)]],
+                              texture2d<float> clip_atlas
+                              [[texture(QuadInputIndex_ClipAtlas),
+                                function_constant(CLIPPED)]]) {
   Quad quad = quads[input.quad_id];
-  float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
+  float mask_alpha = content_mask_alpha(input.scene_position, quad.content_mask);
+  if (CLIPPED) {
+    mask_alpha *=
+        clip_mask_alpha(input.scene_position, quad.clip, clip_masks, clip_atlas);
+  }
+  float4 background_color = fill_color(quad.background, input.scene_position, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -115,12 +159,13 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
+    background_color.a *= mask_alpha;
     return background_color;
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
   float2 half_size = size / 2.0;
-  float2 point = input.position.xy - float2(quad.bounds.origin.x, quad.bounds.origin.y);
+  float2 point = input.scene_position - float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float2 center_to_point = point - half_size;
 
   // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -173,8 +218,12 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     straight_border_inner_corner_to_point.x < -antialias_threshold &&
     straight_border_inner_corner_to_point.y < -antialias_threshold;
 
-  // Fast path for points that must be part of the background
+  // Fast path for points that must be part of the background. The quad's own
+  // outline cannot reach this far in, but the content mask still can: this is
+  // the interior of every quad that has a border or corners of its own, which
+  // is most of them.
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
+    background_color.a *= mask_alpha;
     return background_color;
   }
 
@@ -393,7 +442,9 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  return color *
+         float4(1.0, 1.0, 1.0,
+                saturate(antialias_threshold - outer_sdf) * mask_alpha);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -448,6 +499,7 @@ float quarter_ellipse_sdf(float2 point, float2 radii) {
 
 struct ShadowVertexOutput {
   float4 position [[position]];
+  float2 scene_position;
   float4 color [[flat]];
   uint shadow_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -455,6 +507,7 @@ struct ShadowVertexOutput {
 
 struct ShadowFragmentInput {
   float4 position [[position]];
+  float2 scene_position;
   float4 color [[flat]];
   uint shadow_id [[flat]];
 };
@@ -463,8 +516,8 @@ vertex ShadowVertexOutput shadow_vertex(
     uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
     constant Shadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
-    constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    constant RenderTarget *render_target
+    [[buffer(ShadowInputIndex_RenderTarget)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Shadow shadow = shadows[shadow_id];
 
@@ -481,14 +534,15 @@ vertex ShadowVertexOutput shadow_vertex(
     bounds.size.height += 2. * margin;
   }
 
-  float4 device_position =
-      to_device_position(unit_vertex, bounds, viewport_size);
+  float2 scene_position = to_scene_position(unit_vertex, bounds);
+  float4 device_position = to_target_position(scene_position, render_target);
   float4 clip_distance =
       distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
   float4 color = hsla_to_rgba(shadow.color);
 
   return ShadowVertexOutput{
       device_position,
+      scene_position,
       color,
       shadow_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -496,14 +550,20 @@ vertex ShadowVertexOutput shadow_vertex(
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
+                                [[buffer(ShadowInputIndex_Shadows)]],
+                                constant ClipMask *clip_masks
+                                [[buffer(ShadowInputIndex_ClipMasks),
+                                  function_constant(CLIPPED)]],
+                                texture2d<float> clip_atlas
+                                [[texture(ShadowInputIndex_ClipAtlas),
+                                  function_constant(CLIPPED)]]) {
   Shadow shadow = shadows[input.shadow_id];
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
   float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
   float2 half_size = size / 2.;
   float2 center = origin + half_size;
-  float2 point = input.position.xy - center;
+  float2 point = input.scene_position - center;
   float corner_radius;
   if (point.x < 0.) {
     if (point.y < 0.) {
@@ -521,7 +581,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(input.scene_position, shadow.bounds, shadow.corner_radii);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -546,9 +606,15 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+    float element_distance = quad_sdf(input.scene_position, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 - element_distance);
+  }
+
+  alpha *= content_mask_alpha(input.scene_position, shadow.content_mask);
+  if (CLIPPED) {
+    alpha *=
+        clip_mask_alpha(input.scene_position, shadow.clip, clip_masks, clip_atlas);
   }
 
   return input.color * float4(1., 1., 1., alpha);
@@ -556,6 +622,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
 struct UnderlineVertexOutput {
   float4 position [[position]];
+  float2 scene_position;
   float4 color [[flat]];
   uint underline_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -563,6 +630,7 @@ struct UnderlineVertexOutput {
 
 struct UnderlineFragmentInput {
   float4 position [[position]];
+  float2 scene_position;
   float4 color [[flat]];
   uint underline_id [[flat]];
 };
@@ -571,17 +639,18 @@ vertex UnderlineVertexOutput underline_vertex(
     uint unit_vertex_id [[vertex_id]], uint underline_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
     constant Underline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
-    constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    constant RenderTarget *render_target
+    [[buffer(UnderlineInputIndex_RenderTarget)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
-  float4 device_position =
-      to_device_position(unit_vertex, underline.bounds, viewport_size);
+  float2 scene_position = to_scene_position(unit_vertex, underline.bounds);
+  float4 device_position = to_target_position(scene_position, render_target);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
                                                  underline.content_mask.bounds);
   float4 color = hsla_to_rgba(underline.color);
   return UnderlineVertexOutput{
       device_position,
+      scene_position,
       color,
       underline_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -589,17 +658,31 @@ vertex UnderlineVertexOutput underline_vertex(
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
                                    constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
+                                   [[buffer(UnderlineInputIndex_Underlines)]],
+                                   constant ClipMask *clip_masks
+                                   [[buffer(UnderlineInputIndex_ClipMasks),
+                                     function_constant(CLIPPED)]],
+                                   texture2d<float> clip_atlas
+                                   [[texture(UnderlineInputIndex_ClipAtlas),
+                                     function_constant(CLIPPED)]]) {
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  // Straight alpha out of this pipeline, so the mask multiplies the alpha
+  // channel alone.
+  float mask_alpha =
+      content_mask_alpha(input.scene_position, underline.content_mask);
+  if (CLIPPED) {
+    mask_alpha *= clip_mask_alpha(input.scene_position, underline.clip, clip_masks,
+                                  clip_atlas);
+  }
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
         float2(underline.bounds.origin.x, underline.bounds.origin.y);
 
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
+    float2 st = ((input.scene_position - origin) / underline.bounds.size.height) -
                 float2(0., 0.5);
     float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
     float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
@@ -612,53 +695,78 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return input.color * float4(1., 1., 1., alpha * mask_alpha);
   } else {
-    return input.color;
+    return input.color * float4(1., 1., 1., mask_alpha);
   }
 }
 
+// Every glyph in the app goes through this pipeline, so the fragment stage is
+// given the mask as two flat varyings rather than the sprite's index: reading
+// the sprite back out of the instance buffer would load the whole struct once
+// per fragment, for data the vertex stage has already loaded.
 struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
+  float2 scene_position;
   float2 tile_position;
   float4 color [[flat]];
+  float4 mask_bounds [[flat]];
+  float4 mask_corner_radii [[flat]];
   float4 clip_distance;
+  // Carried only by the clipped variant, for the same reason the mask above is
+  // carried as varyings at all: the fragment stage never loads the sprite.
+  uint clip_id [[flat, function_constant(CLIPPED)]];
 };
 
 struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
+  float2 scene_position;
   float2 tile_position;
   float4 color [[flat]];
+  float4 mask_bounds [[flat]];
+  float4 mask_corner_radii [[flat]];
   float4 clip_distance;
+  uint clip_id [[flat, function_constant(CLIPPED)]];
 };
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    constant Size_DevicePixels *viewport_size
-    [[buffer(SpriteInputIndex_ViewportSize)]],
+    constant RenderTarget *render_target
+    [[buffer(SpriteInputIndex_RenderTarget)]],
     constant Size_DevicePixels *atlas_size
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   MonochromeSprite sprite = sprites[sprite_id];
-  float4 device_position =
-      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float2 scene_position = to_scene_position_transformed(
+      unit_vertex, sprite.bounds, sprite.transformation);
+  float4 device_position = to_target_position(scene_position, render_target);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   float4 color = hsla_to_rgba(sprite.color);
-  return MonochromeSpriteVertexOutput{
-      device_position,
-      tile_position,
-      color,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+  MonochromeSpriteVertexOutput output;
+  output.position = device_position;
+  output.scene_position = scene_position;
+  output.tile_position = tile_position;
+  output.color = color;
+  output.mask_bounds = pack_bounds(sprite.content_mask.bounds);
+  output.mask_corner_radii = pack_corner_radii(sprite.content_mask.corner_radii);
+  output.clip_distance = clip_distance;
+  if (CLIPPED) {
+    output.clip_id = sprite.clip;
+  }
+  return output;
 }
 
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant ClipMask *clip_masks
+    [[buffer(SpriteInputIndex_ClipMasks), function_constant(CLIPPED)]],
+    texture2d<float> clip_atlas
+    [[texture(SpriteInputIndex_ClipAtlas), function_constant(CLIPPED)]]) {
   if (any(input.clip_distance < float4(0.0))) {
     return float4(0.0);
   }
@@ -668,12 +776,19 @@ fragment float4 monochrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
+  color.a *= sample.a * packed_content_mask_alpha(input.scene_position,
+                                                  input.mask_bounds,
+                                                  input.mask_corner_radii);
+  if (CLIPPED) {
+    color.a *= clip_mask_alpha(input.scene_position, input.clip_id, clip_masks,
+                               clip_atlas);
+  }
   return color;
 }
 
 struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
+  float2 scene_position;
   float2 tile_position;
   uint sprite_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -681,6 +796,7 @@ struct PolychromeSpriteVertexOutput {
 
 struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
+  float2 scene_position;
   float2 tile_position;
   uint sprite_id [[flat]];
 };
@@ -689,20 +805,21 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    constant Size_DevicePixels *viewport_size
-    [[buffer(SpriteInputIndex_ViewportSize)]],
+    constant RenderTarget *render_target
+    [[buffer(SpriteInputIndex_RenderTarget)]],
     constant Size_DevicePixels *atlas_size
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
-  float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
+  float2 scene_position = to_scene_position(unit_vertex, sprite.bounds);
+  float4 device_position = to_target_position(scene_position, render_target);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   return PolychromeSpriteVertexOutput{
       device_position,
+      scene_position,
       tile_position,
       sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -711,14 +828,18 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant ClipMask *clip_masks
+    [[buffer(SpriteInputIndex_ClipMasks), function_constant(CLIPPED)]],
+    texture2d<float> clip_atlas
+    [[texture(SpriteInputIndex_ClipAtlas), function_constant(CLIPPED)]]) {
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.scene_position, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -727,7 +848,12 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  color.a *= sprite.opacity * saturate(0.5 - distance) *
+             content_mask_alpha(input.scene_position, sprite.content_mask);
+  if (CLIPPED) {
+    color.a *=
+        clip_mask_alpha(input.scene_position, sprite.clip, clip_masks, clip_atlas);
+  }
   return color;
 }
 
@@ -771,13 +897,19 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
+  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant ContentMask_ScaledPixels *content_masks [[buffer(PathRasterizationInputIndex_ContentMasks)]],
+  constant PathBrushRecord *path_brushes [[buffer(PathRasterizationInputIndex_Brushes)]],
+  constant uint *path_brush_count [[buffer(PathRasterizationInputIndex_BrushCount)]],
+  texture2d<float> brush_atlas [[texture(PathRasterizationInputIndex_BrushAtlas)]],
+  constant uint *path_clips [[buffer(PathRasterizationInputIndex_ClipIds), function_constant(CLIPPED)]],
+  constant ClipMask *clip_masks [[buffer(PathRasterizationInputIndex_ClipMasks), function_constant(CLIPPED)]],
+  texture2d<float> clip_atlas [[texture(PathRasterizationInputIndex_ClipAtlas), function_constant(CLIPPED)]]
 ) {
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
 
   PathRasterizationVertex v = vertices[input.vertex_id];
-  Background background = v.color;
   Bounds_ScaledPixels path_bounds = v.bounds;
   float alpha;
   if (length(float2(dx.x, dy.x)) < 0.001) {
@@ -792,6 +924,32 @@ fragment float4 path_rasterization_fragment(
     alpha = saturate(0.5 - distance);
   }
 
+  alpha *= content_mask_alpha(input.position.xy, content_masks[v.path_id]);
+  // A path takes its clip here, while it is being rasterized into the
+  // intermediate, exactly the way it takes its content mask: the sprite pass
+  // that copies the intermediate out applies neither.
+  if (CLIPPED) {
+    alpha *= clip_mask_alpha(input.position.xy, path_clips[v.path_id],
+                             clip_masks, clip_atlas);
+  }
+
+  // An image brush replaces the fill entirely, and is resolved here rather than
+  // in the pass that copies the intermediate out: that pass copies a union rect
+  // whenever the paths in a batch disagree on their draw order, by which point
+  // several paths' coverages have already been blended into one pixel and there
+  // is no path left to ask which image it wanted.
+  if (v.path_id < *path_brush_count) {
+    PathBrushRecord record = path_brushes[v.path_id];
+    if (record.enabled != 0) {
+      float4 sample = sample_path_brush(record.brush, input.position.xy, brush_atlas);
+      // The atlas holds straight (un-premultiplied) BGRA, and this pipeline
+      // blends One / OneMinusSourceAlpha, so what leaves here is premultiplied.
+      float brush_alpha = sample.a * record.brush.opacity * alpha;
+      return float4(sample.rgb * brush_alpha, brush_alpha);
+    }
+  }
+
+  Background background = v.color;
   GradientColor gradient_color = prepare_fill_color(
     background.tag,
     background.color_space,
@@ -808,6 +966,7 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
+
   return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -821,17 +980,20 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
   uint sprite_id [[instance_id]],
   constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
   constant PathSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-  constant Size_DevicePixels *viewport_size [[buffer(SpriteInputIndex_ViewportSize)]]
+  constant RenderTarget *render_target [[buffer(SpriteInputIndex_RenderTarget)]],
+  // The intermediate a path was rasterized into is the whole window, whatever
+  // target this copy is landing on, so its size is bound separately from the
+  // target's.
+  constant Size_DevicePixels *intermediate_size [[buffer(SpriteInputIndex_AtlasTextureSize)]]
 ) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PathSprite sprite = sprites[sprite_id];
   // Don't apply content mask because it was already accounted for when
   // rasterizing the path.
-  float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
+  float2 scene_position = to_scene_position(unit_vertex, sprite.bounds);
+  float4 device_position = to_target_position(scene_position, render_target);
 
-  float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
+  float2 texture_coords = scene_position / float2(intermediate_size->width, intermediate_size->height);
 
   return PathSpriteVertexOutput{
     device_position,
@@ -849,43 +1011,67 @@ fragment float4 path_sprite_fragment(
 
 struct SurfaceVertexOutput {
   float4 position [[position]];
+  float2 scene_position;
   float2 texture_position;
+  float4 mask_bounds [[flat]];
+  float4 mask_corner_radii [[flat]];
   float clip_distance [[clip_distance]][4];
+  uint clip_id [[flat, function_constant(CLIPPED)]];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
+  float2 scene_position;
   float2 texture_position;
+  float4 mask_bounds [[flat]];
+  float4 mask_corner_radii [[flat]];
+  uint clip_id [[flat, function_constant(CLIPPED)]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
     uint unit_vertex_id [[vertex_id]], uint surface_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
     constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
-    constant Size_DevicePixels *viewport_size
-    [[buffer(SurfaceInputIndex_ViewportSize)]],
+    constant RenderTarget *render_target
+    [[buffer(SurfaceInputIndex_RenderTarget)]],
     constant Size_DevicePixels *texture_size
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
-  float4 device_position =
-      to_device_position(unit_vertex, surface.bounds, viewport_size);
+  float2 scene_position = to_scene_position(unit_vertex, surface.bounds);
+  float4 device_position = to_target_position(scene_position, render_target);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
                                                  surface.content_mask.bounds);
   // We are going to copy the whole texture, so the texture position corresponds
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
-  return SurfaceVertexOutput{
-      device_position,
-      texture_position,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+  SurfaceVertexOutput output;
+  output.position = device_position;
+  output.scene_position = scene_position;
+  output.texture_position = texture_position;
+  output.mask_bounds = pack_bounds(surface.content_mask.bounds);
+  output.mask_corner_radii = pack_corner_radii(surface.content_mask.corner_radii);
+  output.clip_distance[0] = clip_distance.x;
+  output.clip_distance[1] = clip_distance.y;
+  output.clip_distance[2] = clip_distance.z;
+  output.clip_distance[3] = clip_distance.w;
+  if (CLIPPED) {
+    output.clip_id = surface.clip;
+  }
+  return output;
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]],
+                                 constant ClipMask *clip_masks
+                                 [[buffer(SurfaceInputIndex_ClipMasks),
+                                   function_constant(CLIPPED)]],
+                                 texture2d<float> clip_atlas
+                                 [[texture(SurfaceInputIndex_ClipAtlas),
+                                   function_constant(CLIPPED)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -896,7 +1082,343 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  // The `surfaces` pipeline blends straight alpha, so only the alpha channel
+  // takes the mask.
+  color.a *= packed_content_mask_alpha(input.scene_position, input.mask_bounds,
+                                       input.mask_corner_radii);
+  if (CLIPPED) {
+    color.a *= clip_mask_alpha(input.scene_position, input.clip_id, clip_masks,
+                               clip_atlas);
+  }
+  return color;
+}
+
+fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> bgra_texture
+                                      [[texture(SurfaceInputIndex_YTexture)]],
+                                      constant ClipMask *clip_masks
+                                      [[buffer(SurfaceInputIndex_ClipMasks),
+                                        function_constant(CLIPPED)]],
+                                      texture2d<float> clip_atlas
+                                      [[texture(SurfaceInputIndex_ClipAtlas),
+                                        function_constant(CLIPPED)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  // Unlike `surfaces` above, the `bgra_surfaces` pipeline blends premultiplied
+  // alpha, so the mask scales the whole colour. Masking the alpha alone would
+  // leave the colour un-darkened and fringe the cut edge.
+  float alpha = packed_content_mask_alpha(input.scene_position, input.mask_bounds,
+                                          input.mask_corner_radii);
+  if (CLIPPED) {
+    alpha *= clip_mask_alpha(input.scene_position, input.clip_id, clip_masks,
+                             clip_atlas);
+  }
+  return bgra_texture.sample(texture_sampler, input.texture_position) * alpha;
+}
+
+// The two halves of stencil-and-cover, which is how a clip path becomes a tile
+// of the coverage atlas.
+//
+// The stencil half draws a triangle fan per contour with colour writes off,
+// counting winding into the stencil buffer: a fan's interior edges are walked
+// once each way and cancel exactly, so a non-convex or self-overlapping contour
+// comes out right where a plain fan of blended triangles - which is all a
+// `Path` can do - would double-paint or paint outside itself.
+//
+// The cover half then draws the tile rectangle wherever the stencil says the
+// path covers it, samples the parent clip's tile so nesting intersects, and
+// zeroes the stencil behind itself so the next clip in the pass starts clean.
+// Coverage comes from multisampling: the stencil test is per sample, and the
+// resolve averages them.
+
+struct ClipMaskVertexOutput {
+  float4 position [[position]];
+};
+
+vertex ClipMaskVertexOutput clip_stencil_vertex(
+    uint vertex_id [[vertex_id]],
+    constant PointF *vertices [[buffer(ClipMaskInputIndex_Vertices)]],
+    constant Size_DevicePixels *target_size
+    [[buffer(ClipMaskInputIndex_TargetSize)]]) {
+  PointF vertex_position = vertices[vertex_id];
+  float2 position = float2(vertex_position.x, vertex_position.y);
+  return ClipMaskVertexOutput{
+      float4(position * float2(2. / target_size->width,
+                               -2. / target_size->height) +
+                 float2(-1., 1.),
+             0., 1.)};
+}
+
+// The colour this writes is thrown away - the stencil pipeline's write mask is
+// empty - but a pipeline with a colour attachment wants a fragment stage that
+// produces one.
+fragment float clip_stencil_fragment() { return 0.; }
+
+vertex ClipMaskVertexOutput clip_cover_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(ClipMaskInputIndex_Vertices)]],
+    constant ClipCover *cover [[buffer(ClipMaskInputIndex_Cover)]],
+    constant Size_DevicePixels *target_size
+    [[buffer(ClipMaskInputIndex_TargetSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  return ClipMaskVertexOutput{
+      to_device_position(unit_vertex, cover->tile, target_size)};
+}
+
+fragment float clip_cover_fragment(
+    ClipMaskVertexOutput input [[stage_in]],
+    constant ClipCover *cover [[buffer(ClipMaskInputIndex_Cover)]],
+    texture2d<float> clip_atlas [[texture(ClipMaskInputIndex_ClipAtlas)]]) {
+  if (cover->has_parent == 0u) {
+    return 1.;
+  }
+  float2 parent_position =
+      input.position.xy +
+      float2(cover->parent_offset.x, cover->parent_offset.y);
+  return clip_atlas.read(uint2(parent_position)).r;
+}
+
+// Which Porter-Duff operator the composite pipeline this was specialized into
+// blends with. It selects what the fragment stage *emits*; the operator's src
+// and dst factors are the pipeline's blend state, and the two are written to
+// agree. See `GroupComposeMode`.
+constant uint COMPOSE_MODE [[function_constant(1)]];
+
+// Whether this composite was handed a copy of what is underneath the group and
+// has to filter it: CSS `backdrop-filter`.
+//
+// The variant that was cannot use a blend state at all. It is given the
+// destination as two textures - as it stood, and with the filter applied - and
+// emits the finished pixel, which the pipeline writes with One/Zero. That is
+// what lets the group's coverage fade the filter in as well as the group,
+// something no blend factor could express: a blend factor sees one source and
+// one destination, and this needs two of the latter.
+constant bool HAS_BACKDROP [[function_constant(2)]];
+
+struct GroupCompositeVertexOutput {
+  float4 position [[position]];
+  float2 scene_position;
+  float2 texture_position;
+};
+
+vertex GroupCompositeVertexOutput group_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices
+    [[buffer(GroupCompositeInputIndex_Vertices)]],
+    constant GroupComposite *composite
+    [[buffer(GroupCompositeInputIndex_Composite)]],
+    constant RenderTarget *render_target
+    [[buffer(GroupCompositeInputIndex_RenderTarget)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 scene_position = to_scene_position(unit_vertex, composite->bounds);
+  // The group's target is at least the group's size and may be larger - it is
+  // pooled and quantized - so the region to sample is the group's own bounds
+  // in the corner of it, not the whole texture.
+  float2 texture_position =
+      unit_vertex *
+      float2(composite->bounds.size.width, composite->bounds.size.height) /
+      float2((float)composite->texture_size.width,
+             (float)composite->texture_size.height);
+  return GroupCompositeVertexOutput{
+      to_target_position(scene_position, render_target), scene_position,
+      texture_position};
+}
+
+// A group's finished target, composited onto what is underneath it.
+//
+// The target holds premultiplied RGBA. The clip path in force where the group
+// was pushed cannot be a blend factor - it varies per fragment - so its
+// coverage `c`, with the group's opacity folded in, is folded into what this
+// emits instead, and every operator below is written so that `c == 0` leaves
+// the destination exactly as it found it.
+fragment float4 group_composite_fragment(
+    GroupCompositeVertexOutput input [[stage_in]],
+    texture2d<float> group_texture
+    [[texture(GroupCompositeInputIndex_GroupTexture)]],
+    constant GroupComposite *composite
+    [[buffer(GroupCompositeInputIndex_Composite)]],
+    constant GroupFilter *filter [[buffer(GroupCompositeInputIndex_Filter)]],
+    constant ClipMask *clip_masks
+    [[buffer(GroupCompositeInputIndex_ClipMasks),
+      function_constant(CLIPPED)]],
+    texture2d<float> clip_atlas
+    [[texture(GroupCompositeInputIndex_ClipAtlas),
+      function_constant(CLIPPED)]],
+    texture2d<float> backdrop
+    [[texture(GroupCompositeInputIndex_BackdropTexture),
+      function_constant(HAS_BACKDROP)]],
+    texture2d<float> filtered_backdrop
+    [[texture(GroupCompositeInputIndex_FilteredBackdropTexture),
+      function_constant(HAS_BACKDROP)]]) {
+  // Nearest: the composite quad is pixel-aligned with the target it was drawn
+  // into, so every sample is a texel centre and filtering would only blur it.
+  constexpr sampler group_sampler(mag_filter::nearest, min_filter::nearest);
+  float4 source = apply_color_matrices(
+      group_texture.sample(group_sampler, input.texture_position), filter);
+
+  float coverage = composite->opacity;
+  if (CLIPPED) {
+    coverage *= clip_mask_alpha(input.scene_position, composite->clip,
+                                clip_masks, clip_atlas);
+  }
+
+  if (HAS_BACKDROP) {
+    // The copy covers at least the group's quad, and both textures are
+    // texel-aligned with the window, so the texel under this fragment is the
+    // fragment's own scene position less where the copy starts.
+    int2 texel = int2(input.scene_position -
+                      float2(composite->backdrop_origin.x,
+                             composite->backdrop_origin.y));
+    texel = clamp(texel, int2(0, 0),
+                  int2(composite->backdrop_size.width - 1,
+                       composite->backdrop_size.height - 1));
+    float4 below = backdrop.read(uint2(texel));
+    float4 above = filtered_backdrop.read(uint2(texel));
+    // Both halves are premultiplied, so mixing them is linear and the result is
+    // premultiplied too. At `coverage == 0` this is the destination exactly as
+    // it stood, which is what "the group did not reach here" has to mean even
+    // though the pipeline overwrites every fragment it touches.
+    float4 destination = mix(below, above, coverage);
+    float4 over = source * coverage;
+    return over + destination * (1. - over.a);
+  }
+
+  switch (COMPOSE_MODE) {
+  case GroupComposeMode_DestOut:
+    // dst * (1 - c * S.a)
+    return float4(0., 0., 0., coverage * source.a);
+  case GroupComposeMode_DestIn:
+    // dst * (1 - c * (1 - S.a)): at c == 0 the destination is multiplied by
+    // one, which is what "outside the group's clip, nothing happened" means.
+    return float4(0., 0., 0., 1. - coverage * (1. - source.a));
+  case GroupComposeMode_Clear:
+    // dst * (1 - c)
+    return float4(0., 0., 0., coverage);
+  default:
+    // Src-over, xor, src-atop and plus all take the source scaled by coverage
+    // and differ only in the pipeline's blend factors.
+    return source * coverage;
+  }
+}
+
+// ------------------------------------------------------------- filter passes
+
+// One texel of a filter pass's source, and what is outside the source.
+//
+// A group's own image sits on a transparent canvas, so reading past its edge
+// has to give transparent black or the blur would smear the outermost row of
+// ink outwards forever instead of fading. A backdrop is a rectangle cut out of
+// something larger, so reading past *its* edge has to give the nearest texel
+// inside: the pixels beyond it are not empty, they are merely not in the copy,
+// and fading to transparent there would ring the filtered region with a halo
+// that is in nothing behind it.
+float4 filter_read(texture2d<float> source, int2 texel,
+                   constant FilterPass *pass) {
+  int2 last = int2(pass->source_size.width - 1, pass->source_size.height - 1);
+  if (pass->edge == FilterEdge_Clamp) {
+    return source.read(uint2(clamp(texel, int2(0, 0), last)));
+  }
+  if (texel.x < 0 || texel.y < 0 || texel.x > last.x || texel.y > last.y) {
+    return float4(0., 0., 0., 0.);
+  }
+  return source.read(uint2(texel));
+}
+
+// The alpha at a point between texels, bilinearly. A drop shadow's offset is a
+// CSS length times the scale factor and lands wherever it lands.
+float filter_sample_alpha(texture2d<float> source, float2 at,
+                          constant FilterPass *pass) {
+  float2 corner = at - 0.5;
+  int2 texel = int2(floor(corner));
+  float2 t = corner - float2(texel);
+  float top = mix(filter_read(source, texel, pass).a,
+                  filter_read(source, texel + int2(1, 0), pass).a, t.x);
+  float bottom = mix(filter_read(source, texel + int2(0, 1), pass).a,
+                     filter_read(source, texel + int2(1, 1), pass).a, t.x);
+  return mix(top, bottom, t.y);
+}
+
+struct FilterVertexOutput {
+  float4 position [[position]];
+};
+
+// A quad over the whole of the pass's destination.
+//
+// The viewport is already the image's own rectangle in the top-left corner of a
+// pooled texture, so covering it is covering clip space, and `position.xy` in
+// the fragment stage is then the texel being written - which is also the texel
+// being read, because every pass in a chain writes the rectangle it read.
+vertex FilterVertexOutput filter_pass_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(FilterInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  return FilterVertexOutput{
+      float4(unit_vertex.x * 2. - 1., 1. - unit_vertex.y * 2., 0., 1.)};
+}
+
+// One axis of a separable gaussian.
+//
+// The weights are not normalized in advance and the sum divides them at the
+// end, which is what makes the truncated kernel behave. Every tap counts
+// towards the divisor, including the ones that fall outside the image and
+// contribute nothing, so the interior keeps its brightness exactly while an
+// edge fades in proportion to how much of the kernel found anything - which is
+// the definition of blurring an image that stops.
+//
+// The blur runs on premultiplied colour, as `feGaussianBlur` is defined to.
+// Blurring straight colour and the alpha separately would drag the colour of an
+// invisible texel into a visible one and halo every edge.
+fragment float4 filter_blur_fragment(
+    FilterVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]],
+    constant FilterPass *pass [[buffer(FilterInputIndex_Pass)]]) {
+  int2 texel = int2(input.position.xy);
+  int2 step = int2(int(pass->direction.x), int(pass->direction.y)) * pass->stride;
+  float4 total = float4(0., 0., 0., 0.);
+  float weight_total = 0.;
+  for (int index = -pass->taps; index <= pass->taps; index++) {
+    float distance = (float)(index * pass->stride);
+    float weight = exp(-(distance * distance) / (2. * pass->sigma * pass->sigma));
+    weight_total += weight;
+    total += weight * filter_read(source, texel + step * index, pass);
+  }
+  return total / weight_total;
+}
+
+// A run of CSS colour filters, as a pass of its own.
+//
+// The composite applies the trailing run itself, so this is only reached by a
+// run with something after it - a matrix before a blur, which has to happen
+// before the blur and not after.
+fragment float4 filter_matrix_fragment(
+    FilterVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]],
+    constant FilterPass *pass [[buffer(FilterInputIndex_Pass)]],
+    constant GroupFilter *filter [[buffer(FilterInputIndex_Filter)]]) {
+  return apply_color_matrices(
+      filter_read(source, int2(input.position.xy), pass), filter);
+}
+
+// The source over its own blurred alpha, offset and tinted: CSS
+// `drop-shadow()`.
+//
+// Only the alpha of the blurred image is used. The shadow takes the colour it
+// was given, whatever the group underneath it was coloured, which is what makes
+// a drop shadow a silhouette rather than a smear.
+fragment float4 filter_drop_shadow_fragment(
+    FilterVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]],
+    texture2d<float> blurred [[texture(FilterInputIndex_Blurred)]],
+    constant FilterPass *pass [[buffer(FilterInputIndex_Pass)]]) {
+  int2 texel = int2(input.position.xy);
+  float4 above = filter_read(source, texel, pass);
+  float2 at = float2(texel) + 0.5 -
+              float2(pass->offset.x, pass->offset.y);
+  float alpha = filter_sample_alpha(blurred, at, pass);
+  float4 color = hsla_to_rgba(pass->color);
+  float shadow_alpha = color.a * alpha;
+  float4 shadow = float4(color.rgb * shadow_alpha, shadow_alpha);
+  return above + shadow * (1. - above.a);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1009,12 +1531,22 @@ float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
   return float4(device_position, 0., 1.);
 }
 
-float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size) {
-  float2 position =
-      unit_vertex * float2(bounds.size.width, bounds.size.height) +
-      float2(bounds.origin.x, bounds.origin.y);
+// Where a primitive's unit vertex lands in the window, in device pixels.
+//
+// This is the space every primitive is expressed in and every fragment stage
+// reasons in - content masks, clip masks, gradients and signed distance fields
+// alike - and it is *not* the framebuffer's space once a group is being drawn
+// to a target of its own, which is why each vertex stage carries this across
+// to its fragment stage rather than letting it read `[[position]]`.
+float2 to_scene_position(float2 unit_vertex, Bounds_ScaledPixels bounds) {
+  return unit_vertex * float2(bounds.size.width, bounds.size.height) +
+         float2(bounds.origin.x, bounds.origin.y);
+}
+
+float2 to_scene_position_transformed(float2 unit_vertex,
+                                     Bounds_ScaledPixels bounds,
+                                     TransformationMatrix transformation) {
+  float2 position = to_scene_position(unit_vertex, bounds);
 
   // Apply the transformation matrix to the position via matrix multiplication.
   float2 transformed_position = float2(0, 0);
@@ -1025,11 +1557,50 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
   transformed_position[0] += transformation.translation[0];
   transformed_position[1] += transformation.translation[1];
 
-  float2 viewport_size = float2((float)input_viewport_size->width,
-                                (float)input_viewport_size->height);
+  return transformed_position;
+}
+
+// A scene position placed on the attachment currently being drawn into, which
+// is the window itself only when no group is open.
+float4 to_target_position(float2 scene_position,
+                          constant RenderTarget *render_target) {
+  float2 size = float2((float)render_target->size.width,
+                       (float)render_target->size.height);
+  float2 origin = float2((float)render_target->origin.x,
+                         (float)render_target->origin.y);
   float2 device_position =
-      transformed_position / viewport_size * float2(2., -2.) + float2(-1., 1.);
+      (scene_position - origin) / size * float2(2., -2.) + float2(-1., 1.);
   return float4(device_position, 0., 1.);
+}
+
+// A chain of CSS colour filters, applied to a group's premultiplied result.
+//
+// Colour matrices are defined on non-premultiplied colour, so this undoes the
+// premultiplication, runs the chain, and puts it back. The chain is applied one
+// matrix at a time with a clamp between stages rather than collapsed into a
+// single product, because the spec clamps between filter primitives and the two
+// are not the same function: `brightness(2) invert(1)` diverges above 0.5.
+float4 apply_color_matrices(float4 premultiplied, constant GroupFilter *filter) {
+  if (filter->matrix_count == 0u) {
+    return premultiplied;
+  }
+  float alpha = premultiplied.a;
+  float4 color =
+      float4(alpha > 0. ? premultiplied.rgb / alpha : float3(0.), alpha);
+  for (uint index = 0u; index < filter->matrix_count; index++) {
+    constant float *m = filter->matrices + index * 20u;
+    float4 result;
+    result.r = m[0] * color.r + m[1] * color.g + m[2] * color.b +
+               m[3] * color.a + m[4];
+    result.g = m[5] * color.r + m[6] * color.g + m[7] * color.b +
+               m[8] * color.a + m[9];
+    result.b = m[10] * color.r + m[11] * color.g + m[12] * color.b +
+               m[13] * color.a + m[14];
+    result.a = m[15] * color.r + m[16] * color.g + m[17] * color.b +
+               m[18] * color.a + m[19];
+    color = saturate(result);
+  }
+  return float4(color.rgb * color.a, color.a);
 }
 
 
@@ -1039,6 +1610,74 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
   float2 tile_size = float2(tile.bounds.size.width, tile.bounds.size.height);
   return (tile_origin + unit_vertex * tile_size) /
          float2((float)atlas_size->width, (float)atlas_size->height);
+}
+
+// Folds a texel index, which an image brush may take anywhere on the number
+// line, back onto the [0, extent) the tile actually occupies.
+//
+// This is where the extend modes have to happen. A sampler address mode would
+// wrap in the atlas rather than in the tile, and the atlas packs a tile against
+// its neighbours with `AtlasTile::padding` of zero, so `address::repeat` would
+// tile the whole atlas and `address::clamp_to_edge` would clamp to the atlas's
+// edge - both of them showing another sprite.
+uint extend_texel(int texel, uint extent, BrushExtend extend) {
+  int size = (int)extent;
+  if (size <= 0) {
+    return 0;
+  }
+  if (extend == BrushExtend_Repeat) {
+    int wrapped = texel % size;
+    return (uint)(wrapped < 0 ? wrapped + size : wrapped);
+  }
+  if (extend == BrushExtend_Reflect) {
+    int period = size * 2;
+    int wrapped = texel % period;
+    if (wrapped < 0) {
+      wrapped += period;
+    }
+    return (uint)(wrapped < size ? wrapped : period - 1 - wrapped);
+  }
+  return (uint)clamp(texel, 0, size - 1);
+}
+
+// One bilinear tap of a brush's image, taken by hand.
+//
+// Four `read`s and two mixes rather than one `sample`, because a single
+// hardware tap near a tile edge under `Repeat` or `Reflect` straddles the seam
+// and blends in whichever sprite the atlas packed next door. Wrapping the four
+// texel indices individually keeps every tap inside the tile, so the seam is
+// the seam of the image rather than of the atlas.
+float4 sample_path_brush(PathBrush brush, float2 position,
+                         texture2d<float> atlas) {
+  TransformationMatrix screen_to_brush = brush.screen_to_brush;
+  float2 brush_position = float2(
+      position.x * screen_to_brush.rotation_scale[0][0] +
+          position.y * screen_to_brush.rotation_scale[0][1] +
+          screen_to_brush.translation[0],
+      position.x * screen_to_brush.rotation_scale[1][0] +
+          position.y * screen_to_brush.rotation_scale[1][1] +
+          screen_to_brush.translation[1]);
+
+  uint2 tile_size = uint2((uint)brush.tile.bounds.size.width,
+                          (uint)brush.tile.bounds.size.height);
+  // Brush space measures the image as the unit square; texel centres sit half a
+  // texel in from it, which is what the -0.5 is for.
+  float2 texel = brush_position * float2(tile_size) - 0.5;
+  float2 fraction = fract(texel);
+  int2 low = int2(floor(texel));
+
+  uint2 x = uint2(extend_texel(low.x, tile_size.x, brush.x_extend),
+                  extend_texel(low.x + 1, tile_size.x, brush.x_extend));
+  uint2 y = uint2(extend_texel(low.y, tile_size.y, brush.y_extend),
+                  extend_texel(low.y + 1, tile_size.y, brush.y_extend));
+  uint2 origin = uint2((uint)brush.tile.bounds.origin.x,
+                       (uint)brush.tile.bounds.origin.y);
+
+  float4 top = mix(atlas.read(origin + uint2(x.x, y.x)),
+                   atlas.read(origin + uint2(x.y, y.x)), fraction.x);
+  float4 bottom = mix(atlas.read(origin + uint2(x.x, y.y)),
+                      atlas.read(origin + uint2(x.y, y.y)), fraction.x);
+  return mix(top, bottom, fraction.y);
 }
 
 // Selects corner radius based on quadrant.
@@ -1069,6 +1708,93 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
     return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+float4 pack_bounds(Bounds_ScaledPixels bounds) {
+  return float4(bounds.origin.x, bounds.origin.y, bounds.size.width,
+                bounds.size.height);
+}
+
+float4 pack_corner_radii(Corners_ScaledPixels corner_radii) {
+  return float4(corner_radii.top_left, corner_radii.top_right,
+                corner_radii.bottom_right, corner_radii.bottom_left);
+}
+
+// Coverage of the content mask at this point: 1 inside, 0 outside, antialiased
+// across a rounded edge.
+//
+// A rectangular mask - which is nearly every mask - is already clipped exactly
+// by [[clip_distance]] in the vertex stage, so it takes the fast path out.
+float content_mask_alpha(float2 point, ContentMask_ScaledPixels mask) {
+  return packed_content_mask_alpha(point, pack_bounds(mask.bounds),
+                                   pack_corner_radii(mask.corner_radii));
+}
+
+// How much of `point` the clip path `clip_id` lets through: one texel of the
+// coverage atlas the frame rasterized its masks into.
+//
+// `tile` is the only part of the window this clip can reach - the content mask
+// it was pushed under, intersected with its parent's tile and with the viewport
+// - so a point outside it is outside the clip and the atlas is never read
+// there.
+//
+// When `sampled` is zero the clip got no tile and the rectangle *is* the clip.
+// That happens when the nesting depth cap or a full atlas refused a mask the
+// path did have: the fallback loses the shape but keeps the bound, which is the
+// one way to degrade without silently painting the wrong picture. A path with
+// no shape to lose - one enclosing no area - is not that case; its tile is
+// empty, so the test above has already returned zero and this line is never
+// reached for it.
+float clip_mask_alpha(float2 point, uint clip_id,
+                      constant ClipMask *clip_masks,
+                      texture2d<float> clip_atlas) {
+  ClipMask mask = clip_masks[clip_id];
+  if (point.x < mask.tile.origin.x || point.y < mask.tile.origin.y ||
+      point.x >= mask.tile.origin.x + mask.tile.size.width ||
+      point.y >= mask.tile.origin.y + mask.tile.size.height) {
+    return 0.0;
+  }
+  if (mask.sampled == 0u) {
+    return 1.0;
+  }
+  float2 atlas_position =
+      point + float2(mask.atlas_offset.x, mask.atlas_offset.y);
+  return clip_atlas.read(uint2(atlas_position)).r;
+}
+
+// `content_mask_alpha` for a mask that arrived as two float4s rather than as a
+// struct: `mask_bounds` is (origin.x, origin.y, width, height) and
+// `mask_corner_radii` is (top_left, top_right, bottom_right, bottom_left).
+// That is the form a fragment stage handed the mask as flat varyings has, and
+// it saves those stages a per-fragment load out of the instance buffer.
+float packed_content_mask_alpha(float2 point, float4 mask_bounds,
+                                float4 mask_corner_radii) {
+  if (all(mask_corner_radii == float4(0.0))) {
+    return 1.0;
+  }
+
+  float2 half_size = mask_bounds.zw / 2.0;
+  float2 center = mask_bounds.xy + half_size;
+  float2 center_to_point = point - center;
+
+  // A radius wider than half the mask cannot be drawn as written: the four
+  // corner arcs would overlap, and picking one of them by quadrant would leave
+  // a step where the quadrants meet. `ContentMask::intersect` produces such
+  // radii routinely - a radius kept from a tall parent, landing on a short
+  // intersection - so clamp here rather than trust the caller. These are the
+  // semantics of `Corners::clamp_radii_for_quad_size` on the Rust side.
+  float4 radii = min(mask_corner_radii, float4(min(half_size.x, half_size.y)));
+
+  float corner_radius;
+  if (center_to_point.x < 0.0) {
+    corner_radius = center_to_point.y < 0.0 ? radii.x : radii.w;
+  } else {
+    corner_radius = center_to_point.y < 0.0 ? radii.y : radii.z;
+  }
+
+  float2 corner_center_to_point =
+      (fabs(center_to_point) - half_size) + corner_radius;
+  return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
 }
 
 // Implementation of quad signed distance field
