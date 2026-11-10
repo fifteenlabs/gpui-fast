@@ -3,8 +3,8 @@ use super::{
     CFRetained, CVMetalTexture, DevicePixels, GlobalInputIndex, InstanceBindings,
     InstanceBufferWriter, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLRenderCommandEncoder, MTLTexture, MTLViewport, MetalRenderer, PaintedPath, PrimitiveBatch,
-    ProtocolObject, Result, Retained, Scene, Size, mem, new_command_encoder_for_texture, ptr,
-    quad_depth, quad_depth_scale,
+    ProtocolObject, RenderTarget, Result, Retained, Scene, Size, bind_render_target, mem,
+    new_command_encoder_for_texture, ptr, quad_depth, quad_depth_scale,
 };
 use anyhow::Context as _;
 
@@ -104,14 +104,10 @@ impl MetalRenderer {
         } else {
             quad_depth_scale(scene.quads.len())
         };
-        // SAFETY: Metal copies both values, which match every vertex shader's
-        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
+        bind_render_target(command_encoder, &RenderTarget::whole(viewport_size));
+        // SAFETY: Metal copies the value, which matches every vertex shader's
+        // `GlobalInputIndex_DepthScale` argument.
         unsafe {
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                GlobalInputIndex::ViewportSize as usize,
-            );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&depth_scale).cast(),
                 mem::size_of_val(&depth_scale),
@@ -148,11 +144,11 @@ impl MetalRenderer {
 
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, command_encoder)
+                    self.draw_shadows(range, false, instance_bindings, command_encoder)
                 }
                 PrimitiveBatch::Quads(range) => {
                     quad_cursor += range.len() as u32;
-                    self.draw_quads(range, instance_bindings, command_encoder)
+                    self.draw_quads(range, false, instance_bindings, command_encoder)
                 }
                 PrimitiveBatch::Paths(range) => {
                     let tiles_start = path_tile_cursor;
@@ -162,15 +158,22 @@ impl MetalRenderer {
                         .sum::<usize>();
                     self.draw_path_tiles(
                         tiles_start..path_tile_cursor,
+                        false,
                         instance_bindings,
                         command_encoder,
                     )
                 }
                 PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, command_encoder)
+                    self.draw_underlines(range, false, instance_bindings, command_encoder)
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(texture_id, range, instance_bindings, command_encoder),
+                    .draw_monochrome_sprites(
+                    texture_id,
+                    range,
+                    false,
+                    instance_bindings,
+                    command_encoder,
+                ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     if crate::fast::rounded_clip::draw_group(
                         self,
@@ -197,6 +200,7 @@ impl MetalRenderer {
                         self.draw_polychrome_sprites(
                             texture_id,
                             range,
+                            false,
                             instance_bindings,
                             command_encoder,
                         );

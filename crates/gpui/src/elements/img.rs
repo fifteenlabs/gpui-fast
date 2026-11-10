@@ -2,8 +2,8 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource, SharedString,
-    SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image, decode_static_image,
-    decode_webp_image, px,
+    SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image, decode_png_image,
+    decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
@@ -658,6 +658,7 @@ impl Asset for ImageAssetLoader {
                 let data = match format {
                     ImageFormat::Gif => decode_gif_image(&bytes)?,
                     ImageFormat::WebP => decode_webp_image(&bytes)?,
+                    ImageFormat::Png => decode_png_image(&bytes)?,
                     _ => decode_static_image(&bytes, format)?,
                 };
 

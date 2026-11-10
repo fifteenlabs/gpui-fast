@@ -193,6 +193,9 @@ impl ReentrantWindowCallbacks {
         }
         let event = event.expect("event is only taken when deferred");
         this.update_window("dispatching input", |window, cx| {
+            // The one place OS events enter, and so the one place their screen
+            // units become layout units: see `Window::event_in_layout_units`.
+            let event = window.event_in_layout_units(event);
             window.dispatch_event(event, cx)
         })
         .unwrap_or_default()
@@ -252,6 +255,7 @@ impl ReentrantWindowCallbacks {
             } else if let Some(event) = pending.input.pop_front() {
                 drop(pending);
                 self.update_window("dispatching input", |window, cx| {
+                    let event = window.event_in_layout_units(event);
                     window.dispatch_event(event, cx);
                 });
             } else {

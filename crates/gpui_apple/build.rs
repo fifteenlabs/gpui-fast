@@ -46,7 +46,21 @@ mod apple_build {
             "Size".into(),
             "Pixels".into(),
             "Hsla".into(),
+            "PointF".into(),
             "ContentMask".into(),
+            "ClipId".into(),
+            "ClipInputIndex".into(),
+            "ClipMask".into(),
+            "ClipCover".into(),
+            "ClipMaskInputIndex".into(),
+            "RenderTarget".into(),
+            "GroupComposite".into(),
+            "GroupComposeMode".into(),
+            "GroupFilter".into(),
+            "GroupCompositeInputIndex".into(),
+            "FilterPass".into(),
+            "FilterEdge".into(),
+            "FilterInputIndex".into(),
             "Uniforms".into(),
             "AtlasTile".into(),
             "GlobalInputIndex".into(),
@@ -54,6 +68,9 @@ mod apple_build {
             "PathTile".into(),
             "PathCurve".into(),
             "PathPaint".into(),
+            "BrushExtend".into(),
+            "PathBrush".into(),
+            "PathBrushRecord".into(),
             "ShadowInputIndex".into(),
             "Shadow".into(),
             "QuadInputIndex".into(),
@@ -78,6 +95,7 @@ mod apple_build {
         // Source files from gpui that define types used in shaders
         let gpui_src_paths = [
             gpui_dir.join("src/scene.rs"),
+            gpui_dir.join("src/clip_path.rs"),
             gpui_dir.join("src/geometry.rs"),
             gpui_dir.join("src/color.rs"),
             gpui_dir.join("src/window.rs"),
@@ -85,7 +103,12 @@ mod apple_build {
         ];
 
         // Source files from this crate
-        let local_src_paths = [crate_dir.join("src/metal_renderer.rs")];
+        let local_src_paths = [
+            crate_dir.join("src/metal_renderer.rs"),
+            crate_dir.join("src/vector/frame.rs"),
+            crate_dir.join("src/vector/groups.rs"),
+            crate_dir.join("src/vector/clips.rs"),
+        ];
 
         for src_path in gpui_src_paths.iter().chain(local_src_paths.iter()) {
             println!("cargo:rerun-if-changed={}", src_path.display());

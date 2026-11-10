@@ -672,6 +672,7 @@ pub(crate) fn snap_mask(
     }
     crate::ContentMask {
         bounds: snap_bounds(mask.bounds),
+        ..mask
     }
 }
 

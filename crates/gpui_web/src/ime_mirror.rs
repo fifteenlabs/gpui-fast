@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration, TextInputContentType};
 use wasm_bindgen::JsCast;
 
 use crate::window::WebWindowInner;
@@ -176,6 +176,14 @@ impl ImeMirror {
             Some(hint) => element.set_attribute("enterkeyhint", hint).ok(),
             None => element.remove_attribute("enterkeyhint").ok(),
         };
+        let input_mode = match configuration.content_type {
+            TextInputContentType::Text | TextInputContentType::Password => "text",
+            TextInputContentType::Number => "numeric",
+            TextInputContentType::Phone => "tel",
+            TextInputContentType::Email => "email",
+            TextInputContentType::Url => "url",
+        };
+        element.set_attribute("inputmode", input_mode).ok();
     }
 
     pub(crate) fn event_target(&self) -> &web_sys::EventTarget {

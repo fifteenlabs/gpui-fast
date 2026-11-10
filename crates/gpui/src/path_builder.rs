@@ -8,7 +8,7 @@ use lyon_path::{ArcFlags, Event, Polygon};
 pub use lyon_path::math::Transform;
 pub use lyon_path::{FillRule, LineCap, LineJoin};
 
-use crate::{PathCurve, PathTiles, Pixels, Point, point, px};
+use crate::{Bounds, PathCurve, PathTiles, Pixels, Point, point, px};
 use std::sync::Arc;
 
 /// Style of the PathBuilder
@@ -431,6 +431,22 @@ impl Path {
 
     pub(crate) fn even_odd(&self) -> bool {
         self.even_odd
+    }
+
+    /// The smallest rectangle holding the path, in logical pixels. Its curves
+    /// are monotone, so their end points bound them.
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        let mut points = self
+            .curves
+            .iter()
+            .flat_map(|curve| [curve.p0, curve.p1]);
+        let Some(first) = points.next() else {
+            return Bounds::default();
+        };
+        let (min, max) = points.fold((first, first), |(min, max), point| {
+            (min.min(&point), max.max(&point))
+        });
+        Bounds::from_corners(point(px(min.x), px(min.y)), point(px(max.x), px(max.y)))
     }
 
     /// Bin the curves into tiles in device pixels, for painting at the given

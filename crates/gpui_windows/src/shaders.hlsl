@@ -35,6 +35,14 @@ struct Corners {
     float bottom_left;
 };
 
+// Mirrors `ContentMask<ScaledPixels>` on the Rust side, which is uploaded to
+// these shaders as raw bytes - the field order and sizes here have to match it
+// exactly.
+struct ContentMask {
+    Bounds bounds;
+    Corners corner_radii;
+};
+
 struct Edges {
     float top;
     float right;
@@ -127,6 +135,42 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
     float2 position = unit_vertex * bounds.size + bounds.origin;
     float2 transformed = mul(position, transformation.rotation_scale) + transformation.translation;
     return distance_from_clip_rect_impl(transformed, clip_bounds);
+}
+
+bool has_rounded_mask(ContentMask mask) {
+    return mask.corner_radii.top_left != 0.0
+        || mask.corner_radii.top_right != 0.0
+        || mask.corner_radii.bottom_right != 0.0
+        || mask.corner_radii.bottom_left != 0.0;
+}
+
+float pick_corner_radius(float2 center_to_point, Corners corner_radii);
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius);
+
+// Coverage of the content mask at this point: 1 inside, 0 outside, antialiased
+// across a rounded edge.
+//
+// A rectangular mask - which is nearly every mask - is already clipped exactly
+// by the geometry the vertex stage emits, so it takes the fast path out.
+float content_mask_alpha(float2 pt, ContentMask mask) {
+    if (!has_rounded_mask(mask)) {
+        return 1.0;
+    }
+
+    float2 half_size = mask.bounds.size / 2.;
+    float2 center = mask.bounds.origin + half_size;
+    float2 center_to_point = pt - center;
+
+    // A radius wider than half the mask cannot be drawn as written: the four
+    // corner arcs would overlap, and picking one of them by quadrant would leave
+    // a step where the quadrants meet. `ContentMask::intersect` produces such
+    // radii routinely, so clamp here rather than trust the caller. These are the
+    // semantics of `Corners::clamp_radii_for_quad_size` on the Rust side.
+    float corner_radius = min(pick_corner_radius(center_to_point, mask.corner_radii),
+                              min(half_size.x, half_size.y));
+
+    float2 corner_center_to_point = (abs(center_to_point) - half_size) + corner_radius;
+    return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
 }
 
 struct ClippedVertex {
@@ -487,8 +531,10 @@ float quarter_ellipse_sdf(float2 pt, float2 radii) {
 struct Quad {
     uint order;
     uint border_style;
+    uint clip;
+    uint pad; // keep the record an even number of words
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Background background;
     Hsla border_color;
     Corners corner_radii;
@@ -525,7 +571,8 @@ bool is_opaque_rectangle(Quad quad) {
     return quad.background.tag == 0u
         && quad.background.solid.a >= 1.0
         && !has_rounded_corners(quad.corner_radii)
-        && !has_border(quad.border_widths);
+        && !has_border(quad.border_widths)
+        && !has_rounded_mask(quad.content_mask);
 }
 
 StructuredBuffer<Quad> quads: register(t1);
@@ -541,7 +588,7 @@ QuadFragmentInput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_
     }
 
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-    ClippedVertex vertex = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask);
+    ClippedVertex vertex = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask.bounds);
     float4 device_position = to_device_position_impl(vertex.position);
 
     float4 border_color = hsla_to_rgba(quad.border_color);
@@ -550,7 +597,8 @@ QuadFragmentInput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_
     output.position = device_position;
     output.position.z = quad_depth(quad_id);
     output.border_color = border_color;
-    bool simple = !is_shaped(quad) && quad.background.tag == 0u;
+    bool simple = !is_shaped(quad) && quad.background.tag == 0u
+        && !has_rounded_mask(quad.content_mask);
     output.quad_id = quad_id | (simple ? SIMPLE_PRIMITIVE_FLAG : 0u);
     output.background = prepare_background(quad.background);
     return output;
@@ -564,6 +612,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background =
         background_color(input.background, quad.background, quad.bounds, input.position.xy);
+    float mask_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
     bool unrounded = !has_rounded_corners(quad.corner_radii);
 
     float2 size = quad.bounds.size;
@@ -622,6 +671,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
+        background.a *= mask_alpha;
         return background;
     }
 
@@ -832,7 +882,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         color = over(background, border_color);
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * mask_alpha);
 }
 
 /*
@@ -858,7 +908,7 @@ OpaqueQuadFragmentInput opaque_quad_vertex(uint vertex_id: SV_VertexID, uint ins
     }
 
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-    ClippedVertex vertex = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask);
+    ClippedVertex vertex = clip_to_mask(unit_vertex, quad.bounds, quad.content_mask.bounds);
 
     output.position = to_device_position_impl(vertex.position);
     output.position.z = quad_depth(quad_id);
@@ -881,12 +931,12 @@ struct Shadow {
     float blur_radius;
     Bounds bounds;
     Corners corner_radii;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     Bounds shape_bounds;
     Corners shape_corner_radii;
     uint inset;
-    uint pad; // align to 8 bytes
+    uint clip; // also aligns the record to 8 bytes
 };
 
 struct PreparedBlurredRoundedRect {
@@ -968,7 +1018,7 @@ ShadowFragmentInput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id:
     uint shadow_id = batch_start_index + instance_id;
     Shadow shadow = shadows[shadow_id];
 
-    ClippedVertex vertex = clip_to_mask(unit_vertex, shadow.bounds, shadow.content_mask);
+    ClippedVertex vertex = clip_to_mask(unit_vertex, shadow.bounds, shadow.content_mask.bounds);
     float4 device_position = to_device_position_impl(vertex.position);
     float4 color = hsla_to_rgba(shadow.color);
 
@@ -1000,6 +1050,8 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         float element_distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }
+
+    alpha *= content_mask_alpha(input.position.xy, shadow.content_mask);
 
     return input.color * float4(1., 1., 1., alpha);
 }
@@ -1033,10 +1085,10 @@ struct PathTile {
 
 struct PathPaint {
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Background color;
     uint even_odd;
-    uint pad;
+    uint clip;
 };
 
 StructuredBuffer<PathTile> path_tiles: register(t1);
@@ -1058,8 +1110,8 @@ PathTileFragmentInput path_tile_vertex(uint vertex_id: SV_VertexID, uint tile_id
     // Neighboring tiles store their shared edge as the same number, so clipping each corner on its
     // own gives them bit-identical edges, which the rasterizer neither overlaps nor leaves gaps
     // between. Interpolating from an origin and a size would not.
-    float2 mask_top_left = paint.content_mask.origin;
-    float2 mask_bottom_right = paint.content_mask.origin + paint.content_mask.size;
+    float2 mask_top_left = paint.content_mask.bounds.origin;
+    float2 mask_bottom_right = paint.content_mask.bounds.origin + paint.content_mask.bounds.size;
     float2 top_left = clamp(tile.top_left, mask_top_left, mask_bottom_right);
     float2 bottom_right = clamp(tile.bottom_right, top_left, mask_bottom_right);
     float2 position = float2(
@@ -1068,7 +1120,10 @@ PathTileFragmentInput path_tile_vertex(uint vertex_id: SV_VertexID, uint tile_id
 
     PathTileFragmentInput output;
     output.position = to_device_position_impl(position);
-    output.tile_id = tile_index;
+    // A rounded mask has to be evaluated per fragment, which the solid fast
+    // path in the fragment stage would skip.
+    bool simple = paint.color.tag == 0u && !has_rounded_mask(paint.content_mask);
+    output.tile_id = tile_index | (simple ? SIMPLE_PRIMITIVE_FLAG : 0u);
     output.curve_box = float4(tile.curves_top_left, tile.curves_bottom_right);
     output.background = prepare_background(paint.color);
     return output;
@@ -1141,11 +1196,11 @@ void correct_for_endpoint(float2 endpoint, float step, float2 reference, float2 
 
 float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
     float2 center = floor(input.position.xy) + 0.5;
-    if (input.background.tag == 0u
+    if ((input.tile_id & SIMPLE_PRIMITIVE_FLAG) != 0u
         && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
         return input.background.color0;
     }
-    PathTile tile = path_tiles[input.tile_id];
+    PathTile tile = path_tiles[input.tile_id & ~SIMPLE_PRIMITIVE_FLAG];
     PathPaint paint = path_paints[tile.paint];
 
     float2 winding = float(tile.backdrop);
@@ -1172,6 +1227,7 @@ float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
         ? 1.0 - abs(1.0 - frac(coverage * 0.5) * 2.0)
         : saturate(coverage);
 
+    coverage *= content_mask_alpha(input.position.xy, paint.content_mask);
     if (coverage == 0.0) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
@@ -1189,9 +1245,9 @@ float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
 
 struct Underline {
     uint order;
-    uint pad;
+    uint clip;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     float thickness;
     uint wavy;
@@ -1209,14 +1265,15 @@ UnderlineFragmentInput underline_vertex(uint vertex_id: SV_VertexID, uint instan
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     uint underline_id = batch_start_index + instance_id;
     Underline underline = underlines[underline_id];
-    ClippedVertex vertex = clip_to_mask(unit_vertex, underline.bounds, underline.content_mask);
+    ClippedVertex vertex = clip_to_mask(unit_vertex, underline.bounds, underline.content_mask.bounds);
     float4 device_position = to_device_position_impl(vertex.position);
     float4 color = hsla_to_rgba(underline.color);
 
     UnderlineFragmentInput output;
     output.position = device_position;
     output.color = color;
-    output.underline_id = underline_id | (underline.wavy == 0u ? SIMPLE_PRIMITIVE_FLAG : 0u);
+    bool simple = underline.wavy == 0u && !has_rounded_mask(underline.content_mask);
+    output.underline_id = underline_id | (simple ? SIMPLE_PRIMITIVE_FLAG : 0u);
     return output;
 }
 
@@ -1229,6 +1286,10 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
     }
 
     Underline underline = underlines[input.underline_id];
+    float mask_alpha = content_mask_alpha(input.position.xy, underline.content_mask);
+    if (underline.wavy == 0u) {
+        return input.color * float4(1., 1., 1., mask_alpha);
+    }
     float half_thickness = underline.thickness * 0.5;
     float2 origin = underline.bounds.origin;
 
@@ -1244,7 +1305,7 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return input.color * float4(1., 1., 1., alpha * mask_alpha);
 }
 
 /*
@@ -1255,10 +1316,12 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 
 struct MonochromeSprite {
     uint order;
+    uint animation;
+    uint clip;
     uint pad;
     AtlasTile tile;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     TransformationMatrix transformation;
 };
@@ -1268,6 +1331,8 @@ struct MonochromeSpriteFragmentInput {
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
     float4 clip_distance: SV_ClipDistance;
+    nointerpolation float4 mask_bounds: TEXCOORD2;
+    nointerpolation float4 mask_corner_radii: TEXCOORD3;
 };
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
@@ -1278,7 +1343,7 @@ MonochromeSpriteFragmentInput monochrome_sprite_vertex(uint vertex_id: SV_Vertex
     MonochromeSprite sprite = mono_sprites[sprite_id];
     float4 device_position =
         to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
-    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
     float4 color = hsla_to_rgba(sprite.color);
 
@@ -1287,13 +1352,31 @@ MonochromeSpriteFragmentInput monochrome_sprite_vertex(uint vertex_id: SV_Vertex
     output.tile_position = tile_position;
     output.color = color;
     output.clip_distance = clip_distance;
+    output.mask_bounds = float4(sprite.content_mask.bounds.origin, sprite.content_mask.bounds.size);
+    output.mask_corner_radii = float4(
+        sprite.content_mask.corner_radii.top_left,
+        sprite.content_mask.corner_radii.top_right,
+        sprite.content_mask.corner_radii.bottom_right,
+        sprite.content_mask.corner_radii.bottom_left);
     return output;
+}
+
+// The mask a monochrome or subpixel sprite carried through flat varyings.
+float sprite_mask_alpha(MonochromeSpriteFragmentInput input) {
+    ContentMask mask;
+    mask.bounds.origin = input.mask_bounds.xy;
+    mask.bounds.size = input.mask_bounds.zw;
+    mask.corner_radii.top_left = input.mask_corner_radii.x;
+    mask.corner_radii.top_right = input.mask_corner_radii.y;
+    mask.corner_radii.bottom_right = input.mask_corner_radii.z;
+    mask.corner_radii.bottom_left = input.mask_corner_radii.w;
+    return content_mask_alpha(input.position.xy, mask);
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+    return float4(input.color.rgb, input.color.a * alpha_corrected * sprite_mask_alpha(input));
 }
 
 MonochromeSpriteFragmentInput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1309,7 +1392,7 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
     SubpixelSpriteFragmentOutput output;
     output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    output.alpha = float4(input.color.a * alpha_corrected * sprite_mask_alpha(input), 1.0f);
     return output;
 }
 
@@ -1321,12 +1404,12 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
 struct PolychromeSprite {
     uint order;
-    uint pad;
+    uint clip;
     AtlasTile tile;
     uint grayscale;
     float opacity;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Corners corner_radii;
 };
 
@@ -1343,14 +1426,15 @@ PolychromeSpriteFragmentInput polychrome_sprite_vertex(uint vertex_id: SV_Vertex
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     uint sprite_id = batch_start_index + instance_id;
     PolychromeSprite sprite = poly_sprites[sprite_id];
-    ClippedVertex vertex = clip_to_mask(unit_vertex, sprite.bounds, sprite.content_mask);
+    ClippedVertex vertex = clip_to_mask(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
     float4 device_position = to_device_position_impl(vertex.position);
     float2 tile_position = to_tile_position(vertex.unit_vertex, sprite.tile);
 
     PolychromeSpriteFragmentInput output;
     output.position = device_position;
     output.tile_position = tile_position;
-    bool simple = !has_rounded_corners(sprite.corner_radii) && sprite.grayscale == 0u;
+    bool simple = !has_rounded_corners(sprite.corner_radii) && sprite.grayscale == 0u
+        && !has_rounded_mask(sprite.content_mask);
     output.sprite_id = sprite_id | (simple ? SIMPLE_PRIMITIVE_FLAG : 0u);
     output.opacity = sprite.opacity;
     return output;
@@ -1367,6 +1451,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         color.rgb = dot(color.rgb, GRAYSCALE_FACTORS);
     }
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
-    color.a *= input.opacity * saturate(0.5 - distance);
+    color.a *= input.opacity * saturate(0.5 - distance)
+        * content_mask_alpha(input.position.xy, sprite.content_mask);
     return color;
 }

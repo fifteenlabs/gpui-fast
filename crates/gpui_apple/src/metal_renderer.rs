@@ -1,11 +1,22 @@
 #[path = "fast/frame.rs"]
 mod fast_frame;
+#[path = "vector/clips.rs"]
+mod vector_clips;
+#[path = "vector/frame.rs"]
+mod vector_frame;
+#[path = "vector/groups.rs"]
+mod vector_groups;
+pub(crate) use vector_frame::RenderTarget;
+use vector_clips::ClipResources;
+use vector_groups::{FilterPipeline, FilterScratch, GroupComposeMode, GroupTargets};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Bounds, ContentMask, DevicePixels, PaintSurface, PaintedPath, PrimitiveBatch,
-    ScaledPixels, Scene, Size, quad_depth, quad_depth_scale, size,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, BrushExtend, ClipId, ClipPlan,
+    ClipTextureBudget, ContentMask, DevicePixels, PaintSurface, PaintedPath, PathBrush,
+    PrimitiveBatch, ScaledPixels, Scene, Size, TileId, TransformationMatrix, quad_depth,
+    quad_depth_scale, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -23,18 +34,23 @@ use objc2_metal::MTLCopyAllDevices;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLClearColor, MTLCommandBuffer,
     MTLCommandEncoder, MTLCommandQueue, MTLCompareFunction, MTLCreateSystemDefaultDevice,
-    MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLDrawable, MTLGPUFamily,
-    MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
-    MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
-    MTLTextureUsage, MTLViewport,
+    MTLDataType, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLDrawable,
+    MTLFunctionConstantValues, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLStorageMode,
+    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell, collections::HashMap, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc,
+};
+
+// Exported to metal
+pub(crate) type PointF = gpui::Point<f32>;
 
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
@@ -128,6 +144,49 @@ enum DisplayLinkMode {
 
 pub struct MetalRenderer {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// Kept so the clipped pipeline variants can be specialized out of it the
+    /// first time a scene actually carries a clip path. Building them eagerly
+    /// would double this renderer's pipeline count at startup for a feature
+    /// nothing in gpui's own UI uses.
+    pub(crate) library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    clip: Option<ClipResources>,
+    clip_atlas_budget: ClipTextureBudget,
+    clip_work_budget: ClipTextureBudget,
+    group_targets: GroupTargets,
+    /// The working textures a group's filter chain runs through. Empty until a
+    /// scene carries a blur, a drop shadow or a backdrop filter.
+    filter_scratch: FilterScratch,
+    /// Built the first time a scene actually composites a group, and only for
+    /// the operators it uses: there are seven of them times a clipped and an
+    /// unclipped variant times a backdrop and a plain one, and gpui's own UI
+    /// asks for none.
+    group_composite_pipelines: HashMap<
+        (GroupComposeMode, bool, bool),
+        Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    >,
+    /// Built the first time a scene carries a filter that needs a pass of its
+    /// own.
+    filter_pipelines: HashMap<FilterPipeline, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    /// Whether what this renderer draws the frame into can be copied out of
+    /// again, which is what a top-level backdrop filter needs.
+    ///
+    /// An offscreen target always can. A window's drawable cannot until the
+    /// layer is told to stop being framebuffer-only, which costs the display
+    /// some of its fast paths and is therefore not paid until a scene turns up
+    /// carrying a backdrop filter.
+    drawable_is_readable: bool,
+    /// Whether the layer has already been asked to stop being framebuffer-only.
+    /// The drawables it had already vended were made under the old setting, so
+    /// `drawable_is_readable` only follows on the frame after this is set.
+    layer_reads_requested: bool,
+    /// Bound wherever a path batch has no image brush to sample: a fragment
+    /// shader that declares a `texture2d` argument needs something bound even
+    /// in the frames that never read it.
+    default_brush_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// The depth state of every pass a frame with clip paths or isolated groups
+    /// draws: such a frame is cut into several passes, which a depth buffer
+    /// does not survive, so it draws back to front with nothing culled.
+    unordered_depth_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
     pub(crate) layer: Option<Retained<CAMetalLayer>>,
     is_apple_gpu: bool,
     pub(crate) is_unified_memory: bool,
@@ -152,7 +211,9 @@ pub struct MetalRenderer {
     native_views_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     depth_write_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
     depth_test_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
-    depth_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    /// One depth texture per size of attachment drawn into lately: the window,
+    /// and the targets isolated groups are drawn into.
+    depth_textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
     pub(crate) instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     pub(crate) sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
@@ -230,10 +291,19 @@ impl MetalRenderer {
     ///
     /// This renderer can render scenes to images without requiring a CAMetalLayer,
     /// window, or AppKit. Use `render_scene_to_image()` to render scenes.
+    ///
+    /// `transparent` decides what the offscreen target is cleared to. An opaque
+    /// renderer clears to opaque black, which is what a screenshot of a normal
+    /// window looks like; a transparent one clears to all zeroes, so the alpha
+    /// that reads back is the coverage the scene actually produced rather than
+    /// a constant 255.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
-    pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Result<Self> {
+    pub fn new_headless(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+    ) -> Result<Self> {
         let device = Self::create_device()?;
-        Self::new_internal(device, None, true, instance_buffer_pool)
+        Self::new_internal(device, None, !transparent, instance_buffer_pool)
     }
 
     #[cfg(target_os = "macos")]
@@ -302,6 +372,7 @@ impl MetalRenderer {
             "path_tile_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let shadows_pipeline_state = build_pipeline_state(
             &device,
@@ -311,6 +382,7 @@ impl MetalRenderer {
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let quads_pipeline_state = build_pipeline_state(
             &device,
@@ -320,6 +392,7 @@ impl MetalRenderer {
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let opaque_quads_pipeline_state = build_pipeline_state(
             &device,
@@ -328,6 +401,7 @@ impl MetalRenderer {
             "opaque_quad_vertex",
             "opaque_quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
             false,
         )?;
         let underlines_pipeline_state = build_pipeline_state(
@@ -338,6 +412,7 @@ impl MetalRenderer {
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -347,6 +422,7 @@ impl MetalRenderer {
             "monochrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -356,6 +432,7 @@ impl MetalRenderer {
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -365,6 +442,7 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true,
+            false,
         )?;
         let native_views_pipeline_state = build_pipeline_state(
             &device,
@@ -374,10 +452,13 @@ impl MetalRenderer {
             "native_view_fragment",
             MTLPixelFormat::BGRA8Unorm,
             true, // fast rounded clips blend partially covered native-view holes.
+            false,
         )?;
 
         let depth_write_state = build_depth_stencil_state(&device, true)?;
         let depth_test_state = build_depth_stencil_state(&device, false)?;
+        let unordered_depth_state = build_unordered_depth_state(&device)?;
+        let default_brush_texture = build_default_brush_texture(&device)?;
 
         let command_queue = crate::fast::dynamic_textures::command_queue(&device)?;
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -402,6 +483,24 @@ impl MetalRenderer {
 
         Ok(Self {
             device,
+            library,
+            clip: None,
+            clip_atlas_budget: ClipTextureBudget::default(),
+            clip_work_budget: ClipTextureBudget::default(),
+            group_targets: GroupTargets::default(),
+            filter_scratch: FilterScratch::default(),
+            group_composite_pipelines: HashMap::new(),
+            filter_pipelines: HashMap::new(),
+            // A headless renderer draws into a texture of its own making, which
+            // is readable. A layer's drawables are framebuffer-only until
+            // something asks otherwise - except in a debug build with test
+            // support, where `configure_layer` already allows reads so that a
+            // screenshot can be taken without ScreenCaptureKit.
+            drawable_is_readable: layer.is_none()
+                || cfg!(all(feature = "test-support", debug_assertions)),
+            layer_reads_requested: false,
+            default_brush_texture,
+            unordered_depth_state,
             layer,
             presents_with_transaction: false,
             display_link_mode: DisplayLinkMode::Detached,
@@ -422,7 +521,7 @@ impl MetalRenderer {
             native_views_pipeline_state,
             depth_write_state,
             depth_test_state,
-            depth_texture: None,
+            depth_textures: Vec::new(),
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
@@ -529,6 +628,23 @@ impl MetalRenderer {
                 return;
             }
         };
+        // A backdrop filter copies out of whatever the group is composited
+        // over, and at the top level that is the drawable itself. A
+        // framebuffer-only layer forbids the copy, so the first scene that asks
+        // for one buys the window out of it - the flag is not set from the
+        // start because it costs the display its direct-to-display path, and
+        // nothing in gpui's own UI has ever needed a backdrop filter. The
+        // drawables already in the layer's pool were made under the old flag,
+        // so this frame still composites over an unfiltered backdrop and says
+        // so; the next one does not.
+        if !self.drawable_is_readable {
+            if self.layer_reads_requested {
+                self.drawable_is_readable = true;
+            } else if vector_groups::scene_has_a_backdrop_filter(scene) {
+                layer.setFramebufferOnly(false);
+                self.layer_reads_requested = true;
+            }
+        }
         // Native views sit beneath the layer, so it can only be opaque, and
         // eligible for direct-to-display presentation, while none are showing.
         let shows_native_views = !scene.native_views.is_empty();
@@ -588,12 +704,14 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         crate::fast::layers::raster::rasterize_tiles(self, scene);
+        let clip_plan = self.prepare_clip_masks(scene, viewport_size)?;
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
             self.is_unified_memory,
         )?;
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let instance_bindings = write_clipped_instances(scene, &clip_plan.masks, &mut writer)
+            .with_context(|| {
             format!(
                 "writing instance data: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -606,14 +724,28 @@ impl MetalRenderer {
             )
         })?;
         let mut surface_textures = Vec::new();
-        let command_buffer = self.fast_frame(
-            scene,
-            &instance_bindings,
-            &mut writer, // fast child scenes append their own instance bindings.
-            texture,
-            viewport_size,
-            &mut surface_textures,
-        )?;
+        // A scene that clips to a path or isolates a group is drawn in passes
+        // of its own; every other scene is drawn exactly as upstream draws it.
+        let command_buffer = if scene.clips.is_empty() && scene.groups.is_empty() {
+            self.fast_frame(
+                scene,
+                &instance_bindings,
+                &mut writer, // fast child scenes append their own instance bindings.
+                texture,
+                viewport_size,
+                &mut surface_textures,
+            )?
+        } else {
+            self.vector_frame(
+                scene,
+                &clip_plan,
+                &instance_bindings,
+                &mut writer,
+                texture,
+                viewport_size,
+                &mut surface_textures,
+            )?
+        };
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let frame_resources = Cell::new(Some((writer.finish(), surface_textures)));
@@ -799,14 +931,10 @@ impl MetalRenderer {
         )?;
         crate::fast::rounded_clip::default_mask(&command_encoder);
         let depth_scale = quad_depth_scale(scene.quads.len());
-        // SAFETY: Metal copies both values, which match every vertex shader's
-        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
+        bind_render_target(&command_encoder, &RenderTarget::whole(viewport_size));
+        // SAFETY: Metal copies the value, which matches every vertex shader's
+        // `GlobalInputIndex_DepthScale` argument.
         unsafe {
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                GlobalInputIndex::ViewportSize as usize,
-            );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&depth_scale).cast(),
                 mem::size_of_val(&depth_scale),
@@ -839,11 +967,11 @@ impl MetalRenderer {
 
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, &command_encoder)
+                    self.draw_shadows(range, false, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Quads(range) => {
                     quad_cursor += range.len() as u32;
-                    self.draw_quads(range, instance_bindings, &command_encoder)
+                    self.draw_quads(range, false, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Paths(range) => {
                     let tiles_start = path_tile_cursor;
@@ -853,17 +981,19 @@ impl MetalRenderer {
                         .sum::<usize>();
                     self.draw_path_tiles(
                         tiles_start..path_tile_cursor,
+                        false,
                         instance_bindings,
                         &command_encoder,
                     )
                 }
                 PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, &command_encoder)
+                    self.draw_underlines(range, false, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
+                        false,
                         instance_bindings,
                         &command_encoder,
                     ),
@@ -871,6 +1001,7 @@ impl MetalRenderer {
                     .draw_polychrome_sprites(
                         texture_id,
                         range,
+                        false,
                         instance_bindings,
                         &command_encoder,
                     ),
@@ -898,15 +1029,16 @@ impl MetalRenderer {
         Ok(command_buffer)
     }
 
-    fn depth_texture_matching(
+    pub(crate) fn depth_texture_matching(
         &mut self,
         target: &ProtocolObject<dyn MTLTexture>,
     ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        if let Some(depth_texture) = &self.depth_texture
-            && depth_texture.width() == target.width()
-            && depth_texture.height() == target.height()
-        {
-            return Ok(depth_texture.clone());
+        if let Some(index) = self.depth_textures.iter().position(|depth_texture| {
+            depth_texture.width() == target.width() && depth_texture.height() == target.height()
+        }) {
+            let depth_texture = self.depth_textures.remove(index);
+            self.depth_textures.insert(0, depth_texture.clone());
+            return Ok(depth_texture);
         }
         let descriptor = MTLTextureDescriptor::new();
         // SAFETY: The size is the size of an existing render target, which the device supports.
@@ -927,7 +1059,10 @@ impl MetalRenderer {
             .device
             .newTextureWithDescriptor(&descriptor)
             .context("allocating depth texture")?;
-        self.depth_texture = Some(depth_texture.clone());
+        // The window and a few nesting levels of group targets: older sizes are
+        // ones no target has had for a while.
+        self.depth_textures.insert(0, depth_texture.clone());
+        self.depth_textures.truncate(MAX_DEPTH_TEXTURES);
         Ok(depth_texture)
     }
 
@@ -967,7 +1102,7 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_native_views(
+    pub(crate) fn draw_native_views(
         &self,
         native_views: Range<usize>,
         instance_bindings: &InstanceBindings,
@@ -996,9 +1131,10 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_path_tiles(
+    pub(crate) fn draw_path_tiles(
         &self,
         tiles: Range<usize>,
+        clipped: bool,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1006,7 +1142,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.setRenderPipelineState(&self.path_tiles_pipeline_state);
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::PathTiles,
+            &self.path_tiles_pipeline_state,
+            clipped,
+        ));
         // SAFETY: The scene's tile range and its curves and paints match the uploaded shader layouts and slots.
         // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
@@ -1035,19 +1175,47 @@ impl MetalRenderer {
                 instance_bindings.path_paints.offset,
                 PathTileInputIndex::Paints as usize,
             );
-            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::TriangleStrip,
-                0,
-                4,
-                tiles.len(),
-                tiles.start,
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.path_brushes.buffer),
+                instance_bindings.path_brushes.offset,
+                PathTileInputIndex::Brushes as usize,
             );
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&instance_bindings.path_brushes.buffer),
+                instance_bindings.path_brushes.offset,
+                PathTileInputIndex::Brushes as usize,
+            );
+        }
+        // One draw per stretch of tiles whose brushes share an atlas texture: a
+        // fragment stage samples one texture, and a batch's paths may have
+        // brushes in different ones.
+        for run in instance_bindings.brush_runs(tiles) {
+            let texture = run
+                .texture
+                .and_then(|texture_id| self.sprite_atlas.metal_texture(texture_id))
+                .unwrap_or_else(|| self.default_brush_texture.clone());
+            // SAFETY: The run lies within the uploaded tiles, and Metal retains
+            // the texture for the draw.
+            unsafe {
+                command_encoder.setFragmentTexture_atIndex(
+                    Some(&texture),
+                    PathTileInputIndex::BrushAtlas as usize,
+                );
+                command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                    run.tiles.len(),
+                    run.tiles.start,
+                );
+            }
         }
     }
 
-    fn draw_shadows(
+    pub(crate) fn draw_shadows(
         &self,
         shadows: Range<usize>,
+        clipped: bool,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1055,7 +1223,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.setRenderPipelineState(&self.shadows_pipeline_state);
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::Shadows,
+            &self.shadows_pipeline_state,
+            clipped,
+        ));
         // SAFETY: The scene's shadow range matches the uploaded shader layouts and slots.
         // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
@@ -1079,9 +1251,10 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_quads(
+    pub(crate) fn draw_quads(
         &self,
         quads: Range<usize>,
+        clipped: bool,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1089,7 +1262,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.setRenderPipelineState(&self.quads_pipeline_state);
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::Quads,
+            &self.quads_pipeline_state,
+            clipped,
+        ));
         // SAFETY: The scene's quad range matches the uploaded shader layouts and slots.
         // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
@@ -1113,9 +1290,10 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_underlines(
+    pub(crate) fn draw_underlines(
         &self,
         underlines: Range<usize>,
+        clipped: bool,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1123,7 +1301,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.setRenderPipelineState(&self.underlines_pipeline_state);
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::Underlines,
+            &self.underlines_pipeline_state,
+            clipped,
+        ));
         // SAFETY: The scene's underline range matches the uploaded shader layouts and slots.
         // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
@@ -1147,10 +1329,11 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_monochrome_sprites(
+    pub(crate) fn draw_monochrome_sprites(
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
+        clipped: bool,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1167,7 +1350,11 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.setRenderPipelineState(&self.monochrome_sprites_pipeline_state);
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::MonochromeSprites,
+            &self.monochrome_sprites_pipeline_state,
+            clipped,
+        ));
         // SAFETY: The scene's sprite range and copied sizes match the shader layouts and slots.
         // Metal retains the buffers and texture, and writer.finish publishes the instance writes.
         unsafe {
@@ -1200,10 +1387,11 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_polychrome_sprites(
+    pub(crate) fn draw_polychrome_sprites(
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
+        clipped: bool,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1229,7 +1417,11 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.setRenderPipelineState(&self.polychrome_sprites_pipeline_state);
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::PolychromeSprites,
+            &self.polychrome_sprites_pipeline_state,
+            clipped,
+        ));
         // SAFETY: The scene's sprite range and copied sizes match the shader layouts and slots.
         // Metal retains the buffers and texture, and writer.finish publishes the instance writes.
         unsafe {
@@ -1262,7 +1454,7 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_surfaces(
+    pub(crate) fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
         first_surface: usize,
@@ -1270,11 +1462,17 @@ impl MetalRenderer {
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     ) -> Result<()> {
-        if surfaces.is_empty() {
+        let Some(first) = surfaces.first() else {
             return Ok(());
-        }
+        };
 
-        command_encoder.setRenderPipelineState(&self.surfaces_pipeline_state);
+        // A batch is homogeneous in whether it is clipped, so the whole run
+        // agrees with its first element.
+        command_encoder.setRenderPipelineState(self.pipeline_for(
+            PrimitivePipeline::Surfaces,
+            &self.surfaces_pipeline_state,
+            first.clip.is_clipped(),
+        ));
         // SAFETY: The SurfaceBounds instances match the shader layout and slot.
         // Metal retains the buffers, and writer.finish publishes CPU writes before submission.
         unsafe {
@@ -1292,11 +1490,13 @@ impl MetalRenderer {
                 DevicePixels::from(CVPixelBufferGetHeight(image_buffer) as i32),
             );
 
+            // A surface in a format this cannot draw is skipped rather than
+            // failing the whole frame around it.
             let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
-            anyhow::ensure!(
-                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                "unsupported surface pixel format: {pixel_format:#x}"
-            );
+            if pixel_format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                log::error!("unsupported surface pixel format {pixel_format:#x}; skipping draw");
+                continue;
+            }
 
             let plane_texture = |plane, format| -> Result<CFRetained<CVMetalTexture>> {
                 let width = CVPixelBufferGetWidthOfPlane(image_buffer, plane);
@@ -1366,7 +1566,50 @@ impl MetalRenderer {
     }
 }
 
-fn new_command_encoder_for_texture(
+impl MetalRenderer {
+    /// The pipeline a batch of `kind` draws with: `unclipped`, or its clip-path
+    /// specialization when the batch is clipped.
+    ///
+    /// A clipped batch only reaches here in a scene that registered clip paths,
+    /// and such a scene built the clip resources before anything was drawn,
+    /// so the specialization is there to take.
+    fn pipeline_for<'a>(
+        &'a self,
+        kind: PrimitivePipeline,
+        unclipped: &'a ProtocolObject<dyn MTLRenderPipelineState>,
+        clipped: bool,
+    ) -> &'a ProtocolObject<dyn MTLRenderPipelineState> {
+        match &self.clip {
+            Some(clip) if clipped => &clip.primitive_pipelines[kind as usize],
+            _ => unclipped,
+        }
+    }
+}
+
+/// Binds the attachment a pass draws into for both stages: the vertex stage
+/// places primitives on it, and the fragment stage turns `[[position]]` back
+/// into a scene position with it.
+pub(crate) fn bind_render_target(
+    command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    render_target: &RenderTarget,
+) {
+    // SAFETY: Metal copies the value, which matches every shader's
+    // `GlobalInputIndex_RenderTarget` argument.
+    unsafe {
+        command_encoder.setVertexBytes_length_atIndex(
+            ptr::NonNull::from(render_target).cast(),
+            mem::size_of_val(render_target),
+            GlobalInputIndex::RenderTarget as usize,
+        );
+        command_encoder.setFragmentBytes_length_atIndex(
+            ptr::NonNull::from(render_target).cast(),
+            mem::size_of_val(render_target),
+            GlobalInputIndex::RenderTarget as usize,
+        );
+    }
+}
+
+pub(crate) fn new_command_encoder_for_texture(
     command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     texture: &ProtocolObject<dyn MTLTexture>,
     depth_texture: &ProtocolObject<dyn MTLTexture>,
@@ -1438,7 +1681,8 @@ fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Rgb
     RgbaImage::from_raw(width, height, pixels).context("creating RGBA image from pixel data")
 }
 
-fn build_pipeline_state(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_pipeline_state(
     device: &ProtocolObject<dyn MTLDevice>,
     library: &ProtocolObject<dyn MTLLibrary>,
     label: &str,
@@ -1446,13 +1690,11 @@ fn build_pipeline_state(
     fragment_fn_name: &str,
     pixel_format: MTLPixelFormat,
     blending: bool,
+    clipped: bool,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-    let vertex_fn = library
-        .newFunctionWithName(&NSString::from_str(vertex_fn_name))
-        .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
-    let fragment_fn = library
-        .newFunctionWithName(&NSString::from_str(fragment_fn_name))
-        .with_context(|| format!("locating fragment function {fragment_fn_name}"))?;
+    let constants = clip_constants(clipped);
+    let vertex_fn = shader_function(library, vertex_fn_name, Some(&constants))?;
+    let fragment_fn = shader_function(library, fragment_fn_name, Some(&constants))?;
 
     let descriptor = MTLRenderPipelineDescriptor::new();
     descriptor.setLabel(Some(&NSString::from_str(label)));
@@ -1488,6 +1730,134 @@ fn build_depth_stencil_state(
         .context("creating depth stencil state")
 }
 
+/// Draws everything, in submission order, and writes no depth.
+fn build_unordered_depth_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Result<Retained<ProtocolObject<dyn MTLDepthStencilState>>> {
+    let descriptor = MTLDepthStencilDescriptor::new();
+    descriptor.setDepthCompareFunction(MTLCompareFunction::Always);
+    descriptor.setDepthWriteEnabled(false);
+    device
+        .newDepthStencilStateWithDescriptor(&descriptor)
+        .context("creating unordered depth stencil state")
+}
+
+/// Looks a function up in the shader library, specialized with `constants`
+/// when the function declares any.
+pub(crate) fn shader_function(
+    library: &ProtocolObject<dyn MTLLibrary>,
+    name: &str,
+    constants: Option<&MTLFunctionConstantValues>,
+) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLFunction>>> {
+    let ns_name = NSString::from_str(name);
+    match constants {
+        Some(constants) => library
+            .newFunctionWithName_constantValues_error(&ns_name, constants)
+            .with_context(|| format!("locating function {name}")),
+        None => library
+            .newFunctionWithName(&ns_name)
+            .with_context(|| format!("locating function {name}")),
+    }
+}
+
+/// The specialization that picks between the clipped and unclipped variant of a
+/// shader. Every function that mentions `CLIPPED` must be given one, and one
+/// given to a function that does not is ignored.
+pub(crate) fn clip_constants(clipped: bool) -> Retained<MTLFunctionConstantValues> {
+    let constants = MTLFunctionConstantValues::new();
+    // SAFETY: The value is read for the duration of the call, with the type
+    // and index the shaders declare for `CLIPPED`.
+    unsafe {
+        constants.setConstantValue_type_atIndex(
+            ptr::NonNull::from(&clipped).cast(),
+            MTLDataType::Bool,
+            0,
+        );
+    }
+    constants
+}
+
+/// A one-texel texture to bind where a path batch has no image brush. Nothing
+/// samples it - the per-path record says the path has no brush - but the
+/// argument it fills is declared unconditionally, so it has to exist.
+fn build_default_brush_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let descriptor = MTLTextureDescriptor::new();
+    // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
+    unsafe {
+        descriptor.setWidth(1);
+        descriptor.setHeight(1);
+    }
+    descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    descriptor.setUsage(MTLTextureUsage::ShaderRead);
+    descriptor.setStorageMode(MTLStorageMode::Private);
+    device
+        .newTextureWithDescriptor(&descriptor)
+        .context("allocating the default brush texture")
+}
+
+/// A drawing pipeline that exists in both an unclipped and a clip-path
+/// specialization. The variant is its own index into
+/// [`ClipResources::primitive_pipelines`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrimitivePipeline {
+    PathTiles = 0,
+    Shadows,
+    Quads,
+    Underlines,
+    MonochromeSprites,
+    PolychromeSprites,
+    Surfaces,
+}
+
+/// Every [`PrimitivePipeline`], in the order the enum indexes them: the label
+/// Metal's debugger shows, the vertex function and the fragment function. A
+/// clipped pipeline is the same names with `_clipped` appended to the label
+/// and the `CLIPPED` function constant set.
+pub(crate) const PRIMITIVE_PIPELINES: [(&str, &str, &str); 7] = [
+    ("path_tiles", "path_tile_vertex", "path_tile_fragment"),
+    ("shadows", "shadow_vertex", "shadow_fragment"),
+    ("quads", "quad_vertex", "quad_fragment"),
+    ("underlines", "underline_vertex", "underline_fragment"),
+    (
+        "monochrome_sprites",
+        "monochrome_sprite_vertex",
+        "monochrome_sprite_fragment",
+    ),
+    (
+        "polychrome_sprites",
+        "polychrome_sprite_vertex",
+        "polychrome_sprite_fragment",
+    ),
+    ("surfaces", "surface_vertex", "surface_fragment"),
+];
+
+/// Builds the clip-path specialization of every [`PrimitivePipeline`].
+pub(crate) fn build_clipped_pipelines(
+    device: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+) -> Result<[Retained<ProtocolObject<dyn MTLRenderPipelineState>>; PRIMITIVE_PIPELINES.len()]> {
+    let pipelines = PRIMITIVE_PIPELINES
+        .iter()
+        .map(|&(label, vertex_fn, fragment_fn)| {
+            build_pipeline_state(
+                device,
+                library,
+                &format!("{label}_clipped"),
+                vertex_fn,
+                fragment_fn,
+                MTLPixelFormat::BGRA8Unorm,
+                true,
+                true,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pipelines
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("built a primitive pipeline count other than its kinds'"))
+}
+
 #[derive(Clone)]
 pub(crate) struct InstanceBinding {
     pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -1499,30 +1869,150 @@ pub(crate) struct InstanceBindings {
     path_tiles: InstanceBinding,
     path_curves: InstanceBinding,
     path_paints: InstanceBinding,
+    /// One [`PathBrushRecord`] per path, beside its paint.
+    path_brushes: InstanceBinding,
+    /// Where each path's tiles end, and the atlas texture its brush samples.
+    path_brush_textures: Vec<(usize, Option<AtlasTextureId>)>,
     shadows: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     pub(crate) polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
     native_views: InstanceBinding,
+    /// One [`gpui::ClipMask`] per registered clip, plus the leading `ClipId::NONE`
+    /// entry, so a fragment stage can index this by the id it already carries.
+    pub(crate) clip_masks: InstanceBinding,
 }
 
-// Shared by fast layer tiles and clipped child scenes.
+/// A stretch of one path batch's tiles that can be drawn with one brush atlas
+/// texture bound.
+///
+/// `texture` is `None` while no path in the run has asked for one, which is the
+/// whole batch in every frame that brushes nothing.
+pub(crate) struct BrushRun {
+    pub(crate) texture: Option<AtlasTextureId>,
+    pub(crate) tiles: Range<usize>,
+}
+
+impl InstanceBindings {
+    /// The runs of `tiles` that share a brush texture, in order.
+    pub(crate) fn brush_runs(&self, tiles: Range<usize>) -> Vec<BrushRun> {
+        let mut runs: Vec<BrushRun> = Vec::new();
+        let mut path_start = 0;
+        for &(path_end, texture) in &self.path_brush_textures {
+            let start = path_start.max(tiles.start);
+            let end = path_end.min(tiles.end);
+            path_start = path_end;
+            if start >= end {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(run) if run.tiles.end == start && run.accepts(texture) => {
+                    run.texture = run.texture.or(texture);
+                    run.tiles.end = end;
+                }
+                _ => runs.push(BrushRun {
+                    texture,
+                    tiles: start..end,
+                }),
+            }
+        }
+        runs
+    }
+}
+
+impl BrushRun {
+    /// Whether a path wanting `texture` can be drawn in this run: one that
+    /// wants no texture always can, and one that wants a texture can as long as
+    /// the run has not committed to a different one.
+    fn accepts(&self, texture: Option<AtlasTextureId>) -> bool {
+        match (self.texture, texture) {
+            (_, None) | (None, Some(_)) => true,
+            (Some(bound), Some(wanted)) => bound == wanted,
+        }
+    }
+}
+
+/// One entry of the per-path brush buffer, indexed by [`gpui::PathTile::paint`]
+/// exactly as the paint buffer beside it is.
+///
+/// It sits beside the paint rather than in [`gpui::PathPaint`] because every
+/// backend uploads the paint and only this one resolves a brush; a path that
+/// has no brush spends one of these with `enabled` zero.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct PathBrushRecord {
+    pub brush: PathBrush,
+    /// Whether `brush` means anything.
+    pub enabled: u32,
+}
+
+impl PathBrushRecord {
+    fn enabled(brush: PathBrush) -> Self {
+        Self { brush, enabled: 1 }
+    }
+
+    /// The entry an unbrushed path gets. Its tile names texture zero, which the
+    /// shader never reads because `enabled` is zero.
+    fn disabled() -> Self {
+        Self {
+            brush: PathBrush {
+                tile: AtlasTile {
+                    texture_id: AtlasTextureId {
+                        index: 0,
+                        kind: AtlasTextureKind::Polychrome,
+                    },
+                    tile_id: TileId(0),
+                    padding: 0,
+                    bounds: Bounds::default(),
+                },
+                screen_to_brush: TransformationMatrix::unit(),
+                x_extend: BrushExtend::Pad,
+                y_extend: BrushExtend::Pad,
+                opacity: 0.,
+            },
+            enabled: 0,
+        }
+    }
+}
+
+// Shared by fast layer tiles and clipped child scenes, which clip nothing to a
+// path: the scene keeps content that pushes one out of both.
 pub(crate) fn write_instances(
     scene: &Scene,
+    writer: &mut InstanceBufferWriter,
+) -> Result<InstanceBindings> {
+    write_clipped_instances(scene, &ClipPlan::unclipped().masks, writer)
+}
+
+pub(crate) fn write_clipped_instances(
+    scene: &Scene,
+    clip_masks: &[gpui::ClipMask],
     writer: &mut InstanceBufferWriter,
 ) -> Result<InstanceBindings> {
     let mut path_paints = Vec::with_capacity(scene.paths.len());
     let mut path_curves = Vec::new();
     let mut path_tiles = Vec::new();
+    let mut path_brushes = Vec::with_capacity(scene.paths.len());
+    let mut path_brush_textures = Vec::with_capacity(scene.paths.len());
     for path in &scene.paths {
         path.append_to(&mut path_paints, &mut path_curves, &mut path_tiles);
+        path_brushes.push(match path.brush() {
+            Some(brush) => PathBrushRecord::enabled(*brush),
+            None => PathBrushRecord::disabled(),
+        });
+        path_brush_textures.push((
+            path_tiles.len(),
+            path.brush().map(|brush| brush.tile.texture_id),
+        ));
     }
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
         path_tiles: writer.write(&path_tiles)?,
         path_curves: writer.write(&path_curves)?,
         path_paints: writer.write(&path_paints)?,
+        path_brushes: writer.write(&path_brushes)?,
+        path_brush_textures,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
@@ -1530,13 +2020,18 @@ pub(crate) fn write_instances(
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            clip: surface.clip,
+            pad: 0,
         }))?,
         native_views: writer.write_iter(scene.native_views.iter().map(|native_view| {
             SurfaceBounds {
                 bounds: native_view.bounds,
                 content_mask: native_view.content_mask,
+                clip: ClipId::NONE,
+                pad: 0,
             }
         }))?,
+        clip_masks: writer.write(clip_masks)?,
     })
 }
 
@@ -1593,7 +2088,7 @@ impl InstanceBufferWriter {
         Ok((binding, values))
     }
 
-    fn write<T>(&mut self, values: &[T]) -> Result<InstanceBinding> {
+    pub(crate) fn write<T>(&mut self, values: &[T]) -> Result<InstanceBinding> {
         let (binding, destination) = self.allocate::<T>(values.len())?;
         // SAFETY: The disjoint source and destination hold the same number of T values, and the destination stays MaybeUninit.
         unsafe {
@@ -1680,9 +2175,20 @@ impl InstanceBufferWriter {
 /// Vertex buffer slots bound once per render pass and shared by every
 /// pipeline. Each primitive's own slots start after these.
 #[repr(C)]
-enum GlobalInputIndex {
-    ViewportSize = 0,
+pub(crate) enum GlobalInputIndex {
+    /// The [`RenderTarget`] a pass draws into.
+    RenderTarget = 0,
     DepthScale = 1,
+}
+
+/// The coverage atlas and the per-clip records the clipped variant of every
+/// primitive's fragment stage reads, bound once per pass. Buffers and textures
+/// index separately in Metal; both sit clear of every primitive's own slots
+/// and of the rounded clip's.
+#[repr(C)]
+pub(crate) enum ClipInputIndex {
+    Masks = 26,
+    Atlas = 27,
 }
 
 #[repr(C)]
@@ -1722,6 +2228,9 @@ enum PathTileInputIndex {
     Tiles = 2,
     Curves = 3,
     Paints = 4,
+    Brushes = 5,
+    /// A texture slot: the atlas texture the batch's image brushes sample.
+    BrushAtlas = 6,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1729,7 +2238,15 @@ enum PathTileInputIndex {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// A surface is drawn one instance at a time out of its own record, so
+    /// unlike every other primitive its clip id rides here rather than in the
+    /// scene struct the shaders read.
+    pub clip: ClipId,
+    pub pad: u32,
 }
+
+/// How many depth textures [`MetalRenderer::depth_texture_matching`] keeps.
+const MAX_DEPTH_TEXTURES: usize = 4;
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 pub struct MetalHeadlessRenderer {
@@ -1739,8 +2256,15 @@ pub struct MetalHeadlessRenderer {
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 impl MetalHeadlessRenderer {
     pub fn new() -> Result<Self> {
+        Self::with_transparency(false)
+    }
+
+    /// A headless renderer whose target is cleared to transparent rather than
+    /// opaque black when `transparent` is set, so a test can read the scene's
+    /// own alpha back.
+    pub fn with_transparency(transparent: bool) -> Result<Self> {
         let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let renderer = MetalRenderer::new_headless(instance_buffer_pool)?;
+        let renderer = MetalRenderer::new_headless(instance_buffer_pool, transparent)?;
         Ok(Self { renderer })
     }
 }
@@ -1878,15 +2402,16 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(PaintSurface {
             order: 0,
+            clip: ClipId::NONE,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);
         scene.finish();
 
         let mut renderer =
-            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())), false)
                 .unwrap();
         let image = renderer
             .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))

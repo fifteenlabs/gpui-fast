@@ -173,6 +173,9 @@ pub(crate) fn upload_paths(
     curves.clear();
     paints.clear();
     for path in &scene.paths {
+        if path.brush().is_some() {
+            gpui::report_unresolved_path_brush();
+        }
         path.append_to(paints, curves, tiles);
     }
     pipelines

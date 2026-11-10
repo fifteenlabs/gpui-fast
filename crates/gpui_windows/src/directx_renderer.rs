@@ -57,6 +57,9 @@ pub(crate) struct DirectXRenderer {
     pub(crate) fast_composition: crate::fast::composition::DirectXComposition,
     pub(crate) fast_recovery: crate::fast::device_recovery::RecoveryState,
     pub(crate) fast_partial: crate::fast::partial::Partial,
+
+    /// Whether this renderer has already said that it cannot isolate a group.
+    reported_groups: bool,
 }
 
 /// Direct3D objects
@@ -205,6 +208,7 @@ impl DirectXRenderer {
             fast_composition: crate::fast::composition::DirectXComposition::default(),
             fast_recovery: crate::fast::device_recovery::RecoveryState::default(),
             fast_partial,
+            reported_groups: false,
         })
     }
 
@@ -380,6 +384,7 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        report_groups_painted_without_isolation(scene, &mut self.reported_groups);
         if !crate::fast::partial::draw(self, scene, background_appearance)? {
             self.render(scene, background_appearance)?;
         }
@@ -668,6 +673,9 @@ impl DirectXRenderer {
             let mut curves = Vec::new();
             let mut tiles = Vec::new();
             for path in &scene.paths {
+                if path.brush().is_some() {
+                    gpui::report_unresolved_path_brush();
+                }
                 path.append_to(&mut paints, &mut curves, &mut tiles);
             }
 
