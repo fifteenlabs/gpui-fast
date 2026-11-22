@@ -25,7 +25,9 @@ upstream GPUI before the app moved to gpui-fast.
 - **Animations in a view of their own**: `AnimationElement::in_own_view`
   (`fast::animation_view`) draws an animation of a `Clone` element in a
   view of its own, so its frames build only the animated element and the
-  view around it is spliced rather than built again.
+  view around it is spliced rather than built again; and a splice may
+  rebuild a nested view in a list's row, outside the layout tree of the view
+  around it, when it asks for the layout it had.
 - **Retained-renderer reactivity**: a retained view is drawn again when an
   entity it read is released, when the window's focus, size or appearance
   changes while it draws, when scroll geometry it read changes or a scroll

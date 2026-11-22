@@ -343,6 +343,7 @@ impl Window {
         // The outermost dirty views nested in it are the gaps. Every view
         // around a dirty one is dirty too, so a clean one holds none.
         let mut gaps = Vec::new();
+        let mut detached = Vec::new();
         let mut index = previous + 1;
         while index <= previous + record.nested {
             let nested = &records[index];
@@ -354,18 +355,18 @@ impl Window {
                     return None;
                 }
                 // A splice skips the ancestor's prepaint. If that prepaint
-                // places a separate layout root, rebuilding a gap under it
-                // would leave its new measurements outside the layout pass.
-                // Fall back before claiming nodes or building any gaps so
-                // the ancestor can lay out and place that root itself.
-                if !self
-                    .layout_engine
-                    .as_ref()
-                    .unwrap()
-                    .layout_reaches(layout.root, nested.layout.as_ref().unwrap().root)
-                {
-                    return None;
-                }
+                // places a separate layout root (a list's rows), a gap under
+                // it is outside the layout pass the splice computes: it can
+                // only be built again on its own if it asks for exactly the
+                // layout it had, which needs no computing. See
+                // `GapLayout::Unchanged` below.
+                detached.push(
+                    !self
+                        .layout_engine
+                        .as_ref()
+                        .unwrap()
+                        .layout_reaches(layout.root, nested.layout.as_ref().unwrap().root),
+                );
                 gaps.push(index);
             }
             index += nested.nested + 1;
@@ -426,13 +427,16 @@ impl Window {
         let mut built = Vec::with_capacity(gaps.len());
         let mut unchanged = true;
         let mut same_roots = true;
-        for gap in gaps {
+        for (gap, detached) in gaps.into_iter().zip(detached) {
             let (gap, gap_layout) = self.lay_out_gap(gap, cx)?;
             built.push(gap);
             match gap_layout {
                 GapLayout::Unchanged => {}
-                GapLayout::Changed => unchanged = false,
-                GapLayout::NewRoot => {
+                GapLayout::Changed if !detached => unchanged = false,
+                // A gap outside the view's own layout tree that has to be
+                // laid out again is laid out by the prepaint that places its
+                // root, which only building the view around it runs.
+                GapLayout::Changed | GapLayout::NewRoot => {
                     same_roots = false;
                     break;
                 }

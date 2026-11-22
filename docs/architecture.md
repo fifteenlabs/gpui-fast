@@ -377,6 +377,13 @@ around it is rebuilt after all, taking over the nested view it already built
 rather than building it twice. The splice is an optimization with a fallback
 to the full rebuild, never a different result.
 
+A nested view laid out outside the layout tree of the view around it — in a
+list's row, which the list lays out as a root of its own while it is
+prepainted — is outside the layout the splice computes. It is rebuilt on its
+own only if it asks for exactly the layout it had, so that the layout its
+row was given last frame still holds; otherwise the view around it is built
+after all, and the list lays the row out again.
+
 A nested view can be rebuilt on its own only if it can be rendered without
 the view around it: it has to have been placed as an `Entity` or `AnyView`,
 which is how views are almost always placed.
