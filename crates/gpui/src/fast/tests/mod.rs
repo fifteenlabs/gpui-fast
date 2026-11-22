@@ -1,6 +1,7 @@
 //! Tests of what gpui-fast adds, kept out of upstream files' test modules.
 
 mod a11y;
+mod animation_view;
 mod cached_layout;
 mod dependencies;
 mod dispatch;
