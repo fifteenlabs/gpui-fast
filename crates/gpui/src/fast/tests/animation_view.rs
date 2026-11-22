@@ -471,3 +471,169 @@ fn measure() {
         );
     }
 }
+
+/// A list's rows are laid out on their own, outside the layout of the view
+/// the list is in: an animation in a row is built again on its own all the
+/// same, and draws what the page drawn from scratch draws.
+mod in_a_list {
+    use super::Swatch;
+    use crate::prelude::FluentBuilder as _;
+    use crate::{
+        Animation, AnimationExt as _, AnyWindowHandle, AppContext as _, Context, IntoElement,
+        ListAlignment, ListState, ParentElement as _, Render, Styled as _, TestAppContext, Window,
+        div, list, px, uniform_list,
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        time::Duration,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        List,
+        UniformList,
+    }
+
+    struct ListPage {
+        kind: Kind,
+        state: ListState,
+        renders: Rc<Cell<usize>>,
+        swatch: Swatch,
+    }
+
+    impl Render for ListPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let swatch = self.swatch.clone();
+            let row = move |ix: usize| {
+                let swatch = swatch.clone();
+                let base_width = swatch.width;
+                let grows = swatch.grows;
+                div()
+                    .flex()
+                    .h(px(20.))
+                    .w(px(200.))
+                    .bg(crate::hsla(0.6, 0.2, ix as f32 / 100., 1.))
+                    .pl(px(13.))
+                    .when(ix == 1, |this| {
+                        this.child(div().w(px(7.)).h(px(4.)).bg(crate::hsla(0.4, 0.2, 0.5, 1.)))
+                            .child(
+                                div().flex().pt(px(3.)).pl(px(5.)).child(
+                                    swatch
+                                        .with_animation(
+                                            "swatch",
+                                            Animation::new(Duration::from_secs(1)).repeat(),
+                                            move |mut swatch, delta| {
+                                                swatch.seen.borrow_mut().push(delta);
+                                                swatch.alpha = 0.1 + 0.9 * delta;
+                                                if grows {
+                                                    swatch.width = base_width + px(100. * delta);
+                                                }
+                                                swatch
+                                            },
+                                        )
+                                        .in_own_view(),
+                                ),
+                            )
+                            .child(div().size(px(8.)).bg(crate::hsla(0.1, 0.2, 0.5, 1.)))
+                    })
+                    .into_any_element()
+            };
+            match self.kind {
+                Kind::List => list(self.state.clone(), move |ix, _, _| row(ix))
+                    .h(px(100.))
+                    .w(px(200.))
+                    .into_any_element(),
+                Kind::UniformList => {
+                    uniform_list("rows", 50, move |range, _, _| range.map(&row).collect())
+                        .h(px(100.))
+                        .w(px(200.))
+                        .into_any_element()
+                }
+            }
+        }
+    }
+
+    fn window(
+        cx: &mut TestAppContext,
+        kind: Kind,
+        grows: bool,
+        retention: bool,
+    ) -> (AnyWindowHandle, Rc<Cell<usize>>, Rc<RefCell<Vec<f32>>>) {
+        let renders = Rc::new(Cell::new(0));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let (renders, seen) = (renders.clone(), seen.clone());
+            move |window, _| {
+                window.set_view_retention(retention);
+                ListPage {
+                    kind,
+                    state: ListState::new(50, ListAlignment::Top, px(0.)),
+                    renders,
+                    swatch: Swatch {
+                        hue: 0.,
+                        width: px(20.),
+                        grows,
+                        repeats: true,
+                        alpha: 1.,
+                        seen,
+                    },
+                }
+            }
+        });
+        (window.into(), renders, seen)
+    }
+
+    fn quads(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> {
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+            let mut quads: Vec<String> = window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|quad| {
+                    format!(
+                        "{:?} {:?} {:?}",
+                        quad.bounds, quad.content_mask.bounds, quad.background
+                    )
+                })
+                .collect();
+            quads.sort();
+            quads
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_animation_in_a_list_row_is_built_again_on_its_own() {
+        for kind in [Kind::List, Kind::UniformList] {
+            for grows in [false, true] {
+                let mut cx = TestAppContext::single();
+                let (retained, renders, seen) = window(&mut cx, kind, grows, true);
+                let (scratch, _, _) = window(&mut cx, kind, grows, false);
+                for frame in 0..8 {
+                    cx.executor().advance_clock(Duration::from_millis(16));
+                    renders.take();
+                    seen.borrow_mut().clear();
+                    let drawn = quads(&mut cx, retained);
+                    assert_eq!(
+                        drawn,
+                        quads(&mut cx, scratch),
+                        "{kind:?}, grows {grows}, frame {frame}: drawn as from scratch"
+                    );
+                    if frame >= 2 {
+                        assert_eq!(seen.borrow().len(), 1, "{kind:?}: the animation runs");
+                        assert_eq!(
+                            renders.get(),
+                            usize::from(grows),
+                            "{kind:?}, grows {grows}: the page is built again only for a new size"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

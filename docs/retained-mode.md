@@ -118,7 +118,7 @@ its frames, so that view is built again, whole, while the animation runs. On
 Fifteen's branch, `.with_animation(..).in_own_view()` draws the animation in
 a view of its own, for an element that is `Clone`: its frames build only the
 animated element, and the view around it is drawn from the last frame around
-it. An animation that changes its element's size still
+it, in a list's row too. An animation that changes its element's size still
 builds the view around it, as it has to.
 
 The window asks the focused text input things every frame — whether it
