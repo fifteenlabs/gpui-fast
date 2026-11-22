@@ -113,6 +113,14 @@ for the views reading it to see it. A frame driver or timer that only needs
 to notify another view should notify it by id (`cx.notify(entity_id)`) rather
 than updating the view that owns the driver.
 
+An animation (`with_animation`) notifies the view it is drawn in on each of
+its frames, so that view is built again, whole, while the animation runs. On
+Fifteen's branch, `.with_animation(..).in_own_view()` draws the animation in
+a view of its own, for an element that is `Clone`: its frames build only the
+animated element, and the view around it is drawn from the last frame around
+it. An animation that changes its element's size still
+builds the view around it, as it has to.
+
 The window asks the focused text input things every frame — whether it
 accepts text, its selection, the bounds of a range — through
 `ElementInputHandler`. Those calls update the input's entity, but do not

@@ -159,10 +159,10 @@ impl<E: IntoElement + 'static> AnimationExt for E {}
 
 /// A GPUI element that applies an animation to another element
 pub struct AnimationElement<E> {
-    id: ElementId,
-    element: Option<E>,
-    animations: SmallVec<[Animation; 1]>,
-    animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
+    pub(crate) id: ElementId,
+    pub(crate) element: Option<E>,
+    pub(crate) animations: SmallVec<[Animation; 1]>,
+    pub(crate) animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
 }
 
 /// A GPUI element driven by a stateful spring.
