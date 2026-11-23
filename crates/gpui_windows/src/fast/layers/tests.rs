@@ -279,7 +279,7 @@ fn composited_scene(
                 TILE as f32,
                 TILE as f32,
             ),
-            content_mask: ContentMask { bounds: viewport },
+            content_mask: ContentMask::new(viewport),
             corner_radii: Corners::default(),
             tile: AtlasTile {
                 texture_id: layer_tile_texture_id(key),
@@ -449,7 +449,7 @@ fn rasterize_and_assemble(harness: &mut Harness, content: Scene, tiles: &[(i32, 
             grayscale: false.into(),
             opacity: 1.,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             corner_radii: Corners::default(),
             tile: AtlasTile {
                 texture_id: layer_tile_texture_id(key),
@@ -533,9 +533,7 @@ fn add_content(
 ) {
     let (ox, oy) = offset;
     let at = |x: f32, y: f32, w: f32, h: f32| sp(x + ox, y + oy, w, h);
-    let mask = |bounds: Bounds<ScaledPixels>| ContentMask {
-        bounds: bounds.intersect(&clip),
-    };
+    let mask = |bounds: Bounds<ScaledPixels>| ContentMask::new(bounds.intersect(&clip));
 
     scene.insert_primitive(Quad {
         content_mask: mask(clip),
@@ -643,7 +641,7 @@ fn add_covered_paths(
     (ox, oy): (f32, f32),
     clip: Bounds<ScaledPixels>,
 ) {
-    let mask = ContentMask { bounds: clip };
+    let mask = ContentMask::new(clip);
     for (x, y, dx, dy) in [
         (200., 330., 1., 1.),
         (330.5, 330., -1., 1.),
@@ -658,9 +656,7 @@ fn add_covered_paths(
         scene.insert_primitive(PaintedPath::new(
             path.build().expect("path"),
             1.,
-            ContentMask {
-                bounds: clip.map(|c| px(c.0)),
-            },
+            ContentMask::new(clip.map(|c| px(c.0))),
             Hsla::from(rgba(0x3366ccff)).into(),
         ));
     }
@@ -693,9 +689,7 @@ fn add_covered_paths(
     scene.insert_primitive(PaintedPath::new(
         path.build().expect("path"),
         1.,
-        ContentMask {
-            bounds: clip.map(|c| px(c.0)),
-        },
+        ContentMask::new(clip.map(|c| px(c.0))),
         Hsla::from(rgba(0x8800ffcc)).into(),
     ));
 }
@@ -762,9 +756,7 @@ fn sp(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
 
 /// A content mask that clips nothing the tests draw.
 fn no_mask() -> ContentMask<ScaledPixels> {
-    ContentMask {
-        bounds: sp(-10_000., -10_000., 20_000., 20_000.),
-    }
+    ContentMask::new(sp(-10_000., -10_000., 20_000., 20_000.))
 }
 
 fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
@@ -1170,9 +1162,7 @@ fn culling_under_covers_changes_no_pixel() {
         (
             "masked",
             Quad {
-                content_mask: ContentMask {
-                    bounds: sp(80., 80., 300., 200.),
-                },
+                content_mask: ContentMask::new(sp(80., 80., 300., 200.)),
                 ..cover(sp(0., 0., 1024., 1024.))
             },
         ),
@@ -1352,9 +1342,7 @@ fn culling_at_a_shared_edge_on_a_pixel_centre_changes_no_pixel() {
         for bordered in [false, true] {
             eprintln!("shared edge: {name}, bordered {bordered}");
             let mut hidden = Quad {
-                content_mask: ContentMask {
-                    bounds: hidden_mask,
-                },
+                content_mask: ContentMask::new(hidden_mask),
                 ..quad(hidden_bounds, Hsla::from(rgba(0xcc3322ff)))
             };
             if bordered {
@@ -1538,7 +1526,7 @@ fn scrolled_scene(harness: &Harness, offset: f32, extra: Option<Quad>, backdrop:
     add_content(&mut scene, harness, (0., offset), clip);
     for row in 0..14 {
         scene.insert_primitive(Quad {
-            content_mask: ContentMask { bounds: clip },
+            content_mask: ContentMask::new(clip),
             corner_radii: Corners::all(ScaledPixels(8.)),
             ..quad(
                 sp(820., 110. + 110. * row as f32 + offset, 150., 90.),
@@ -1592,9 +1580,7 @@ fn partial_redraw_of_a_scroll_equals_whole_drawing() {
         );
         // Something new without a scroll: only that is drawn again.
         let extra = Quad {
-            content_mask: ContentMask {
-                bounds: sp(32., 96., 960., 896.),
-            },
+            content_mask: ContentMask::new(sp(32., 96., 960., 896.)),
             ..quad(sp(600., 500., 120., 80.), Hsla::from(rgba(0xffaa00ff)))
         };
         assert_eq!(
@@ -1642,9 +1628,7 @@ fn turned_sprite_scene(harness: &Harness, angle: f32) -> Scene {
         order: 0,
         animation: Default::default(),
         bounds: sp(400., 400., 120., 120.),
-        content_mask: ContentMask {
-            bounds: sp(0., 0., 1024., 1024.),
-        },
+        content_mask: ContentMask::new(sp(0., 0., 1024., 1024.)),
         color: Hsla::from(rgba(0xffffffff)),
         tile: glyph_tile(harness, 1, false),
         transformation: TransformationMatrix {
@@ -1759,9 +1743,7 @@ fn transformed_sprite_scene(
             order: 0,
             animation: Default::default(),
             bounds: sp(200., 200., 120., 120.),
-            content_mask: ContentMask {
-                bounds: sp(0., 0., 1024., 1024.),
-            },
+            content_mask: ContentMask::new(sp(0., 0., 1024., 1024.)),
             color: Hsla::from(rgba(color)),
             tile: glyph_tile(harness, 1, false),
             transformation,
@@ -1869,9 +1851,7 @@ fn clip_with_turned_sprite(
             order: 0,
             animation: Default::default(),
             bounds,
-            content_mask: ContentMask {
-                bounds: sp(0., 0., 1024., 1024.),
-            },
+            content_mask: ContentMask::new(sp(0., 0., 1024., 1024.)),
             color: Hsla::from(rgba(0xff4040ff)),
             tile: glyph_tile(harness, 1, false),
             transformation: turn_about(angle, side * 0.75, side * 0.5),

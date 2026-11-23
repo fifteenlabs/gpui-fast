@@ -22,9 +22,7 @@ fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
 }
 
 fn everywhere() -> ContentMask<ScaledPixels> {
-    ContentMask {
-        bounds: bounds(0., 0., 4096., 4096.),
-    }
+    ContentMask::new(bounds(0., 0., 4096., 4096.))
 }
 
 fn rectangle_path(x: f32, y: f32, width: f32, height: f32, rgba: u32) -> PaintedPath {
@@ -37,12 +35,10 @@ fn rectangle_path(x: f32, y: f32, width: f32, height: f32, rgba: u32) -> Painted
     PaintedPath::new(
         path.build().expect("rectangle path"),
         1.,
-        ContentMask {
-            bounds: Bounds {
+        ContentMask::new(Bounds {
                 origin: point(px(0.), px(0.)),
                 size: size(px(4096.), px(4096.)),
-            },
-        },
+            }),
         color(rgba).into(),
     )
 }
