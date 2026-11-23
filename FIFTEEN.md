@@ -22,6 +22,19 @@ upstream GPUI before the app moved to gpui-fast.
   break opportunities), a transparent headless renderer
   (`current_headless_renderer_with_transparency`), and the wgpu font and
   backend options the Android and web builds use.
+- **Animations in a view of their own**: `AnimationElement::in_own_view`
+  (`fast::animation_view`) draws an animation of a `Clone` element in a
+  view of its own, so its frames build only the animated element and the
+  view around it is spliced rather than built again; and a splice may
+  rebuild a nested view in a list's row, outside the layout tree of the view
+  around it, when it asks for the layout it had.
+- **Values inherited through the app**: `App::set_inherited` and
+  `App::inherited` (`fast::inherited`) let an element hand a value to
+  everything drawn inside it that reads only the app, such as which theme a
+  part of the window is drawn in. A nested view built again on its own in a
+  splice and a deferred draw take the values they were drawn with, as they take
+  the text style, and a view drawn from last frame is reused only where it
+  inherits what it did then.
 - **Retained-renderer reactivity**: a retained view is drawn again when an
   entity it read is released, when the window's focus, size or appearance
   changes while it draws, when scroll geometry it read changes or a scroll

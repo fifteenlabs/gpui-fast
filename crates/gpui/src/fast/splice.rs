@@ -21,6 +21,7 @@
 //! was placed as an entity or an `AnyView`, and [`Rebuild`] what it inherited.
 
 use crate::fast::dependencies::RenderDependencies;
+use crate::fast::inherited::InheritedValues;
 use crate::fast::retained::{EnclosingRetained, OpenPaint};
 use crate::fast::retained::{
     PaintStatus, RetainedLayout, RetainedSubtree, ViewLayoutState, ViewPrepaint, ViewPrepaintState,
@@ -76,6 +77,7 @@ pub(crate) struct Rebuild {
     /// and the keys of its nodes, are derived from.
     parent_layout_key: u64,
     text_style_stack: TextStyleStack,
+    inherited: InheritedValues,
     element_offset: Point<Pixels>,
     rem_size: Pixels,
     /// The style it is laid out at, when it is a cached view.
@@ -100,6 +102,7 @@ impl Window {
     /// `parent_layout_key`, and nothing it inherits is out of reach.
     pub(crate) fn rebuild_here(
         &self,
+        cx: &App,
         handle: &RebuildHandle,
         cached_style: Option<&StyleRefinement>,
         parent_layout_key: Option<u64>,
@@ -111,6 +114,7 @@ impl Window {
             view: handle.0.clone()?,
             parent_layout_key: parent_layout_key?,
             text_style_stack: self.text_style_stack.clone(),
+            inherited: crate::fast::inherited::current(cx),
             element_offset: self.element_offset(),
             rem_size: self.rem_size(),
             cached_style: cached_style.cloned(),
@@ -253,6 +257,7 @@ impl SplicedPrepaint {
 struct Inherited {
     element_id_stack: crate::window::ElementIdStack,
     text_style_stack: TextStyleStack,
+    values: InheritedValues,
     content_mask_stack: Vec<ContentMask<Pixels>>,
     element_offset_stack: Vec<Point<Pixels>>,
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
@@ -264,6 +269,7 @@ impl Window {
     /// returning what to put back with [`Window::leave_gap`].
     fn enter_gap(
         &mut self,
+        cx: &App,
         id: &GlobalElementId,
         rebuild: &Rebuild,
         content_mask: ContentMask<Pixels>,
@@ -282,6 +288,7 @@ impl Window {
                 &mut self.text_style_stack,
                 rebuild.text_style_stack.clone(),
             ),
+            values: crate::fast::inherited::enter(cx, &rebuild.inherited),
             content_mask_stack: mem::replace(&mut self.content_mask_stack, vec![content_mask]),
             element_offset_stack: mem::replace(
                 &mut self.element_offset_stack,
@@ -295,9 +302,10 @@ impl Window {
         }
     }
 
-    fn leave_gap(&mut self, inherited: Inherited) {
+    fn leave_gap(&mut self, cx: &App, inherited: Inherited) {
         self.element_id_stack = inherited.element_id_stack;
         self.text_style_stack = inherited.text_style_stack;
+        crate::fast::inherited::leave(cx, inherited.values);
         self.content_mask_stack = inherited.content_mask_stack;
         self.element_offset_stack = inherited.element_offset_stack;
         self.rem_size_override_stack = inherited.rem_size_override_stack;
@@ -329,6 +337,7 @@ impl Window {
         let layout = record.layout.as_ref()?;
         if layout.rem_size != self.rem_size()
             || layout.text_style != self.text_style()
+            || !crate::fast::inherited::inherits(cx, &layout.inherited)
             || cx.dependencies_changed(&record.own_dependencies, self.inside_notified_view())
             || crate::fast::layers::invalidate::offset_read_changed(self, &record.own_dependencies)
             || !self.hovers_unchanged(&record.own_hovers)
@@ -338,7 +347,7 @@ impl Window {
 
         // The outermost dirty views nested in it are the gaps. Every view
         // around a dirty one is dirty too, so a clean one holds none.
-        let mut gaps = Vec::new();
+        let mut gaps: Vec<(usize, bool)> = Vec::new();
         let mut index = previous + 1;
         while index <= previous + record.nested {
             let nested = &records[index];
@@ -350,19 +359,17 @@ impl Window {
                     return None;
                 }
                 // A splice skips the ancestor's prepaint. If that prepaint
-                // places a separate layout root, rebuilding a gap under it
-                // would leave its new measurements outside the layout pass.
-                // Fall back before claiming nodes or building any gaps so
-                // the ancestor can lay out and place that root itself.
-                if !self
+                // places a separate layout root (a list's rows), a gap under
+                // it is outside the layout pass the splice computes: it can
+                // only be built again on its own if it asks for exactly the
+                // layout it had, which needs no computing. See
+                // `GapLayout::Unchanged` below.
+                let detached = !self
                     .layout_engine
                     .as_ref()
                     .unwrap()
-                    .layout_reaches(layout.root, nested.layout.as_ref().unwrap().root)
-                {
-                    return None;
-                }
-                gaps.push(index);
+                    .layout_reaches(layout.root, nested.layout.as_ref().unwrap().root);
+                gaps.push((index, detached));
             }
             index += nested.nested + 1;
         }
@@ -377,7 +384,7 @@ impl Window {
         // replay a dirty view. Rebuild the ancestor to reach those draws;
         // deferred draws inside a gap are safe because that gap rebuilds them.
         let mut deferred_cursor = record.prepaint_range.start.deferred_draws_index;
-        for &gap in &gaps {
+        for &(gap, _) in &gaps {
             let range = &records[gap].prepaint_range;
             if deferred_cursor != range.start.deferred_draws_index {
                 return None;
@@ -391,12 +398,12 @@ impl Window {
         let mut kept = kept_keys(
             &layout.keys,
             gaps.iter()
-                .map(|&gap| records[gap].layout.as_ref().unwrap().keys.as_slice()),
+                .map(|&(gap, _)| records[gap].layout.as_ref().unwrap().keys.as_slice()),
             &mut self.retained_state.splice_keys,
         );
         let mut element_states = kept_element_states(
             &layout.element_states,
-            gaps.iter().map(|&gap| {
+            gaps.iter().map(|&(gap, _)| {
                 records[gap]
                     .layout
                     .as_ref()
@@ -422,13 +429,16 @@ impl Window {
         let mut built = Vec::with_capacity(gaps.len());
         let mut unchanged = true;
         let mut same_roots = true;
-        for gap in gaps {
+        for (gap, detached) in gaps {
             let (gap, gap_layout) = self.lay_out_gap(gap, cx)?;
             built.push(gap);
             match gap_layout {
                 GapLayout::Unchanged => {}
-                GapLayout::Changed => unchanged = false,
-                GapLayout::NewRoot => {
+                GapLayout::Changed if !detached => unchanged = false,
+                // A gap outside the view's own layout tree that has to be
+                // laid out again is laid out by the prepaint that places its
+                // root, which only building the view around it runs.
+                GapLayout::Changed | GapLayout::NewRoot => {
                     same_roots = false;
                     break;
                 }
@@ -469,6 +479,7 @@ impl Window {
                         keys: kept,
                         element_states,
                         text_style: previous_layout.text_style.clone(),
+                        inherited: previous_layout.inherited.clone(),
                         rem_size: previous_layout.rem_size,
                         parent_layout_key: previous_layout.parent_layout_key,
                     })
@@ -512,7 +523,7 @@ impl Window {
             return None;
         }
         let previous = self.rendered_frame.retained.find(id)?;
-        if !self.retained_context_matches(previous, bounds) {
+        if !self.retained_context_matches(previous, bounds, cx) {
             return None;
         }
         let records = &self.rendered_frame.retained.records;
@@ -640,7 +651,13 @@ impl Window {
         let recording = self.record_claimed_layout_keys();
         let element_states_start = self.next_frame.accessed_element_states.len();
         let dependency_recording = cx.begin_recording_dependencies();
-        let inherited = self.enter_gap(&global_id, &rebuild, context.content_mask, context.opacity);
+        let inherited = self.enter_gap(
+            cx,
+            &global_id,
+            &rebuild,
+            context.content_mask,
+            context.opacity,
+        );
         let mut view = ViewElement::new(rebuild.view.clone()).rebuildable(rebuild.view.clone());
         view.cached_style = rebuild.cached_style.clone();
         // What its element's request for layout does, inside the view around
@@ -660,7 +677,7 @@ impl Window {
                 crate::fast::layout_key::pop_layout_key(window);
                 (layout_id, layout, layout_key)
             });
-        self.leave_gap(inherited);
+        self.leave_gap(cx, inherited);
         let dependencies = cx.finish_recording_dependencies(dependency_recording).all;
         let element_states =
             self.next_frame.accessed_element_states[element_states_start..].to_vec();
@@ -827,7 +844,7 @@ impl Window {
                 .and_then(|parent| dispatch.copied(parent))
                 .filter(|&node| self.next_frame.dispatch_tree.active_node_id() == Some(node));
             let inherited =
-                self.enter_gap(&gap_id, &rebuild, context.content_mask, context.opacity);
+                self.enter_gap(cx, &gap_id, &rebuild, context.content_mask, context.opacity);
             // What its element's prepaint does, inside the view around it.
             let bounds = gap
                 .bounds
@@ -853,7 +870,7 @@ impl Window {
             }
             self.element_id_stack.pop();
             gap.prepainted = Some((node, prepaint));
-            self.leave_gap(inherited);
+            self.leave_gap(cx, inherited);
 
             cursor = gap_range.end.clone();
             next_record = gap.record + gap_nested + 1;
@@ -964,6 +981,7 @@ impl Window {
                 parent_node: dispatch.refresh(deferred_draw.parent_node),
                 element_id_stack: deferred_draw.element_id_stack.clone(),
                 text_style_stack: deferred_draw.text_style_stack.clone(),
+                fast_inherited: deferred_draw.fast_inherited.clone(),
                 content_mask: deferred_draw.content_mask,
                 rem_size: deferred_draw.rem_size,
                 priority: deferred_draw.priority,
@@ -1055,7 +1073,7 @@ impl Window {
             segments.push((cursor.clone(), self.paint_index()));
             self.reuse_paint(cursor.clone()..gap_range.start.clone());
             let inherited =
-                self.enter_gap(&gap_id, &rebuild, context.content_mask, context.opacity);
+                self.enter_gap(cx, &gap_id, &rebuild, context.content_mask, context.opacity);
             // What its element's paint does, inside the view around it.
             let element_id = gap.element_id();
             if let Some((node, prepaint)) = gap.prepainted.as_mut() {
@@ -1070,7 +1088,7 @@ impl Window {
                 );
                 self.element_id_stack.pop();
             }
-            self.leave_gap(inherited);
+            self.leave_gap(cx, inherited);
             cursor = gap_range.end.clone();
         }
         segments.push((cursor.clone(), self.paint_index()));

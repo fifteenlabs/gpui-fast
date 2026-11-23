@@ -955,6 +955,7 @@ pub struct App {
     pub(crate) pending_notifications: FxHashSet<EntityId>,
     pub(crate) pending_global_notifications: TypeIdHashSet,
     pub(crate) dependencies: crate::fast::dependencies::AppDependencies,
+    pub(crate) fast_inherited: crate::fast::inherited::AppInherited,
     pub(crate) restart_path: Option<PathBuf>,
     pub(crate) restart_arguments: Vec<OsString>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
@@ -1055,6 +1056,7 @@ impl App {
                 pending_notifications: FxHashSet::default(),
                 pending_global_notifications: Default::default(),
                 dependencies: crate::fast::dependencies::AppDependencies::default(),
+                fast_inherited: crate::fast::inherited::AppInherited::default(),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),

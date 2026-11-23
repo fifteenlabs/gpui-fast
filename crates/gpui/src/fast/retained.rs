@@ -17,6 +17,7 @@
 //! on its own later, when what is around it has to be built.
 
 use crate::fast::dependencies::{DependencyRecording, RecordedDependencies, RenderDependencies};
+use crate::fast::inherited::InheritedValues;
 use crate::fast::splice::{Prebuilt, Rebuild, Splice, SplicedPrepaint};
 use crate::window::{PaintIndex, PrepaintStateIndex};
 use crate::{
@@ -152,6 +153,7 @@ pub(crate) struct RetainedContext {
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) content_mask: ContentMask<Pixels>,
     pub(crate) text_style: TextStyle,
+    pub(crate) inherited: InheritedValues,
     pub(crate) opacity: f32,
 }
 
@@ -167,6 +169,7 @@ pub(crate) struct RetainedLayout {
     /// kept for as long as it is not built.
     pub(crate) element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) text_style: TextStyle,
+    pub(crate) inherited: InheritedValues,
     pub(crate) rem_size: Pixels,
     /// The layout key of the element the view hangs off, which keys the
     /// view's own node, when it was laid out in the request-layout walk.
@@ -180,6 +183,7 @@ pub(crate) struct RetainedLayoutRecording {
     element_states: usize,
     dependencies: DependencyRecording,
     text_style: TextStyle,
+    inherited: InheritedValues,
     rem_size: Pixels,
     parent_layout_key: Option<u64>,
     /// What the view read while its `render` ran. See
@@ -633,13 +637,19 @@ impl Window {
 
     /// Whether the subtree last frame's record `previous` stands for would be
     /// drawn at `bounds` just as it was.
-    pub(crate) fn retained_context_matches(&self, previous: usize, bounds: Bounds<Pixels>) -> bool {
+    pub(crate) fn retained_context_matches(
+        &self,
+        previous: usize,
+        bounds: Bounds<Pixels>,
+        cx: &App,
+    ) -> bool {
         let context = &self.rendered_frame.retained.records[previous].context;
         !crate::fast::layers::paint::inside_layer(self)
             && context.bounds == bounds
             && context.opacity == self.element_opacity
             && context.content_mask == self.content_mask()
             && context.text_style == self.text_style()
+            && crate::fast::inherited::inherits(cx, &context.inherited)
             && context.composition_surface == crate::fast::composition::input_surface(self)
     }
 
@@ -653,7 +663,10 @@ impl Window {
     ) -> Option<LayoutId> {
         let record = &self.rendered_frame.retained.records[previous];
         let layout = record.layout.as_ref()?;
-        if layout.rem_size != self.rem_size() || layout.text_style != self.text_style() {
+        if layout.rem_size != self.rem_size()
+            || layout.text_style != self.text_style()
+            || !crate::fast::inherited::inherits(cx, &layout.inherited)
+        {
             return None;
         }
         if !self
@@ -704,6 +717,7 @@ impl Window {
             element_states: self.next_frame.accessed_element_states.len(),
             dependencies: cx.begin_recording_dependencies(),
             text_style: self.text_style(),
+            inherited: crate::fast::inherited::current(cx),
             rem_size: self.rem_size(),
             parent_layout_key: self.parent_layout_key(),
             render: None,
@@ -731,6 +745,7 @@ impl Window {
             element_states: self.next_frame.accessed_element_states[recording.element_states..]
                 .to_vec(),
             text_style: recording.text_style,
+            inherited: recording.inherited,
             rem_size: recording.rem_size,
             parent_layout_key: recording.parent_layout_key,
         };
@@ -917,6 +932,7 @@ impl Window {
                     bounds: Bounds::default(),
                     content_mask: ContentMask::default(),
                     text_style: TextStyle::default(),
+                    inherited: InheritedValues::default(),
                     opacity: 1.,
                 }),
                 dependencies: RenderDependencies::default(),
@@ -987,6 +1003,7 @@ impl Window {
             bounds,
             content_mask: self.content_mask(),
             text_style: self.text_style(),
+            inherited: crate::fast::inherited::current(cx),
             opacity: self.element_opacity,
         };
         let end = self.prepaint_index();
@@ -1602,6 +1619,7 @@ impl<V: View> ViewElement<V> {
                     retained: Some((layout, dependencies)),
                 } => {
                     let rebuild = window.rebuild_here(
+                        cx,
                         &self.rebuild,
                         None,
                         layout.as_ref().and_then(|layout| layout.parent_layout_key),
@@ -1619,7 +1637,7 @@ impl<V: View> ViewElement<V> {
                     ViewPrepaint::Built { element, record }
                 }
                 ViewLayout::Retained { previous } => {
-                    if window.retained_context_matches(previous, bounds) {
+                    if window.retained_context_matches(previous, bounds, cx) {
                         return ViewPrepaint::Reused(
                             window.reuse_retained_prepaint(previous, true, cx),
                         );
@@ -1649,7 +1667,7 @@ impl<V: View> ViewElement<V> {
                 }
                 ViewLayout::Spliced(splice) => {
                     let previous = splice.previous();
-                    if window.retained_context_matches(previous, bounds)
+                    if window.retained_context_matches(previous, bounds, cx)
                         && window.splice_layout_holds(&splice)
                     {
                         return window.splice_prepaint(global_id, splice, cx);
@@ -1667,6 +1685,7 @@ impl<V: View> ViewElement<V> {
                             window.splice_cached(global_id, bounds, layout.clone(), cx)
                     {
                         let rebuild = window.rebuild_here(
+                            cx,
                             &self.rebuild,
                             self.cached_style.as_ref(),
                             layout.as_ref().and_then(|layout| layout.parent_layout_key),
@@ -1680,9 +1699,10 @@ impl<V: View> ViewElement<V> {
                     }
                     if !window.dirty_views.contains(&entity_id)
                         && let Some(previous) = window.reusable_cached(global_id, cx)
-                        && window.retained_context_matches(previous, bounds)
+                        && window.retained_context_matches(previous, bounds, cx)
                     {
                         let rebuild = window.rebuild_here(
+                            cx,
                             &self.rebuild,
                             self.cached_style.as_ref(),
                             layout.as_ref().and_then(|layout| layout.parent_layout_key),
@@ -1709,6 +1729,7 @@ impl<V: View> ViewElement<V> {
                     // at the node it is laid out at, inside a view drawn
                     // around it from last frame.
                     let rebuild = window.rebuild_here(
+                        cx,
                         &self.rebuild,
                         self.cached_style.as_ref(),
                         layout.as_ref().and_then(|layout| layout.parent_layout_key),
@@ -1805,7 +1826,7 @@ impl<V: View> ViewElement<V> {
             element.prepaint_at(bounds.origin, window, cx);
             window.request_animation_frame();
         }
-        let rebuild = window.rebuild_here(&self.rebuild, None, parent_layout_key);
+        let rebuild = window.rebuild_here(cx, &self.rebuild, None, parent_layout_key);
         let record = window.finish_retained_prepaint(
             recording,
             bounds,

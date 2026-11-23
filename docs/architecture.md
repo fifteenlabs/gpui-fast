@@ -377,9 +377,31 @@ around it is rebuilt after all, taking over the nested view it already built
 rather than building it twice. The splice is an optimization with a fallback
 to the full rebuild, never a different result.
 
+A nested view laid out outside the layout tree of the view around it — in a
+list's row, which the list lays out as a root of its own while it is
+prepainted — is outside the layout the splice computes. It is rebuilt on its
+own only if it asks for exactly the layout it had, so that the layout its
+row was given last frame still holds; otherwise the view around it is built
+after all, and the list lays the row out again.
+
 A nested view can be rebuilt on its own only if it can be rendered without
 the view around it: it has to have been placed as an `Entity` or `AnyView`,
 which is how views are almost always placed.
+
+### Animations
+
+An animation asks for its next frame by notifying the view it is drawn in
+(`Window::request_animation_frame`), and that view is built again on every
+frame the animation runs. An element is a value its view's `render` made and
+the frame took, so only that `render` can make it again: nothing narrower
+can be rebuilt unless the code that makes it can run without the view.
+`AnimationElement::in_own_view` (Fifteen's branch, `fast/animation_view.rs`)
+is that code: it keeps a copy of the element before it is animated, and
+draws the animation in a view of its own that animates a fresh copy each
+frame. The animation's frames notify that view, which is a gap in the view
+around it like any notified nested view: the view around it is spliced, and
+an animation that changes only what is painted (opacity, a transformation, a
+colour) asks for the layout it had, so nothing around it is laid out again.
 
 ## Layout
 

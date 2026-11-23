@@ -15,6 +15,7 @@
 //! root one by one, in `gpui.rs`.
 
 pub(crate) mod a11y;
+pub(crate) mod animation_view;
 pub(crate) mod composition;
 pub(crate) mod dependencies;
 pub(crate) mod dispatch;
@@ -24,6 +25,7 @@ pub(crate) mod focus_queries;
 pub(crate) mod global_id;
 pub(crate) mod glyphs;
 pub(crate) mod image_drops;
+pub(crate) mod inherited;
 pub(crate) mod interactive_text;
 pub(crate) mod interactivity;
 pub(crate) mod layers;

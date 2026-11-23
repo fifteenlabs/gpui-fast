@@ -150,11 +150,11 @@ pub use gpui_macros::{
 };
 pub use gpui_shared_string::*;
 pub use gpui_util::arc_cow::ArcCow;
+pub use gradient::*;
 pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
 pub use keymap::*;
-pub use gradient::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;

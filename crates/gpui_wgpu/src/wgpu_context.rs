@@ -92,6 +92,27 @@ fn vertex_storage_supported(adapter: &wgpu::Adapter) -> bool {
         .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
 }
 
+/// Raises WebGL 2's storage buffer limits, which are zero, to what
+/// `downlevel_defaults` asks for when the adapter reads storage buffers in the
+/// vertex stage, since instance data then comes from a storage buffer rather
+/// than a texture (`uses_webgl_instance_data`).
+fn with_vertex_storage(adapter: &wgpu::Adapter, limits: wgpu::Limits) -> wgpu::Limits {
+    if !vertex_storage_supported(adapter) {
+        return limits;
+    }
+    let wanted = wgpu::Limits::downlevel_defaults();
+    let available = adapter.limits();
+    wgpu::Limits {
+        max_storage_buffers_per_shader_stage: wanted
+            .max_storage_buffers_per_shader_stage
+            .min(available.max_storage_buffers_per_shader_stage),
+        max_storage_buffer_binding_size: wanted
+            .max_storage_buffer_binding_size
+            .min(available.max_storage_buffer_binding_size),
+        ..limits
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WgpuBackend {
     BrowserWebGpu,
@@ -456,7 +477,7 @@ impl WgpuContext {
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
         let required_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
-            wgpu::Limits::downlevel_webgl2_defaults()
+            with_vertex_storage(adapter, wgpu::Limits::downlevel_webgl2_defaults())
                 .using_resolution(adapter.limits())
                 .using_alignment(adapter.limits())
         } else {

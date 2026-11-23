@@ -858,12 +858,21 @@ mod tests {
         let text = "see zed-industries/zed now";
         let breaks: Vec<usize> = LineWrapper::break_indices(text).collect();
         assert!(breaks.contains(&4), "{breaks:?}");
-        assert!(!breaks.contains(&(text.find('/').unwrap() + 1)), "{breaks:?}");
-        assert!(!breaks.contains(&(text.find('-').unwrap() + 1)), "{breaks:?}");
+        assert!(
+            !breaks.contains(&(text.find('/').unwrap() + 1)),
+            "{breaks:?}"
+        );
+        assert!(
+            !breaks.contains(&(text.find('-').unwrap() + 1)),
+            "{breaks:?}"
+        );
 
         let url = "https://github.com/zed-industries/zed-fast?x=1&y=2";
         let breaks: Vec<usize> = LineWrapper::break_indices(url).collect();
-        assert!(breaks.iter().all(|&ix| !url[..ix].ends_with(['/', '-'])), "{breaks:?}");
+        assert!(
+            breaks.iter().all(|&ix| !url[..ix].ends_with(['/', '-'])),
+            "{breaks:?}"
+        );
     }
 
     #[test]
