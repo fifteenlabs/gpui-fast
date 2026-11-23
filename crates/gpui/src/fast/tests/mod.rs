@@ -10,6 +10,7 @@ mod em_metrics;
 mod focus_queries;
 mod global_id;
 mod image_drops;
+mod inherited;
 mod interactive_text;
 mod layers;
 mod layers_lists;
