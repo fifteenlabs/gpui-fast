@@ -40,6 +40,16 @@ use crate::{
 /// Builds the animated element, from the copy of the element it animates.
 type Build = Rc<dyn Fn() -> AnyElement>;
 
+/// How an [`AnimationElement`] animates its element, shared rather than
+/// owned so that [`AnimationElement::in_own_view`] hands every frame's copy
+/// the same one.
+pub(crate) type Animator<E> = Rc<dyn Fn(E, usize, f32) -> E + 'static>;
+
+/// The [`Animator`] for `animator`.
+pub(crate) fn animator<E>(animator: impl Fn(E, usize, f32) -> E + 'static) -> Animator<E> {
+    Rc::new(animator)
+}
+
 impl<E: IntoElement + Clone + 'static> AnimationElement<E> {
     /// Draws this animation in a view of its own, so that each of its frames
     /// builds only the animated element rather than the whole view it is
@@ -64,15 +74,13 @@ impl<E: IntoElement + Clone + 'static> AnimationElement<E> {
             animator,
         } = self;
         let element = element.expect("an animation element holds its element until it is drawn");
-        let animator: Rc<dyn Fn(E, usize, f32) -> E> = Rc::from(animator);
         let animation_id = id.clone();
         let build: Build = Rc::new(move || {
-            let animator = animator.clone();
             AnimationElement {
                 id: animation_id.clone(),
                 element: Some(element.clone()),
                 animations: animations.clone(),
-                animator: Box::new(move |element, ix, delta| animator(element, ix, delta)),
+                animator: animator.clone(),
             }
             .into_any_element()
         });
