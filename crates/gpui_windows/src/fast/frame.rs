@@ -366,6 +366,7 @@ fn rasterize_paths(
             st_position: v.st_position,
             color: path.color,
             bounds,
+            content_mask: path.content_mask,
         }));
     }
     pipeline.update_buffer(device, context, vertices)?;

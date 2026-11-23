@@ -23,9 +23,7 @@ fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
 }
 
 fn everywhere() -> ContentMask<ScaledPixels> {
-    ContentMask {
-        bounds: bounds(0., 0., 4096., 4096.),
-    }
+    ContentMask::new(bounds(0., 0., 4096., 4096.))
 }
 
 fn rectangle_path(x: f32, y: f32, width: f32, height: f32, rgba: u32) -> Path<ScaledPixels> {
@@ -35,12 +33,10 @@ fn rectangle_path(x: f32, y: f32, width: f32, height: f32, rgba: u32) -> Path<Sc
     path.line_to(point(px(x), px(y + height)));
     path.line_to(point(px(x), px(y)));
     path.color = color(rgba).into();
-    path.content_mask = ContentMask {
-        bounds: Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(4096.), px(4096.)),
-        },
-    };
+    path.content_mask = ContentMask::new(Bounds {
+        origin: point(px(0.), px(0.)),
+        size: size(px(4096.), px(4096.)),
+    });
     path.scale(1.)
 }
 
