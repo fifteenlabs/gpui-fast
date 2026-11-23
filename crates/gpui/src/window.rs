@@ -1061,6 +1061,7 @@ pub(crate) struct DeferredDraw {
     pub(crate) parent_node: DispatchNodeId,
     pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: crate::fast::text_style::TextStyleStack,
+    pub(crate) fast_inherited: crate::fast::inherited::InheritedValues,
     pub(crate) content_mask: Option<ContentMask<Pixels>>,
     pub(crate) rem_size: Pixels,
     pub(crate) element: Option<AnyElement>,
@@ -4653,6 +4654,10 @@ impl Window {
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
+                    let fast_inherited = crate::fast::inherited::enter(
+                        cx,
+                        &self.next_frame.deferred_draws[deferred_draw_ix].fast_inherited,
+                    );
                     let recording =
                         crate::fast::retained::begin_deferred_prepaint(self, deferred_draw_ix, cx);
                     let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
@@ -4665,6 +4670,7 @@ impl Window {
                         });
                     });
                     crate::fast::retained::finish_deferred(self, recording, cx);
+                    crate::fast::inherited::leave(cx, fast_inherited);
                     self.next_frame.deferred_draws[deferred_draw_ix].accessed_entities =
                         accessed_entities;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
@@ -4711,6 +4717,8 @@ impl Window {
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
                 let enclosing = &deferred_draw.enclosing_retained;
+                let fast_inherited =
+                    crate::fast::inherited::enter(cx, &deferred_draw.fast_inherited);
                 let recording = crate::fast::retained::begin_deferred_paint(self, enclosing, cx);
                 let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
@@ -4722,6 +4730,7 @@ impl Window {
                     })
                 });
                 crate::fast::retained::finish_deferred(self, recording, cx);
+                crate::fast::inherited::leave(cx, fast_inherited);
                 deferred_draw.accessed_entities.extend(accessed_entities);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
@@ -4793,6 +4802,7 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
+                    fast_inherited: deferred_draw.fast_inherited.clone(),
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
@@ -5350,6 +5360,7 @@ impl Window {
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
+            fast_inherited: crate::fast::inherited::InheritedValues::default(),
             content_mask,
             rem_size: self.rem_size(),
             priority,
@@ -9389,16 +9400,15 @@ mod tests {
 
     use crate::GroupSpec;
     use crate::{
-        AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, Bounds, ContentMask,
-        Context, CursorStyle, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload,
-        ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _,
-        InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
-        Render, RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled,
-        TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline,
-        UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px,
-        size,
-        BrushExtend, ClipId, ClipPath, Corners, Path, RenderImage, TransformationMatrix, fill, red,
+        AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, Bounds, BrushExtend,
+        ClipId, ClipPath, ContentMask, Context, Corners, CursorStyle, DispatchPhase, DragMoveEvent,
+        Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
+        InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
+        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+        Path, Pixels, PlatformInput, Point, Render, RenderImage, RequestFrameOptions, ScaledPixels,
+        StatefulInteractiveElement as _, Styled, TestAppContext, ThermalState, TouchDragEvent,
+        TouchEvent, TouchId, TouchPhase, TransformationMatrix, Underline, UnderlineStyle, Window,
+        WindowAppearance, WindowOptions, canvas, div, fill, hsla, point, px, red, size,
     };
 
     #[gpui::test]

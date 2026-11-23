@@ -58,11 +58,12 @@ impl Element for Deferred {
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        fast_cx: &mut App,
     ) {
         let child = self.child.take().unwrap();
         let element_offset = window.element_offset();
-        window.defer_draw(child, element_offset, self.priority, None)
+        window.defer_draw(child, element_offset, self.priority, None);
+        crate::fast::inherited::note_deferred(window, fast_cx);
     }
 
     fn paint(
