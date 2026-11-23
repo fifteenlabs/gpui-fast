@@ -93,7 +93,9 @@ pub trait AnimationExt {
         AnimationElement {
             id: id.into(),
             element: Some(self),
-            animator: Box::new(move |this, _, value| animator(this, value)),
+            animator: crate::fast::animation_view::animator(move |this, _, value| {
+                animator(this, value)
+            }),
             animations: smallvec::smallvec![animation],
         }
     }
@@ -111,7 +113,7 @@ pub trait AnimationExt {
         AnimationElement {
             id: id.into(),
             element: Some(self),
-            animator: Box::new(animator),
+            animator: crate::fast::animation_view::animator(animator),
             animations: animations.into(),
         }
     }
@@ -162,7 +164,7 @@ pub struct AnimationElement<E> {
     pub(crate) id: ElementId,
     pub(crate) element: Option<E>,
     pub(crate) animations: SmallVec<[Animation; 1]>,
-    pub(crate) animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
+    pub(crate) animator: crate::fast::animation_view::Animator<E>,
 }
 
 /// A GPUI element driven by a stateful spring.
