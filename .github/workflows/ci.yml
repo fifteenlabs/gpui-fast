@@ -112,6 +112,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The import commit may only be reachable from a squash-merged sync
+      # branch, which a full clone of this repository's branches lacks.
+      - name: Fetch the upstream import commit
+        run: git fetch --no-tags origin "$(sed -n 's/^import_commit = "\(.*\)"$/\1/p' UPSTREAM)"
+
       - name: Check that upstream files only hold hooks
         run: script/check-upstream
 
