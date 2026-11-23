@@ -41,7 +41,7 @@ mod tests {
         scene.push_layer(bounds);
         scene.insert_primitive(Quad {
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             ..Default::default()
         });
         scene.pop_layer();
