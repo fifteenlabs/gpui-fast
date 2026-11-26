@@ -10,11 +10,12 @@
 #![cfg(target_os = "macos")]
 
 mod harness;
+use harness::polygon;
 
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    App, BlendMode, Bounds, BoxShadow, ClipPath, ComposeMode, Corners, GroupOptions, MixMode, Path,
+    App, BlendMode, Bounds, BoxShadow, ClipPath, ComposeMode, Corners, GroupOptions, MixMode,
     Pixels, RenderImage, SceneFilter, Size, TextAlign, TextRun, UnderlineStyle, Window, font,
     point, px, red, size, white,
 };
@@ -475,9 +476,7 @@ fn one_of_everything(_: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
 
     // A triangle, so the claim covers the rasterizer's coverage and not only
     // the rectangle it was drawn in.
-    let mut path = Path::new(at(40., 70.));
-    path.line_to(at(90., 70.));
-    path.line_to(at(40., 110.));
+    let path = polygon(&[at(40., 70.), at(90., 70.), at(40., 110.)]);
     window.paint_path(path, white());
 
     window.paint_underline(

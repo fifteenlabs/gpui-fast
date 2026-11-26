@@ -2832,8 +2832,9 @@ mod tests {
 
         assert_array_stride::<Quad>(&strides, "Quad");
         assert_array_stride::<Shadow>(&strides, "Shadow");
-        assert_array_stride::<PathRasterizationVertex>(&strides, "PathRasterizationVertex");
-        assert_array_stride::<PathSprite>(&strides, "PathSprite");
+        assert_array_stride::<PathTile>(&strides, "PathTile");
+        assert_array_stride::<PathCurve>(&strides, "PathCurve");
+        assert_array_stride::<PathPaint>(&strides, "PathPaint");
         assert_array_stride::<Underline>(&strides, "Underline");
         assert_array_stride::<MonochromeSprite>(&strides, "MonochromeSprite");
         assert_array_stride::<SubpixelSprite>(&strides, "SubpixelSprite");
@@ -2941,11 +2942,13 @@ mod tests {
             .split_once(&format!("fn {loader}("))
             .unwrap_or_else(|| panic!("{loader} should be defined in the WebGL shaders"))
             .1;
+        // The loader's first statement opens the cursor; its argument may be
+        // parenthesized itself, so it runs to the end of that line's call.
         let argument = body
             .split_once("instance_cursor(")
             .expect("loader should open a cursor")
             .1
-            .split_once(')')
+            .split_once(");")
             .expect("cursor call should be closed")
             .0;
         argument

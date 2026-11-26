@@ -308,7 +308,7 @@ mod tests {
             id: crate::NativeViewId::for_test(id),
             hitbox_id,
             bounds,
-            content_mask: crate::ContentMask { bounds },
+            content_mask: crate::ContentMask::new(bounds),
             background: Default::default(),
         };
         let first = crate::HitboxId::placeholder();

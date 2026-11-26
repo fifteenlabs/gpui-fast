@@ -319,7 +319,7 @@ mod tests {
         };
         let quad = |bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>| Quad {
             bounds,
-            content_mask: ContentMask { bounds: mask },
+            content_mask: ContentMask::new(mask),
             ..Default::default()
         };
         let all = rect(0., 0., 1000., 1000.);

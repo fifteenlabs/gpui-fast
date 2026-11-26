@@ -21,11 +21,12 @@
 #![cfg(target_os = "macos")]
 
 mod harness;
+use harness::polygon;
 
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    BrushExtend, ColorSpace, Gradient, LinearColorStop, Path, Pixels, Radians, Window,
+    BrushExtend, ColorSpace, Gradient, LinearColorStop, Pixels, Radians, Window,
     linear_color_stop, point, px, rgb, rgba, size,
 };
 use harness::{
@@ -355,9 +356,7 @@ fn a_gradient_fills_a_triangle_and_only_the_triangle() {
     // triangle.
     let (start, end) = across_the_shape();
     let frame = render_frame(window(), move |_, window, _| {
-        let mut path = Path::new(at(20., 20.));
-        path.line_to(at(180., 20.));
-        path.line_to(at(100., 140.));
+        let path = polygon(&[at(20., 20.), at(180., 20.), at(100., 140.)]);
         window
             .paint_path_with_gradient(path, &Gradient::linear(start, end, three_stops()), 1.)
             .expect("the baked ramp fits in the atlas");

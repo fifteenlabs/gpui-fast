@@ -200,7 +200,7 @@ struct TextureState {
     size: crate::Size<DevicePixels>,
     source: TextureSource,
     /// Bumped on every sub-region update. Painted sprites carry it in
-    /// [`PolychromeSprite::pad`], which the scroll-layer tile hashes cover,
+    /// their tile's [`crate::AtlasTile::padding`], which the scroll-layer tile hashes cover,
     /// so tiles showing refreshed contents are re-rendered instead of
     /// kept from the cache.
     version: u32,

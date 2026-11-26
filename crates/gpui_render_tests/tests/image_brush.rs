@@ -16,6 +16,7 @@
 #![cfg(target_os = "macos")]
 
 mod harness;
+use harness::polygon;
 
 use std::sync::{Arc, Mutex};
 
@@ -109,7 +110,7 @@ fn brush_over(bounds: Bounds<Pixels>, image_size: u32) -> TransformationMatrix {
 /// outside the image: what all but the tiling tests below ask for.
 fn brush(
     window: &mut Window,
-    path: Path<Pixels>,
+    path: Path,
     image: &Arc<RenderImage>,
     transform: TransformationMatrix,
 ) {
@@ -120,7 +121,7 @@ fn brush(
 /// y it still pads, so a horizontal tiling can be read one row at a time.
 fn tiled_brush(
     window: &mut Window,
-    path: Path<Pixels>,
+    path: Path,
     image: &Arc<RenderImage>,
     transform: TransformationMatrix,
     extend: BrushExtend,
@@ -177,9 +178,7 @@ fn an_image_brush_fills_a_triangle_and_only_the_triangle() {
     // get any of the image at all.
     let image = quadrant_image(IMAGE_SIZE);
     let frame = render_frame(window(), move |_, window, _| {
-        let mut path = Path::new(at(20., 20.));
-        path.line_to(at(180., 20.));
-        path.line_to(at(100., 140.));
+        let path = polygon(&[at(20., 20.), at(180., 20.), at(100., 140.)]);
         brush(window, path, &image, brush_over(shape(), IMAGE_SIZE));
     });
 

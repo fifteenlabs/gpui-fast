@@ -436,12 +436,20 @@ pub fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
 
 /// A rectangle as a closed [`Path`], for the tests whose subject rides the path
 /// pipeline - a brush, a gradient, a clip - rather than the quad one.
-pub fn rect_path(bounds: Bounds<Pixels>) -> Path<Pixels> {
-    let mut path = Path::new(bounds.origin);
-    path.line_to(bounds.top_right());
-    path.line_to(bounds.bottom_right());
-    path.line_to(bounds.bottom_left());
-    path
+pub fn rect_path(bounds: Bounds<Pixels>) -> Path {
+    polygon(&[
+        bounds.origin,
+        bounds.top_right(),
+        bounds.bottom_right(),
+        bounds.bottom_left(),
+    ])
+}
+
+/// A closed polygon through `points`, filled.
+pub fn polygon(points: &[gpui::Point<Pixels>]) -> Path {
+    let mut builder = gpui::PathBuilder::fill();
+    builder.add_polygon(points, true);
+    builder.build().expect("a polygon builds")
 }
 
 /// An opaque white biplanar YCbCr pixel buffer, backed by an IOSurface so the

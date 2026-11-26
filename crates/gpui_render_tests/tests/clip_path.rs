@@ -1,6 +1,6 @@
 //! What an arbitrary clip path actually does to pixels.
 //!
-//! `ClipPath`'s own unit tests cover the arithmetic that builds one. These
+//! `ClipPath<Pixels>`'s own unit tests cover the arithmetic that builds one. These
 //! cover the half nobody can see from Rust: that the path reaches the mask
 //! rasterizer, and that the shapes a [`ContentMask`](gpui::ContentMask)
 //! structurally cannot express - elliptical corners, a non-convex outline, a
@@ -169,7 +169,7 @@ fn an_elliptical_corner_cuts_where_the_ellipse_says_and_not_where_a_circle_would
 
     // Inside the ellipse at 0.81 - but 47.4 from (90, 90), so a *circular* 40px
     // radius, which is all a `Corners<Pixels>` content mask can hold, would
-    // have cut it. This point is the whole reason `ClipPath` exists.
+    // have cut it. This point is the whole reason `ClipPath<Pixels>` exists.
     frame.assert_all_painted(
         &[at(55., 58.), at(60., 57.)],
         WHITE,

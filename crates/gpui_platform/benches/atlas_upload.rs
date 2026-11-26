@@ -219,12 +219,14 @@ fn tile_scene(tile: AtlasTile) -> Scene {
             ScaledPixels(tile.bounds.size.height.0 as f32),
         ),
     };
-    let content_mask = ContentMask { bounds };
+    let content_mask = ContentMask::new(bounds);
     let mut scene = Scene::default();
     match tile.texture_id.kind {
         AtlasTextureKind::Monochrome => scene.insert_primitive(MonochromeSprite {
             order: 0,
             animation: gpui::SpriteAnimationId::NONE,
+            clip: gpui::ClipId::NONE,
+            pad: 0,
             tile,
             bounds,
             content_mask,
@@ -238,7 +240,7 @@ fn tile_scene(tile: AtlasTile) -> Scene {
         }),
         AtlasTextureKind::Polychrome => scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            clip: gpui::ClipId::NONE,
             tile,
             grayscale: PaddedBool32::from(false),
             opacity: 1.0,

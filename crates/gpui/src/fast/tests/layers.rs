@@ -316,12 +316,10 @@ fn translation_moves_every_position_a_primitive_carries() {
     let mut path = crate::PaintedPath::new(
         path.build().expect("triangle"),
         1.,
-        ContentMask {
-            bounds: mask.bounds.map(|c| px(c.0)),
-        },
+        ContentMask::new(mask.bounds.map(|c| px(c.0))),
         Hsla::red().into(),
     );
-    path.clip_content_mask(&mask.bounds);
+    path.paint.content_mask.bounds = path.paint.content_mask.bounds.intersect(&mask.bounds);
     let bounds = path.bounds;
     let tiles = path.tiles.clone();
     let Primitive::Path(moved) = translate(path.into()) else {

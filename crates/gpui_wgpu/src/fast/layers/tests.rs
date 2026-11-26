@@ -265,7 +265,7 @@ fn composite_and_compare(harness: &mut Harness, translation: (f32, f32), paths: 
         let bounds = layer.tile_bounds(tile);
         composited.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            clip: gpui::ClipId::NONE,
             grayscale: false.into(),
             opacity: 1.,
             bounds: sp(
@@ -274,7 +274,7 @@ fn composite_and_compare(harness: &mut Harness, translation: (f32, f32), paths: 
                 TILE as f32,
                 TILE as f32,
             ),
-            content_mask: ContentMask { bounds: viewport },
+            content_mask: ContentMask::new(viewport),
             corner_radii: Corners::default(),
             tile: AtlasTile {
                 texture_id: layer_tile_texture_id(key),
@@ -451,11 +451,11 @@ fn rasterize_and_assemble(harness: &mut Harness, content: Scene, tiles: &[(i32, 
         let bounds = layer.tile_bounds(tile);
         frame.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            clip: gpui::ClipId::NONE,
             grayscale: false.into(),
             opacity: 1.,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             corner_radii: Corners::default(),
             tile: AtlasTile {
                 texture_id: layer_tile_texture_id(key),
@@ -566,9 +566,7 @@ fn add_content(
 ) {
     let (ox, oy) = offset;
     let at = |x: f32, y: f32, w: f32, h: f32| sp(x + ox, y + oy, w, h);
-    let mask = |bounds: Bounds<ScaledPixels>| ContentMask {
-        bounds: bounds.intersect(&clip),
-    };
+    let mask = |bounds: Bounds<ScaledPixels>| ContentMask::new(bounds.intersect(&clip));
 
     scene.insert_primitive(Quad {
         content_mask: mask(clip),
@@ -594,7 +592,7 @@ fn add_content(
         shape_bounds: at(380., 420., 120., 70.),
         shape_corner_radii: Corners::all(ScaledPixels(6.)),
         inset: false.into(),
-        pad: 0,
+        clip: gpui::ClipId::NONE,
     });
     scene.insert_primitive(Quad {
         bounds: at(600., 600., 300., 200.),
@@ -609,7 +607,7 @@ fn add_content(
     });
     scene.insert_primitive(Underline {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         bounds: at(50., 505., 900., 8.),
         content_mask: mask(clip),
         color: Hsla::from(rgba(0xffcc00ff)),
@@ -632,6 +630,8 @@ fn add_content(
     scene.insert_primitive(MonochromeSprite {
         order: 0,
         animation: Default::default(),
+        clip: gpui::ClipId::NONE,
+        pad: 0,
         bounds: at(505., 700., 16., 16.),
         content_mask: mask(clip),
         color: Hsla::from(rgba(0xffffffff)),
@@ -645,6 +645,8 @@ fn add_content(
         scene.insert_primitive(SubpixelSprite {
             order: 0,
             pad: 0,
+            clip: gpui::ClipId::NONE,
+            clip_pad: 0,
             bounds: at(520., 505., 16., 16.),
             content_mask: mask(clip),
             color: Hsla::from(rgba(0x000000ff)),
@@ -654,7 +656,7 @@ fn add_content(
     }
     scene.insert_primitive(PolychromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         grayscale: false.into(),
         opacity: 1.,
         bounds: at(300., 500., 20., 20.),
@@ -677,9 +679,7 @@ fn add_path(scene: &mut Scene, (ox, oy): (f32, f32), clip: Bounds<ScaledPixels>)
     scene.insert_primitive(PaintedPath::new(
         path.build().expect("path"),
         1.,
-        ContentMask {
-            bounds: clip.map(|c| px(c.0)),
-        },
+        ContentMask::new(clip.map(|c| px(c.0))),
         Hsla::from(rgba(0x8800ffcc)).into(),
     ));
 }
@@ -693,7 +693,7 @@ fn add_covered_paths(
     (ox, oy): (f32, f32),
     clip: Bounds<ScaledPixels>,
 ) {
-    let mask = ContentMask { bounds: clip };
+    let mask = ContentMask::new(clip);
     for (x, y, dx, dy) in [
         (200., 330., 1., 1.),
         (330.5, 330., -1., 1.),
@@ -708,9 +708,7 @@ fn add_covered_paths(
         scene.insert_primitive(PaintedPath::new(
             path.build().expect("path"),
             1.,
-            ContentMask {
-                bounds: clip.map(|c| px(c.0)),
-            },
+            ContentMask::new(clip.map(|c| px(c.0))),
             Hsla::from(rgba(0x3366ccff)).into(),
         ));
     }
@@ -726,6 +724,8 @@ fn add_covered_paths(
     scene.insert_primitive(MonochromeSprite {
         order: 0,
         animation: Default::default(),
+        clip: gpui::ClipId::NONE,
+        pad: 0,
         bounds: sp(204. + ox, 334. + oy, 16., 16.),
         content_mask: mask,
         color: Hsla::from(rgba(0xff8800ff)),
@@ -743,9 +743,7 @@ fn add_covered_paths(
     scene.insert_primitive(PaintedPath::new(
         path.build().expect("path"),
         1.,
-        ContentMask {
-            bounds: clip.map(|c| px(c.0)),
-        },
+        ContentMask::new(clip.map(|c| px(c.0))),
         Hsla::from(rgba(0x8800ffcc)).into(),
     ));
 }
@@ -812,9 +810,7 @@ pub(super) fn sp(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
 
 /// A content mask that clips nothing the tests draw.
 pub(super) fn no_mask() -> ContentMask<ScaledPixels> {
-    ContentMask {
-        bounds: sp(-10_000., -10_000., 20_000., 20_000.),
-    }
+    ContentMask::new(sp(-10_000., -10_000., 20_000., 20_000.))
 }
 
 pub(super) fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {

@@ -206,8 +206,10 @@ fn an_upload_redraws_but_a_gpu_write_presents_the_cached_view() {
         assert!(window.needs_present.get());
         assert!(!window.invalidator.is_dirty());
         assert_eq!(
-            window.rendered_frame.scene.polychrome_sprites[0].pad,
-            sprite.pad
+            window.rendered_frame.scene.polychrome_sprites[0]
+                .tile
+                .padding,
+            sprite.tile.padding
         );
     })
     .unwrap();

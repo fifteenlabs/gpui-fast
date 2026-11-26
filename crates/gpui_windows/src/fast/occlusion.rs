@@ -102,7 +102,7 @@ impl Rect {
     /// cover ends (a page under another, at the window's edge) is hidden.
     fn reached(bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>) -> Rect {
         let r = Rect::of(bounds, mask);
-        let b = Rect::of(bounds, &ContentMask { bounds: *bounds });
+        let b = Rect::of(bounds, &ContentMask::new(*bounds));
         let on_centre = |edge: f32| ((edge - edge.floor()) - 0.5).abs() < EDGE_EPSILON;
         let reach = |clipped: f32, own: f32| {
             if clipped < own && on_centre(clipped) {
@@ -193,7 +193,7 @@ fn inset_own_edges(
     margin_y: f32,
 ) -> Rect {
     let r = Rect::of(bounds, mask);
-    let b = Rect::of(bounds, &ContentMask { bounds: *bounds });
+    let b = Rect::of(bounds, &ContentMask::new(*bounds));
     Rect {
         x0: r.x0.max(b.x0 + margin_x),
         y0: r.y0.max(b.y0 + margin_y),
@@ -359,12 +359,10 @@ mod tests {
                 origin: point(ScaledPixels(x), ScaledPixels(y)),
                 size: size(ScaledPixels(w), ScaledPixels(h)),
             },
-            content_mask: ContentMask {
-                bounds: Bounds {
+            content_mask: ContentMask::new(Bounds {
                     origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
                     size: size(ScaledPixels(1000.0), ScaledPixels(800.0)),
-                },
-            },
+                }),
             background: solid_background(hsla(0.0, 0.0, 0.1, alpha)),
             border_color: Default::default(),
             corner_radii: Corners::default(),

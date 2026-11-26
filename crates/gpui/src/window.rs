@@ -11438,9 +11438,7 @@ mod tests {
     #[gpui::test]
     fn test_empty_content_masks_remain_empty_when_snapped(cx: &mut TestAppContext) {
         test_paint_at_scales(cx, |window| {
-            let viewport = ContentMask {
-                bounds: Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(100.))),
-            };
+            let viewport = ContentMask::new(Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(100.))));
             for fraction in [0., 0.25, 0.5, 0.75] {
                 for bounds in [
                     Bounds::new(point(px(30.), px(120. + fraction)), size(px(40.), px(20.))),
@@ -11459,7 +11457,7 @@ mod tests {
                     ),
                 ] {
                     window.with_content_mask(Some(viewport), |window| {
-                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                        window.with_content_mask(Some(ContentMask::new(bounds)), |window| {
                             assert!(window.content_mask().bounds.is_empty());
                             assert!(
                                 window.snapped_content_mask().bounds.is_empty(),
@@ -11485,7 +11483,7 @@ mod tests {
     fn test_nonempty_content_masks_keep_covering_fractional_edges(cx: &mut TestAppContext) {
         test_paint_at_scales(cx, |window| {
             let bounds = Bounds::new(point(px(30.25), px(40.25)), size(px(0.125), px(0.125)));
-            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            window.with_content_mask(Some(ContentMask::new(bounds)), |window| {
                 let snapped = window.snapped_content_mask().bounds;
                 let scale = window.scale_factor();
                 assert_eq!(snapped, window.cover_bounds(bounds));
@@ -11575,12 +11573,10 @@ mod tests {
             canvas(
                 |_, _, _| {},
                 move |_, _, window, _| {
-                    window.content_mask_stack.push(ContentMask {
-                        bounds: Bounds::from_corners(
+                    window.content_mask_stack.push(ContentMask::new(Bounds::from_corners(
                             point(px(-1000.), px(-1000.)),
                             point(px(1000.), px(1000.)),
-                        ),
-                    });
+                        )));
                     paint(window);
                     window.content_mask_stack.pop();
                 },
@@ -11634,41 +11630,6 @@ mod tests {
                     });
                 },
             )
-        }
-    }
-
-    struct UnderlineTestView(Rc<dyn Fn(&mut Window)>);
-
-    impl Render for UnderlineTestView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let paint = self.0.clone();
-            canvas(
-                |_, _, _| {},
-                move |_, _, window, _| {
-                    window.content_mask_stack.push(ContentMask {
-                        bounds: Bounds::from_corners(
-                            point(px(-1000.), px(-1000.)),
-                            point(px(1000.), px(1000.)),
-                        ),
-                        corner_radii: Default::default(),
-                    });
-                    paint(window);
-                    window.content_mask_stack.pop();
-                },
-            )
-            .size_full()
-        }
-    }
-
-    fn test_underline_paint_at_scales(
-        cx: &mut TestAppContext,
-        paint: impl Fn(&mut Window) + 'static,
-    ) {
-        let window = cx.add_window(move |_, _| UnderlineTestView(Rc::new(paint)));
-        for scale in [1., 1.25, 1.5, 2., 3.] {
-            cx.simulate_window_scale_factor_change(window.into(), scale);
-            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
-                .unwrap();
         }
     }
 
@@ -12229,7 +12190,7 @@ mod tests {
 
     /// The scene one paint callback left behind.
     struct PaintedScene {
-        paths: Vec<Path<ScaledPixels>>,
+        paths: Vec<crate::PaintedPath>,
         groups: Vec<GroupSpec>,
     }
 
@@ -12282,16 +12243,18 @@ mod tests {
         Arc::new(RenderImage::new([image::Frame::new(buffer)]))
     }
 
-    fn a_square_path(x: f32, y: f32, side: f32) -> Path<Pixels> {
+    fn a_square_path(x: f32, y: f32, side: f32) -> Path {
         let bounds = Bounds {
             origin: point(px(x), px(y)),
             size: size(px(side), px(side)),
         };
-        let mut path = Path::new(bounds.origin);
+        let mut path = crate::PathBuilder::fill();
+        path.move_to(bounds.origin);
         path.line_to(bounds.top_right());
         path.line_to(bounds.bottom_right());
         path.line_to(bounds.bottom_left());
-        path
+        path.close();
+        path.build().expect("a square")
     }
 
     /// A group holding one brushed path is overlap-free by construction, so it
@@ -12360,7 +12323,7 @@ mod tests {
                 .expect("the test atlas takes a four-texel image");
         });
 
-        let color = crate::Rgba::from(painted.paths[0].color.solid);
+        let color = crate::Rgba::from(painted.paths[0].paint.color.solid);
         assert!(
             color.a > 0.99,
             "a brushed path came back at an alpha of {}, which on wgpu and \
@@ -12395,7 +12358,7 @@ mod tests {
             });
         });
 
-        let color = crate::Rgba::from(painted.paths[0].color.solid);
+        let color = crate::Rgba::from(painted.paths[0].paint.color.solid);
         assert!(
             (color.a - 0.25).abs() < 0.01,
             "half the element opacity and half the caller's alpha is a quarter, \

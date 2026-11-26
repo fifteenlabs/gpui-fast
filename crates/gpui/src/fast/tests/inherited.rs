@@ -27,14 +27,6 @@ impl Inheriting {
     }
 }
 
-impl IntoElement for Inheriting {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for Inheriting {
     type RequestLayoutState = ();
     type PrepaintState = ();

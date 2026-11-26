@@ -2855,7 +2855,7 @@ mod tests {
     fn quad(x: f32) -> Quad {
         Quad {
             bounds: square(x),
-            content_mask: ContentMask { bounds: square(x) },
+            content_mask: ContentMask::new(square(x)),
             ..Default::default()
         }
     }
@@ -2863,9 +2863,9 @@ mod tests {
     fn underline(x: f32) -> Underline {
         Underline {
             order: 0,
-            pad: 0,
+            clip: ClipId::NONE,
             bounds: square(x),
-            content_mask: ContentMask { bounds: square(x) },
+            content_mask: ContentMask::new(square(x)),
             color: Hsla::default(),
             thickness: ScaledPixels(1.),
             wavy: false.into(),
@@ -2887,7 +2887,7 @@ mod tests {
             id: NativeViewId::for_test(1),
             hitbox_id: HitboxId::placeholder(),
             bounds: square(0.),
-            content_mask: ContentMask { bounds: square(0.) },
+            content_mask: ContentMask::new(square(0.)),
             background: Hsla::default(),
         });
         scene.insert_primitive(quad(0.));
@@ -2907,7 +2907,7 @@ mod tests {
             id: NativeViewId::for_test(1),
             hitbox_id,
             bounds: square(x),
-            content_mask: ContentMask { bounds: square(x) },
+            content_mask: ContentMask::new(square(x)),
             background: Hsla::default(),
         };
         let first_hitbox = HitboxId::placeholder();
@@ -3287,29 +3287,35 @@ mod fifteen_tests {
             order: 0,
             clip: ClipId::NONE,
             blur_radius: ScaledPixels(blur),
-            bounds,
+            bounds: bounds.dilate(ScaledPixels(blur * GAUSSIAN_BLUR_EXTENT)),
             corner_radii: Corners::default(),
             content_mask: ContentMask::new(Bounds {
                 origin: point(ScaledPixels(-1000.), ScaledPixels(-1000.)),
                 size: size(ScaledPixels(2000.), ScaledPixels(2000.)),
             }),
             color: Hsla::default(),
-            element_bounds: bounds,
-            element_corner_radii: Corners::default(),
-            inset: 0,
+            shape_bounds: bounds,
+            shape_corner_radii: Corners::default(),
+            inset: false.into(),
         }
     }
 
-    fn path_at(x: f32) -> Path<ScaledPixels> {
+    fn path_at(x: f32) -> PaintedPath {
         let bounds = crate::Bounds {
             origin: point(crate::px(x), crate::px(0.)),
             size: size(crate::px(10.), crate::px(10.)),
         };
-        let mut path = Path::new(bounds.origin);
+        let mut path = crate::PathBuilder::fill();
+        path.move_to(bounds.origin);
         path.line_to(bounds.top_right());
         path.line_to(bounds.bottom_right());
-        path.content_mask = ContentMask::new(bounds);
-        path.scale(1.0)
+        path.close();
+        PaintedPath::new(
+            path.build().expect("a triangle"),
+            1.0,
+            ContentMask::new(bounds),
+            opaque().into(),
+        )
     }
 
     /// The bounds tree orders a primitive by what it intersects, so it has to be
@@ -3358,8 +3364,8 @@ mod fifteen_tests {
             size: size(ScaledPixels(10.), ScaledPixels(10.)),
         };
         let mut shadow = shadow_at(500., 0.);
-        shadow.inset = 1;
-        shadow.element_bounds = element_bounds;
+        shadow.inset = true.into();
+        shadow.bounds = element_bounds;
         shadow.content_mask = ContentMask::new(element_bounds);
 
         let mut scene = Scene::default();
@@ -3569,7 +3575,9 @@ mod fifteen_tests {
         };
         MonochromeSprite {
             order: 0,
+            animation: SpriteAnimationId::NONE,
             clip: ClipId::NONE,
+            pad: 0,
             bounds,
             content_mask: ContentMask::new(bounds),
             color: opaque(),

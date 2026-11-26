@@ -290,9 +290,7 @@ fn glyph_tile(index: usize) -> AtlasTile {
 }
 
 fn scene_content_mask() -> ContentMask<Pixels> {
-    ContentMask {
-        bounds: Bounds::new(point(px(0.), px(0.)), size(px(1_024.), px(1_024.))),
-    }
+    ContentMask::new(Bounds::new(point(px(0.), px(0.)), size(px(1_024.), px(1_024.))))
 }
 
 fn build_scene(scene: &mut Scene, rectangles: &[Rectangle]) {
@@ -326,11 +324,11 @@ fn insert_primitives(scene: &mut Scene, rectangles: &[Rectangle]) {
                 shape_bounds: bounds,
                 shape_corner_radii: Corners::all(gpui::ScaledPixels(4.)),
                 inset: false.into(),
-                pad: 0,
+                clip: gpui::ClipId::NONE,
             }),
             Kind::Underline => scene.insert_primitive(gpui::Underline {
                 order: 0,
-                pad: 0,
+                clip: gpui::ClipId::NONE,
                 bounds,
                 content_mask,
                 color: rectangle.color,
@@ -346,6 +344,8 @@ fn insert_primitives(scene: &mut Scene, rectangles: &[Rectangle]) {
                     scene.insert_primitive(gpui::MonochromeSprite {
                         order: 0,
                         animation: gpui::SpriteAnimationId::NONE,
+                        clip: gpui::ClipId::NONE,
+                        pad: 0,
                         tile: glyph_tile(index + glyph),
                         bounds: Bounds::new(origin, size(glyph_size * 0.6, glyph_size)),
                         content_mask,

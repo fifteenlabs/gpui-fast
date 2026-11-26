@@ -1262,7 +1262,7 @@ fn image_cover_tile(harness: &Harness, id: usize, opaque: bool) -> AtlasTile {
 fn image_cover(tile: AtlasTile, bounds: Bounds<ScaledPixels>, opacity: f32) -> PolychromeSprite {
     PolychromeSprite {
         order: 0,
-        pad: 0,
+        clip: gpui::ClipId::NONE,
         grayscale: false.into(),
         opacity,
         bounds,
@@ -1631,6 +1631,8 @@ fn turned_sprite_scene(harness: &Harness, angle: f32) -> Scene {
     scene.insert_primitive(MonochromeSprite {
         order: 0,
         animation: Default::default(),
+        clip: gpui::ClipId::NONE,
+        pad: 0,
         bounds: sp(400., 400., 120., 120.),
         content_mask: ContentMask::new(sp(0., 0., 1024., 1024.)),
         color: Hsla::from(rgba(0xffffffff)),
@@ -1746,6 +1748,8 @@ fn transformed_sprite_scene(
         scene.insert_primitive(MonochromeSprite {
             order: 0,
             animation: Default::default(),
+            clip: gpui::ClipId::NONE,
+            pad: 0,
             bounds: sp(200., 200., 120., 120.),
             content_mask: ContentMask::new(sp(0., 0., 1024., 1024.)),
             color: Hsla::from(rgba(color)),
@@ -1854,6 +1858,8 @@ fn clip_with_turned_sprite(
         child.insert_primitive(MonochromeSprite {
             order: 0,
             animation: Default::default(),
+            clip: gpui::ClipId::NONE,
+            pad: 0,
             bounds,
             content_mask: ContentMask::new(sp(0., 0., 1024., 1024.)),
             color: Hsla::from(rgba(0xff4040ff)),
