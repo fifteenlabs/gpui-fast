@@ -433,6 +433,36 @@ impl Path {
         self.even_odd
     }
 
+    /// The same path moved by `by`, which is how a path built once is painted
+    /// wherever its element is placed. Only the curves' end points move: their
+    /// remaining coefficients are relative to them.
+    pub fn translated(&self, by: Point<Pixels>) -> Self {
+        let delta = point(by.x.0, by.y.0);
+        Self {
+            curves: self
+                .curves
+                .iter()
+                .map(|curve| PathCurve {
+                    p0: curve.p0 + delta,
+                    p1: curve.p1 + delta,
+                    ..*curve
+                })
+                .collect(),
+            even_odd: self.even_odd,
+        }
+    }
+
+    /// Whether the path encloses nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.curves.is_empty()
+    }
+
+    /// The path's closed contours, as the monotone curves it was built into,
+    /// in logical pixels.
+    pub fn curves(&self) -> &[PathCurve] {
+        &self.curves
+    }
+
     /// The smallest rectangle holding the path, in logical pixels. Its curves
     /// are monotone, so their end points bound them.
     pub fn bounds(&self) -> Bounds<Pixels> {
