@@ -4204,20 +4204,19 @@ fn receive_promised_files(
         let queue = promised_file_queue();
         for (slot, receiver) in claimed.into_iter().enumerate() {
             let receipt = receipt.clone();
-            let reader =
-                RcBlock::new(move |file_url: *mut AnyObject, error: *mut AnyObject| {
-                    let written = if file_url.is_null() {
-                        let message: *mut AnyObject = msg_send![error, localizedDescription];
-                        Err(if message.is_null() {
-                            "the source app did not write the file it promised".to_string()
-                        } else {
-                            message.to_str().to_string()
-                        })
+            let reader = RcBlock::new(move |file_url: *mut AnyObject, error: *mut AnyObject| {
+                let written = if file_url.is_null() {
+                    let message: *mut AnyObject = msg_send![error, localizedDescription];
+                    Err(if message.is_null() {
+                        "the source app did not write the file it promised".to_string()
                     } else {
-                        ns_url_to_path(file_url).map_err(|error| error.to_string())
-                    };
-                    receipt.lock().receive(slot, written);
-                });
+                        message.to_str().to_string()
+                    })
+                } else {
+                    ns_url_to_path(file_url).map_err(|error| error.to_string())
+                };
+                receipt.lock().receive(slot, written);
+            });
             let _: () = msg_send![
                 receiver.get(),
                 receivePromisedFilesAtDestination: destination,

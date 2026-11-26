@@ -26,8 +26,8 @@ use harness::polygon;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    BrushExtend, ColorSpace, Gradient, LinearColorStop, Pixels, Radians, Window,
-    linear_color_stop, point, px, rgb, rgba, size,
+    BrushExtend, ColorSpace, Gradient, LinearColorStop, Pixels, Radians, Window, linear_color_stop,
+    point, px, rgb, rgba, size,
 };
 use harness::{
     at, rect, rect_path, render_frame, render_frame_on_transparent, render_frames,

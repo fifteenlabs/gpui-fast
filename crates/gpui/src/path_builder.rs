@@ -436,10 +436,7 @@ impl Path {
     /// The smallest rectangle holding the path, in logical pixels. Its curves
     /// are monotone, so their end points bound them.
     pub fn bounds(&self) -> Bounds<Pixels> {
-        let mut points = self
-            .curves
-            .iter()
-            .flat_map(|curve| [curve.p0, curve.p1]);
+        let mut points = self.curves.iter().flat_map(|curve| [curve.p0, curve.p1]);
         let Some(first) = points.next() else {
             return Bounds::default();
         };

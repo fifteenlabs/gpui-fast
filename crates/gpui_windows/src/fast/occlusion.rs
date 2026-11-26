@@ -360,9 +360,9 @@ mod tests {
                 size: size(ScaledPixels(w), ScaledPixels(h)),
             },
             content_mask: ContentMask::new(Bounds {
-                    origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-                    size: size(ScaledPixels(1000.0), ScaledPixels(800.0)),
-                }),
+                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: size(ScaledPixels(1000.0), ScaledPixels(800.0)),
+            }),
             background: solid_background(hsla(0.0, 0.0, 0.1, alpha)),
             border_color: Default::default(),
             corner_radii: Corners::default(),

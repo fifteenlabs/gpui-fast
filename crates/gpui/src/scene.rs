@@ -2774,9 +2774,7 @@ impl PaintedPath {
         // A brush maps a scene position to the image, so the image moves with
         // the path only if what it is handed is first moved back.
         if let Some(brush) = &mut self.brush {
-            brush.screen_to_brush = brush
-                .screen_to_brush
-                .translate(point(-delta.x, -delta.y));
+            brush.screen_to_brush = brush.screen_to_brush.translate(point(-delta.x, -delta.y));
         }
     }
 

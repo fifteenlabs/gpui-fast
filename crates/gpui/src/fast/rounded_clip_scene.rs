@@ -14,8 +14,7 @@ use crate::fast::rounded_clip::{ClipOperation, Shape};
 use crate::{
     AtlasTextureId, AtlasTextureKind, AtlasTile, ClipId, ClipPath, ContentMask, LayerContent,
     LayerFrame, LayerKey, PolychromeSprite, Rgba, ScaledPixels, Scene, TileId,
-    bounds_tree::BoundsTree,
-    scene::PaintOperation,
+    bounds_tree::BoundsTree, scene::PaintOperation,
 };
 
 const CLIP_TEXTURE_BASE: u32 = 0xF100_0000;

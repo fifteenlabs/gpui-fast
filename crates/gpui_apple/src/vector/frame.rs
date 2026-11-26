@@ -6,6 +6,7 @@
 //! what is already there. A depth buffer does not survive being cut into
 //! passes, so these frames draw back to front with nothing culled, the way
 //! upstream drew every frame before it had a depth buffer.
+use super::vector_groups::OpenGroup;
 use super::{
     CFRetained, CVMetalTexture, ClipInputIndex, DevicePixels, GlobalInputIndex, InstanceBindings,
     InstanceBufferWriter, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -13,7 +14,6 @@ use super::{
     MTLViewport, MetalRenderer, PrimitiveBatch, ProtocolObject, Result, Retained, Scene, Size,
     bind_render_target, mem, ptr,
 };
-use super::vector_groups::OpenGroup;
 use anyhow::Context as _;
 use gpui::{ClipPlan, Point, SceneStep, point};
 use objc2::Message as _;
@@ -350,10 +350,8 @@ impl MetalRenderer {
                     instance_bindings.clip_masks.offset,
                     ClipInputIndex::Masks as usize,
                 );
-                command_encoder.setFragmentTexture_atIndex(
-                    Some(&clip.atlas),
-                    ClipInputIndex::Atlas as usize,
-                );
+                command_encoder
+                    .setFragmentTexture_atIndex(Some(&clip.atlas), ClipInputIndex::Atlas as usize);
             }
         }
         Ok(command_encoder)

@@ -168,12 +168,12 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
-                    texture_id,
-                    range,
-                    false,
-                    instance_bindings,
-                    command_encoder,
-                ),
+                        texture_id,
+                        range,
+                        false,
+                        instance_bindings,
+                        command_encoder,
+                    ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     if crate::fast::rounded_clip::draw_group(
                         self,

@@ -6,9 +6,6 @@ mod vector_clips;
 mod vector_frame;
 #[path = "vector/groups.rs"]
 mod vector_groups;
-pub(crate) use vector_frame::RenderTarget;
-use vector_clips::ClipResources;
-use vector_groups::{FilterPipeline, FilterScratch, GroupComposeMode, GroupTargets};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -44,6 +41,9 @@ use objc2_metal::{
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
+use vector_clips::ClipResources;
+pub(crate) use vector_frame::RenderTarget;
+use vector_groups::{FilterPipeline, FilterScratch, GroupComposeMode, GroupTargets};
 
 use std::{
     cell::Cell, collections::HashMap, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc,

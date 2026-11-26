@@ -36,9 +36,9 @@ fn rectangle_path(x: f32, y: f32, width: f32, height: f32, rgba: u32) -> Painted
         path.build().expect("rectangle path"),
         1.,
         ContentMask::new(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: size(px(4096.), px(4096.)),
-            }),
+            origin: point(px(0.), px(0.)),
+            size: size(px(4096.), px(4096.)),
+        }),
         color(rgba).into(),
     )
 }

@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Bounds, ContentMask, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
-    Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
+    AtlasTextureId, Bounds, ContentMask, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch,
+    ScaledPixels, Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]

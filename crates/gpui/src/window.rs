@@ -21,12 +21,12 @@ use crate::{
     PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, ScaledPixels, Scene, SceneFilter,
     Shadow, SharedString, Size, SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style,
-    SubpixelSprite, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    SubpixelSprite, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -5747,14 +5747,15 @@ impl Window {
         // against one rectangle rather than two that differ by a fraction of a
         // device pixel.
         let content_mask = crate::fast::layers::paint::snap_mask(self.snapped_content_mask());
-        self.next_frame.scene.insert_primitive(PaintedPath::with_device_mask(
-            path,
-            scale_factor,
-            content_mask,
-            color.opacity(opacity),
-        ));
+        self.next_frame
+            .scene
+            .insert_primitive(PaintedPath::with_device_mask(
+                path,
+                scale_factor,
+                content_mask,
+                color.opacity(opacity),
+            ));
     }
-
 
     /// The atlas tile holding one frame of `data`, uploading its bytes the
     /// first time it is asked for.
@@ -11438,7 +11439,10 @@ mod tests {
     #[gpui::test]
     fn test_empty_content_masks_remain_empty_when_snapped(cx: &mut TestAppContext) {
         test_paint_at_scales(cx, |window| {
-            let viewport = ContentMask::new(Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(100.))));
+            let viewport = ContentMask::new(Bounds::from_corners(
+                point(px(20.), px(20.)),
+                point(px(100.), px(100.)),
+            ));
             for fraction in [0., 0.25, 0.5, 0.75] {
                 for bounds in [
                     Bounds::new(point(px(30.), px(120. + fraction)), size(px(40.), px(20.))),
@@ -11573,7 +11577,9 @@ mod tests {
             canvas(
                 |_, _, _| {},
                 move |_, _, window, _| {
-                    window.content_mask_stack.push(ContentMask::new(Bounds::from_corners(
+                    window
+                        .content_mask_stack
+                        .push(ContentMask::new(Bounds::from_corners(
                             point(px(-1000.), px(-1000.)),
                             point(px(1000.), px(1000.)),
                         )));

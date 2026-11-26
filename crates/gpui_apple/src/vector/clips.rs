@@ -25,7 +25,6 @@ const CLIP_SAMPLE_COUNT: u32 = 4;
 /// byte as a counter instead.
 const EVEN_ODD_STENCIL_MASK: u32 = 1;
 
-
 #[repr(C)]
 enum ClipMaskInputIndex {
     Vertices = 0,
@@ -36,7 +35,6 @@ enum ClipMaskInputIndex {
     Cover = 2,
     ClipAtlas = 3,
 }
-
 
 impl MetalRenderer {
     /// Works out where in the coverage atlas each of this scene's clip paths
@@ -545,4 +543,3 @@ fn build_cover_state(
         .newDepthStencilStateWithDescriptor(&descriptor)
         .context("creating a clip cover state")
 }
-

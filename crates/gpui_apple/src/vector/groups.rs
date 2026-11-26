@@ -1,5 +1,6 @@
 //! Isolated groups: the targets they are drawn into, the filters run over
 //! them, and the composite that puts each back onto what is underneath it.
+use super::vector_frame::ActiveTarget;
 use super::{
     MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
     MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary, MTLLoadAction, MTLPixelFormat,
@@ -8,7 +9,6 @@ use super::{
     MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport, MetalRenderer, PointF,
     ProtocolObject, RenderTarget, Result, Retained, clip_constants, mem, ptr, shader_function,
 };
-use super::vector_frame::ActiveTarget;
 use anyhow::Context as _;
 use gpui::{
     Bounds, ClipId, ComposeMode, DevicePixels, DeviceRect, Extent, FilterOp, GroupFilter,
@@ -88,7 +88,6 @@ pub(crate) enum FilterInputIndex {
     /// `filter_drop_shadow_fragment` alone.
     Blurred = 4,
 }
-
 
 /// Which Porter-Duff operator a group is composited with: the operators this
 /// renderer can express with a single blend state and a premultiplied source.
@@ -244,7 +243,6 @@ impl FilterPass {
         }
     }
 }
-
 
 /// Everything compositing one group needs beyond the group itself.
 pub(super) struct PreparedGroup {
@@ -1268,7 +1266,6 @@ fn build_filter_pipeline_state(
         .with_context(|| format!("creating {label} render pipeline"))
 }
 
-
 /// The specialization the group composite pipelines take: which operator, and
 /// whether the group carried a clip path the composite has to be cut by.
 fn group_composite_constants(
@@ -1294,4 +1291,3 @@ fn group_composite_constants(
     }
     constants
 }
-
