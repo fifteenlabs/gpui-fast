@@ -528,7 +528,6 @@ pub(crate) struct FrameCache {
 
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
-    pub(crate) font_generation: usize,
     pub(crate) lines_index: usize,
     pub(crate) wrapped_lines_index: usize,
 }
@@ -550,23 +549,17 @@ impl LineLayoutCache {
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
-        let font_generation = self.clear_if_font_generation_changed();
+        let _font_generation = self.clear_if_font_generation_changed();
         let state = self.state.borrow();
         let frame = &state.current_frame;
         LineLayoutIndex {
-            font_generation,
             lines_index: frame.used_lines.len(),
             wrapped_lines_index: frame.used_wrapped_lines.len(),
         }
     }
 
     pub fn reuse_layouts(&self, range: Range<LineLayoutIndex>) {
-        let font_generation = self.clear_if_font_generation_changed();
-        if range.start.font_generation != font_generation
-            || range.end.font_generation != font_generation
-        {
-            return;
-        }
+        let _font_generation = self.clear_if_font_generation_changed();
         let mut state = self.state.borrow_mut();
         let LineLayoutCacheState {
             previous_frame,
@@ -591,10 +584,7 @@ impl LineLayoutCache {
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
-        let font_generation = self.clear_if_font_generation_changed();
-        if index.font_generation != font_generation {
-            return;
-        }
+        let _font_generation = self.clear_if_font_generation_changed();
         let mut state = self.state.borrow_mut();
         let current_frame = &mut state.current_frame;
         current_frame.used_lines.truncate(index.lines_index);
@@ -754,7 +744,11 @@ impl LineLayoutCache {
             return font_generation;
         }
 
-        *state = LineLayoutCacheState::default();
+        let LineLayoutCacheState {
+            previous_frame,
+            current_frame,
+        } = &mut *state;
+        crate::fast::text::forget_shaped_lines(previous_frame, current_frame);
         self.cached_font_generation
             .store(font_generation, Ordering::Release);
         font_generation

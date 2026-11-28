@@ -8,6 +8,7 @@ mod dispatch;
 mod dynamic_textures;
 mod em_metrics;
 mod focus_queries;
+mod font_generation;
 mod global_id;
 mod image_drops;
 mod inherited;
