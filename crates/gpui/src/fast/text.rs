@@ -756,12 +756,18 @@ pub(crate) fn carry_over_line_layouts(previous: &mut FrameCache, current: &mut F
     current.used_wrapped_lines.clear();
 }
 
+pub(crate) fn forget_shaped_lines(previous: &mut FrameCache, current: &mut FrameCache) {
+    for frame in [previous, current] {
+        frame.lines.clear();
+        frame.wrapped_lines.clear();
+    }
+}
+
 impl LineLayoutIndex {
     /// This index, taken from a range that started at `from`, as it falls in
     /// a copy of that range starting at `to`.
     pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
         LineLayoutIndex {
-            font_generation: to.font_generation,
             lines_index: self.lines_index - from.lines_index + to.lines_index,
             wrapped_lines_index: self.wrapped_lines_index - from.wrapped_lines_index
                 + to.wrapped_lines_index,
@@ -1063,25 +1069,20 @@ impl PartialEq for DecorationRun {
 impl PartialEq for LineLayoutIndex {
     fn eq(&self, other: &Self) -> bool {
         let LineLayoutIndex {
-            font_generation,
             lines_index,
             wrapped_lines_index,
         } = self;
-        *font_generation == other.font_generation
-            && *lines_index == other.lines_index
-            && *wrapped_lines_index == other.wrapped_lines_index
+        *lines_index == other.lines_index && *wrapped_lines_index == other.wrapped_lines_index
     }
 }
 
 impl std::fmt::Debug for LineLayoutIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let LineLayoutIndex {
-            font_generation,
             lines_index,
             wrapped_lines_index,
         } = self;
         f.debug_struct("LineLayoutIndex")
-            .field("font_generation", font_generation)
             .field("lines_index", lines_index)
             .field("wrapped_lines_index", wrapped_lines_index)
             .finish()
